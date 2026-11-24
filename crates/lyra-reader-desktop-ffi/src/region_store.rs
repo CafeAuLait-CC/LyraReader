@@ -348,9 +348,13 @@ impl DesktopDocument {
             active
                 .validate_view_region(a.page, (x, y, width, height))
                 .map_err(|e| e.to_string())?;
-            let latest=entry.turns.last().map(|turn|json!({"turn_id":turn.id,"question":turn.question,
-                "output":turn.answer,"state":turn.state,"status":turn.error,
-                "source_pages":entry.navigable_sources(entry.turns.len()-1,active.page_count(),&identity.sha256)}))
+            let turn_value = |(index, turn): (usize, &Turn)| {
+                json!({"turn_id":turn.id,"question":turn.question,
+                       "output":turn.answer,"state":turn.state,"status":turn.error,
+                       "source_pages":entry.navigable_sources(index,active.page_count(),&identity.sha256)})
+            };
+            let mut turns = entry.turns.iter().enumerate().map(turn_value);
+            let latest=turns.next_back()
                 .or_else(||(!entry.question.is_empty()).then(||json!({"turn_id":entry.id,"question":entry.question,
                     "output":entry.answer,"state":entry.state,"status":entry.error,"source_pages":[]})));
             return Ok(json!({"history_id":entry.id,"persisted":true,"saved":true,
@@ -359,7 +363,8 @@ impl DesktopDocument {
                 "text":a.text,"text_truncated":a.text_truncated,"image_png":a.png,
                 "image_width_px":a.pixel_width,"image_height_px":a.pixel_height,
                 "capture_scale":a.capture_scale,"source_sha256":identity.sha256,
-                "latest_turn":latest,"completed_turn_count":entry.completed_turns().count(),
+                "latest_turn":latest,"previous_turns":turns.collect::<Vec<_>>(),
+                "completed_turn_count":entry.completed_turns().count(),
                 "knowledge_note":entry.knowledge_note}));
         }
         if op == "region_get" {

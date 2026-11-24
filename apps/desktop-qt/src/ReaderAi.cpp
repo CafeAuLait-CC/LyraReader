@@ -55,6 +55,7 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     clearAiRegionPaper();
     resetDocumentReading();
     ++m_aiRegionEpoch;RasterJobs::cancel(m_aiRegionJob);m_aiRegionJob.reset();m_aiRegion.clear();emit aiRegionChanged();
+    if(!m_aiRegionPreviousTurns.isEmpty()){m_aiRegionPreviousTurns.clear();emit aiRegionPreviousTurnsChanged();}
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
     m_regionHistory.clear();m_aiRegionSaveId=0;m_generatedRegionNoteSaveId=0;emit regionHistoryChanged();
     m_chatDraftTimer.stop();m_chatDraftSaveId=0;m_savedChatDraft.clear();m_chatDraftSnapshot.clear();m_afterChatDraft.reset();
@@ -80,6 +81,7 @@ void ReaderController::resetAiRegion() {
     auto results=m_aiState.value(QStringLiteral("results")).toMap();
     results.remove(QStringLiteral("region"));results.remove(QStringLiteral("region_note"));
     m_aiState.insert(QStringLiteral("results"),results);
+    if(!m_aiRegionPreviousTurns.isEmpty()){m_aiRegionPreviousTurns.clear();emit aiRegionPreviousTurnsChanged();}
     m_aiState.remove(QStringLiteral("regionNoteCandidate"));
     if(!m_aiState.value(QStringLiteral("running")).toBool()
         && (responseView==QStringLiteral("region") || responseView==QStringLiteral("region_note"))) {
@@ -694,9 +696,22 @@ bool ReaderController::startAiWithCredential(const QString &key,const QVariantMa
     m_aiStartId=id;
     if(region) {
         m_aiState.insert(QStringLiteral("regionTurn"),args.value(QStringLiteral("turn_id")));
+        const auto prior=m_aiState.value(QStringLiteral("results")).toMap().value(QStringLiteral("region")).toMap();
+        if(!prior.value(QStringLiteral("turn_id")).toString().isEmpty()) {
+            QVariantMap presentation;
+            for(const auto *key:{"turn_id","question","output","state","status","generation"})
+                presentation.insert(QLatin1String(key),prior.value(QLatin1String(key)));
+            const auto publishedPlan=prior.value(QStringLiteral("responsePlan")).toMap();
+            presentation.insert(QStringLiteral("responsePlan"),QVariantMap{
+                {QStringLiteral("action"),QStringLiteral("RegionQuestion")},
+                {QStringLiteral("source_pages"),publishedPlan.value(QStringLiteral("source_pages"))}});
+            m_aiRegionPreviousTurns.append(presentation);
+            emit aiRegionPreviousTurnsChanged();if(!current())return false;
+        }
         m_aiRegion.insert(QStringLiteral("saved"),false);
         emit aiRegionChanged();
         if(current())markRegionDirty();
+        if(current())emit aiStateChanged();
     }
     return true;
 }
@@ -704,7 +719,13 @@ void ReaderController::retainAiResult(const QString &state) {
     const auto view=m_aiState.value(QStringLiteral("responseView")).toString();
     if(view.isEmpty())return;
     QVariantMap result{{QStringLiteral("state"),state},{QStringLiteral("generation"),m_generation}};
-    if(view==QStringLiteral("region")){result.insert(QStringLiteral("turn_id"),m_aiState.value(QStringLiteral("regionTurn")));result.insert(QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion")));}
+    if(view==QStringLiteral("region")){
+        const auto question=m_aiState.value(QStringLiteral("activeQuestion"));
+        result.insert(QStringLiteral("turn_id"),m_aiState.value(QStringLiteral("regionTurn")));
+        result.insert(QStringLiteral("question"),question);
+        if(state==QStringLiteral("finished") && m_aiRegion.value(QStringLiteral("question")).toString().trimmed()==question.toString())
+            m_aiRegion.insert(QStringLiteral("question"),QString{});
+    }
     for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","translationHistoryWarning","synthesisParts","summaryNoteSource"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
     if(m_aiState.contains(QStringLiteral("unitTitle")))result.insert(QStringLiteral("unitTitle"),m_aiState.value(QStringLiteral("unitTitle")));
     if(m_aiState.contains(QStringLiteral("unitLanguage")))result.insert(QStringLiteral("unitLanguage"),m_aiState.value(QStringLiteral("unitLanguage")));
@@ -810,9 +831,18 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         auto capture=result.toMap();
         // Reopening the same active card must not replace newer local typing with its cache.
         if(m_aiRegion.value(QStringLiteral("history_id"))==capture.value(QStringLiteral("history_id")) && m_aiRegion.contains(QStringLiteral("image_png")))return;
-        const auto latest=capture.take(QStringLiteral("latest_turn")).toMap();const auto image=capture.take(QStringLiteral("image_url")).toUrl();resetAiRegion();
+        const auto latest=capture.take(QStringLiteral("latest_turn")).toMap();
+        const auto previous=capture.take(QStringLiteral("previous_turns")).toList();
+        const auto image=capture.take(QStringLiteral("image_url")).toUrl();resetAiRegion();
         capture.insert(QStringLiteral("restored"),true);m_aiRegion=capture;
         m_aiRegionImage=image;
+        for(const auto &entry:previous) {
+            auto turn=entry.toMap();
+            turn.insert(QStringLiteral("generation"),m_generation);
+            turn.insert(QStringLiteral("responsePlan"),QVariantMap{{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("source_pages"),turn.take(QStringLiteral("source_pages"))}});
+            m_aiRegionPreviousTurns.append(turn);
+        }
+        if(!m_aiRegionPreviousTurns.isEmpty())emit aiRegionPreviousTurnsChanged();
         if(!latest.isEmpty()) {
             auto response=latest;response.insert(QStringLiteral("restored"),true);response.insert(QStringLiteral("generation"),m_generation);
             response.insert(QStringLiteral("responsePlan"),QVariantMap{{QStringLiteral("action"),QStringLiteral("RegionQuestion")},{QStringLiteral("source_pages"),latest.value(QStringLiteral("source_pages"))}});
@@ -927,6 +957,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     if(batch.contains(QStringLiteral("chat_history_warning")))m_aiState.insert(QStringLiteral("chatHistoryWarning"),batch.value(QStringLiteral("chat_history_warning")));
     const auto responseKind=m_aiState.value(QStringLiteral("responsePlan")).toMap().value(QStringLiteral("kind")).toString();
     const bool readingTranslation=responseKind==QStringLiteral("reading_translation");
+    const bool regionQuestion=m_aiState.value(QStringLiteral("responseView"))==QStringLiteral("region");
     if(!batch.value(QStringLiteral("cache_warning")).toString().isEmpty())m_aiState.insert(QStringLiteral("cacheWarning"),batch.value(QStringLiteral("cache_warning")));
     const auto priorOutput=m_aiState.value(QStringLiteral("output")).toString();
     auto output=m_aiState.value(QStringLiteral("output")).toString(),reasoning=m_aiState.value(QStringLiteral("reasoning")).toString();
@@ -935,11 +966,11 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         if(value.toString()==QStringLiteral("Done"))m_aiState.insert(QStringLiteral("terminalReceived"),true);
         if(event.contains(QStringLiteral("Delta")))output+=event.value(QStringLiteral("Delta")).toMap().value(QStringLiteral("text")).toString();
         if(event.contains(QStringLiteral("ReasoningDelta")))reasoning+=event.value(QStringLiteral("ReasoningDelta")).toMap().value(QStringLiteral("text")).toString();
-        // A unit already has a captured UI title; ordinary multipart responses retain their headings.
+        // The region card and captured units already have a title. Other responses keep their part headings.
         if(event.contains(QStringLiteral("PartStarted"))) {
             if(readingTranslation) {
                 if(!output.isEmpty())output+=QStringLiteral("\n\n");
-            } else if(m_aiState.value(QStringLiteral("unitTitle")).toString().isEmpty())output+=(output.isEmpty()?QString{}:QStringLiteral("\n\n"))+QStringLiteral("### ")+event.value(QStringLiteral("PartStarted")).toMap().value(QStringLiteral("label")).toString()+QStringLiteral("\n\n");
+            } else if(!regionQuestion && m_aiState.value(QStringLiteral("unitTitle")).toString().isEmpty())output+=(output.isEmpty()?QString{}:QStringLiteral("\n\n"))+QStringLiteral("### ")+event.value(QStringLiteral("PartStarted")).toMap().value(QStringLiteral("label")).toString()+QStringLiteral("\n\n");
         }
         if(event.contains(QStringLiteral("Usage")))m_aiState.insert(QStringLiteral("usage"),event.value(QStringLiteral("Usage")));
         if(event.contains(QStringLiteral("Diagnostics")))m_aiState.insert(QStringLiteral("diagnostics"),event.value(QStringLiteral("Diagnostics")).toMap().value(QStringLiteral("diagnostics")));

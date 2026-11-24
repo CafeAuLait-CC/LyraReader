@@ -33,7 +33,23 @@ Item {
     readonly property var plan:state.previewView==="region" || notePreview ? state.plan || null : null
     readonly property bool previewReady:!!plan && !state.planSent
     onPreviewReadyChanged:if(!previewReady && payload && payload.visible)payload.close()
-    readonly property var result:state.responseView==="region" ? ({output:state.output,reasoning:state.reasoning,usage:state.usage,responsePlan:state.responsePlan,generation:owner.documentGeneration}) : ((state.results || {}).region || {})
+    readonly property bool activeTurn: running && state.responseView==="region"
+    readonly property var result:activeTurn ? ({
+        question:state.activeQuestion,output:state.output,reasoning:state.reasoning,
+        responsePlan:state.responsePlan,generation:owner.documentGeneration
+    }) : ((state.results || {}).region || {})
+    readonly property var previousTurns:owner ? owner.aiRegionPreviousTurns : []
+    readonly property bool hasConversation:!!result.question || previousTurns.length>0
+    property int shownPreviousTurns:8
+    property bool followTail:true
+    onActiveTurnChanged:if(activeTurn){followTail=true;followTranscript();}
+    function followTranscript() {
+        if(!opened || !followTail || showingNote)return;
+        Qt.callLater(function() {
+            if(card.opened && card.followTail && !card.showingNote)
+                resultScroll.contentItem.contentY=Math.max(0,resultScroll.contentItem.contentHeight-resultScroll.contentItem.height);
+        });
+    }
     parent:app.documentCanvas
     property bool opened:false
     visible:opened
@@ -46,7 +62,8 @@ Item {
     x:frame ? frame.x : 12
     y:frame ? frame.y : located ? -height-1 : Math.max(12,((app.documentCanvas ? app.documentCanvas.height : app.height)-height)/2)
     width:frame ? frame.width : Math.min(560,(app.documentCanvas ? app.documentCanvas.width : app.width)-24)
-    readonly property real heightLimit:Math.max(44,Math.min(740,(app.documentCanvas ? app.documentCanvas.height : app.height)-24))
+    readonly property real viewportHeight:app.documentCanvas ? app.documentCanvas.height : app.height
+    readonly property real heightLimit:Math.max(44,Math.min(420,viewportHeight-24,Math.max(240,viewportHeight*.55)))
     readonly property real fullHeight:Math.min(heightLimit,Math.max(44,
         Math.ceil(body.implicitHeight + Math.max(0,transcript.implicitHeight-resultScroll.Layout.preferredHeight))))
     readonly property bool streamGrowing:opened && running && (state.responseView==="region" || noteRunning)
@@ -136,6 +153,7 @@ Item {
         const current=owner===app.currentReader && ownerGeneration===owner.documentGeneration;
         const anchor=preserve && current ? app.documentCanvas.viewportAnchor(0) : null;
         opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();discardChanges.close();capturePreview.close();actions.close();
+        shownPreviousTurns=8;followTail=true;
         if(owner){if(preserve)owner.flushAiRegionNote();owner.clearAiRegionPaper();}
         if(anchor && current)app.documentCanvas.restoreViewportAnchor(anchor,0);
         if(current)app.focusReadingView();
@@ -246,25 +264,77 @@ Item {
         const match=/^p\.(\d+)$/.exec(link);
         if(match && (plan.source_pages || []).indexOf(Number(match[1]))>=0){app.navigate(Number(match[1])-1);close();}
     }
+    component Exchange: ColumnLayout {
+        id:exchange
+        required property var turn
+        required property string answerName
+        property bool live: false
+        spacing:9
+        TextMetrics {
+            id: questionMetrics
+            font: questionBubble.font
+            text: questionBubble.text
+        }
+        TextArea {
+            id: questionBubble
+            objectName:exchange.answerName+"Question"
+            Layout.alignment:Qt.AlignRight
+            Layout.preferredWidth:Math.min(exchange.width*.82,
+                Math.ceil(questionMetrics.advanceWidth)+leftPadding+rightPadding)
+            visible:!!exchange.turn.question
+            text:exchange.turn.question || ""
+            textFormat:TextEdit.PlainText;wrapMode:TextEdit.Wrap
+            readOnly:true;selectByMouse:true;selectByKeyboard:true
+            font.pixelSize:13
+            leftPadding:10;rightPadding:10;topPadding:7;bottomPadding:7
+            color:card.app.colors.textPrimary
+            Accessible.name:qsTr("Question")
+            background:Rectangle {
+                radius:4;color:Qt.alpha(card.app.colors.accentSoft,.65)
+                Rectangle {width:2;height:parent.height;color:Qt.alpha(card.app.colors.accentBorder,.45)}
+            }
+        }
+        AiResult {
+            app:card.app;viewport:resultScroll.contentItem;value:exchange.turn
+            answerName:exchange.answerName;inlineConversation:true
+            Layout.fillWidth:true;visible:!!exchange.turn.output
+            onKeyboardNavigation:function(key) {if(key===Qt.Key_Up || key===Qt.Key_PageUp || key===Qt.Key_Home)card.followTail=false;}
+            onCitation:function(link,plan){card.follow(link,plan);}
+        }
+        Label {
+            visible:text.length>0
+            Layout.fillWidth:true;textFormat:Text.PlainText;wrapMode:Text.Wrap
+            text:exchange.turn.state==="cancelled" ? qsTr("Stopped · partial answer kept")
+                : exchange.turn.state==="failed" ? exchange.turn.status || qsTr("Request failed")
+                : exchange.live && card.activeTurn && !exchange.turn.output ? qsTr("Thinking…") : ""
+            font.pixelSize:11;color:exchange.turn.state==="failed" ? card.app.colors.errorFg : card.app.colors.textSecondary
+        }
+    }
     Pane {
         id:body
         objectName:"aiRegionBody"
-        width:card.width;height:card.fullHeight;padding:card.veryCompact ? 4 : card.compact ? 8 : 12
+        width:card.width;height:card.fullHeight
+        padding:card.width<400 ? 8 : 18
+        topPadding:14;bottomPadding:16
         opacity:.65+.35*card.revealProgress
         enabled:!card.closing
-        background:RegionPaperSurface {
-            objectName:"aiRegionCardSurface"
-            colors:card.app.colors
-            parchment:card.parchment
+        background:Item {
+            RegionPaperSurface {
+                anchors.fill:parent;anchors.topMargin:8;anchors.bottomMargin:8
+                objectName:"aiRegionCardSurface"
+                colors:card.app.colors
+                parchment:card.parchment
+            }
         }
     contentItem:ColumnLayout {
         spacing:card.veryCompact ? 1 : card.compact ? 4 : 8
         RowLayout {
             spacing:7
-            Text {
+            LyraToolButton {
                 Layout.preferredWidth:21;Layout.preferredHeight:21
-                text:"✧";font.pixelSize:21;color:card.app.colors.accent
-                horizontalAlignment:Text.AlignHCenter;verticalAlignment:Text.AlignVCenter
+                enabled:false;padding:0;background:null
+                icon.source:"qrc:/icons/lyra-quill.svg"
+                icon.width:21;icon.height:21;icon.color:card.app.colors.accent
                 Accessible.ignored:true
             }
             LyraToolButton {
@@ -272,6 +342,7 @@ Item {
                 objectName:"viewAiRegionCapture"
                 text:card.attachment.image_png ? card.captureLabel+" ⌄" : qsTr("Region question")
                 display:AbstractButton.TextOnly
+                font.bold:true;font.pixelSize:13
                 enabled:!!card.attachment.image_png
                 Accessible.name:qsTr("View selected region · %1").arg(card.captureLabel)
                 onClicked:capturePreview.open()
@@ -299,6 +370,7 @@ Item {
                     MenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable;height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
                     MenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openRegionNotes()}
                     MenuItem {text:qsTr("Open in AI Panel");enabled:!!card.attachment.saved && !!card.attachment.history_id;onTriggered:card.app.openSavedReadingNote(card.attachment.history_id)}
+                    MenuItem {text:qsTr("Read document (optional)…");enabled:!!card.owner && !!card.owner.documentReading.choice_pending;onTriggered:card.app.openDocumentReading()}
                     MenuSeparator {}
                     MenuItem {text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onTriggered:card.app.armRegion()}
                     MenuItem {text:qsTr("Clear area");enabled:!card.running && !!card.owner;onTriggered:card.owner.clearAiRegion()}
@@ -320,12 +392,38 @@ Item {
             Layout.minimumHeight:card.veryCompact ? 48 : 64
             Layout.preferredHeight:64
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
+            contentHeight:transcript.implicitHeight
+            WheelHandler {
+                target:null;blocking:false
+                onWheel:function(event) {if(event.angleDelta.y>0 || event.pixelDelta.y>0)card.followTail=false;event.accepted=false;}
+            }
+            onVerticalBarPressedChanged: if(verticalBarPressed)card.followTail=false;
+            Connections {
+                target:resultScroll.contentItem
+                function onMovementStarted(){card.followTail=false;}
+                function onContentYChanged(){if(resultScroll.contentItem.atYEnd)card.followTail=true;}
+                function onContentHeightChanged(){card.followTranscript();}
+            }
             ColumnLayout {
                 id:transcript
                 objectName:"aiRegionTranscriptContent"
-                width:resultScroll.availableWidth;spacing:8
+                width:resultScroll.availableWidth;spacing:12
                 Label {text:card.attachment.error || card.paper.error || "";textFormat:Text.PlainText;visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg}
-                AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";visible:!card.showingNote;Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
+                Button {
+                    text:qsTr("Show earlier messages")
+                    visible:!card.showingNote && card.previousTurns.length>card.shownPreviousTurns
+                    onClicked:{card.followTail=false;card.shownPreviousTurns+=8;}
+                }
+                Repeater {
+                    model:card.previousTurns.slice(-card.shownPreviousTurns)
+                    Exchange {
+                        required property var modelData
+                        required property int index
+                        turn:modelData;answerName:"aiRegionEarlierAnswer"+index
+                        visible:!card.showingNote;Layout.fillWidth:true
+                    }
+                }
+                Exchange {turn:card.result;answerName:"aiRegionAnswer";live:true;visible:!card.showingNote && card.hasConversation;Layout.fillWidth:true}
                 Label {
                     visible:card.showingNote && !!card.candidate
                     text:qsTr("Generated knowledge note · unsaved")
@@ -338,9 +436,8 @@ Item {
                 ColumnLayout {
                     id:details;objectName:"aiRegionDetails";Layout.fillWidth:true
                     spacing:card.compact ? 4 : 8
-                    Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
                     RowLayout {
-                        visible:card.owner && !!card.owner.documentReading.choice_pending
+                        visible:!card.hasConversation && card.owner && !!card.owner.documentReading.choice_pending
                         Layout.fillWidth:true
                         Button {text:qsTr("Read document (optional)…");Layout.fillWidth:true;onClicked:card.app.openDocumentReading()}
                         ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
@@ -367,17 +464,18 @@ Item {
         ScrollView {
             id:composer
             visible:!!card.attachment.image_png
-            Layout.fillWidth:true;Layout.preferredHeight:Math.min(80,Math.max(card.veryCompact ? 36 : 48,card.heightLimit*.18));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
+            Layout.fillWidth:true;Layout.preferredHeight:Math.min(66,Math.max(34,questionEditor.implicitHeight));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
             TextArea {
                 id:questionEditor;objectName:"aiRegionQuestion"
                 width:composer.availableWidth;text:card.attachment.question || ""
                 readOnly:card.running
                 wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
-                placeholderText:card.attachment.completed_turn_count ? qsTr("Ask a follow-up…") : qsTr("Ask about this region…")
+                placeholderText:card.attachment.completed_turn_count || card.result.state==="finished"
+                    ? qsTr("Ask a follow-up…") : qsTr("Ask about this region…")
                 Accessible.name:qsTr("Question about area")
                 color:card.app.colors.textPrimary;placeholderTextColor:card.app.colors.textPlaceholder
                 selectionColor:card.app.colors.textSelectionBg;selectedTextColor:card.app.colors.textSelectionFg
-                padding:9
+                font.pixelSize:13;padding:8
                 background:Rectangle {
                     objectName:"aiRegionQuestionSurface"
                     color:card.parchment ? Qt.rgba(card.app.colors.raisedBg.r,card.app.colors.raisedBg.g,card.app.colors.raisedBg.b,.45) : card.app.colors.fieldBg
@@ -400,6 +498,12 @@ Item {
             LyraToolButton {
                 objectName:"prepareAiRegion";symbol:"arrow";text:qsTr("Preview Question")
                 visible:!card.previewReady && !card.regionRunning;enabled:card.canPrepare
+                contentItem.rotation:-45
+                background:Rectangle {
+                    radius:7;color:parent.hovered && parent.enabled ? card.app.colors.hoverBg : "transparent"
+                    border.width:parent.visualFocus ? 2 : 1
+                    border.color:parent.visualFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
+                }
                 onClicked:card.prepare()
             }
             LyraToolButton {
@@ -413,6 +517,7 @@ Item {
                 visible:card.previewReady && !card.regionRunning
                 enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0
                 icon.color:enabled ? card.app.colors.onAccent : card.app.colors.textDisabled
+                contentItem.rotation:-45
                 background:Rectangle {
                     radius:7
                     color:parent.enabled ? (parent.down ? card.app.colors.accentPressed : card.app.colors.accent) : card.app.colors.panelBg
@@ -431,7 +536,8 @@ Item {
             text:card.running && card.state.responseView!=="region" && !card.noteRunning ? qsTr("Another assistant request is running in this tab.")
                 : card.state.statusView==="region" || card.state.statusView==="region_note" ? card.state.status || "" : ""
             textFormat:Text.PlainText
-            visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;font.pixelSize:11;color:card.app.colors.textSecondary
+            visible:text.length>0 && (card.running || card.previewReady || !card.result.output)
+            wrapMode:Text.Wrap;Layout.fillWidth:true;font.pixelSize:11;color:card.app.colors.textSecondary
         }
         Label {
             visible:card.previewReady;Layout.fillWidth:true;wrapMode:Text.Wrap
@@ -443,6 +549,7 @@ Item {
         Label {
             objectName:"aiRegionPersistenceStatus"
             Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:card.app.colors.textSecondary
+            visible:!!card.owner && !!card.owner.regionPersistenceError
             text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : card.owner && card.owner.regionPersistenceError ? qsTr("This conversation has not been saved. Retry saving to keep the latest changes.") : qsTr("Saving this area and its conversation to Reading notes on this device…")
         }
         Label {text:card.owner ? card.owner.regionHistory.error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg;textFormat:Text.PlainText}

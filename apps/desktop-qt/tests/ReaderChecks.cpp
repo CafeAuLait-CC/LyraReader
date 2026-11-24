@@ -2911,7 +2911,8 @@ private slots:
         const double sx = double(frame.width()) / window->width();
         const double sy = double(frame.height()) / window->height();
         const auto selected = frame.pixelColor(qRound(point.x() * sx), qRound(point.y() * sy));
-        const auto following = frame.pixelColor(qRound(point.x() * sx), qRound((point.y() + current->height()) * sy));
+        const auto following = frame.pixelColor(qRound(point.x() * sx),
+            qRound((point.y() + current->height() + sidebar->property("spacing").toDouble()) * sy));
         QVERIFY2(selected != following, "The selected first page row must be visible in the captured frame");
         // Changing application appearance must repaint the chrome without
         // recoloring or rerasterizing the source PDF.
@@ -5254,9 +5255,9 @@ private slots:
         const auto initial=card->height(),limit=card->property("heightLimit").toDouble();
         QVERIFY2(initial+64<limit,qPrintable(QString("Sheet height %1, limit %2").arg(initial).arg(limit)));
         MockChatServer::Response response;
-        for(int i=0;i<15;++i)response.chunks.append(MockChatServer::delta({{"content",
-            QString("Synthetic observation %1: this public fixture uses the same source. [p.1]\n\n").arg(i+1)}}));
-        response.chunks.append(QByteArray("data: [DONE]\n\n"));response.delay=110;
+        for(int i=0;i<17;++i)response.chunks.append(MockChatServer::delta({{"content",
+            QString("Synthetic observation %1. [p.1]\n").arg(i+1)}}));
+        response.chunks.append(QByteArray("data: [DONE]\n\n"));response.delay=160;
         server.responses.append(response);
         const auto wire=plan().value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
         const auto pages=reader->pages(),rows=reader->layoutRows();
@@ -5270,7 +5271,9 @@ private slots:
         const auto tilePlans=reader->tilePlanBatches();
         QTRY_VERIFY(card->height()>initial+20 && card->height()<limit);
         const auto intermediate=card->height();
-        QTRY_VERIFY(card->height()>intermediate+10);
+        QTRY_VERIFY2_WITH_TIMEOUT(card->height()>intermediate+10,
+            qPrintable(QString("Initial %1, intermediate %2, final %3, cap %4")
+                .arg(initial).arg(intermediate).arg(card->height()).arg(limit)),5000);
         QVERIFY(reader->aiState().value("running").toBool());
         QCOMPARE(reader->aiRegionPaper(),basePlan);QCOMPARE(reader->tilePlanBatches(),tilePlans);
         QCOMPARE(pane->y(),0);
@@ -5286,7 +5289,11 @@ private slots:
     void regionQuestionsCaptureOnceAndSendOnlyTheExplicitPreview() {
         MockChatServer server;QVERIFY(server.listen());
         server.responses.append({{QByteArray("{\"error\":{\"message\":\"Unsupported parameter: stream_options\"}}")},0,400});
-        server.responses.append({{MockChatServer::delta({{"content","Synthetic area answer [p.1] and [p.99]."}}),QByteArray("data: [DONE]\n\n")},20,200});
+        server.responses.append({{MockChatServer::delta({{"content",
+            "Synthetic area answer. The **loss** combines fit and regularization. [p.1] and [p.99].\n\n"
+            "$$L = L_{\\text{fit}} + \\lambda L_{\\text{reg}}$$\n\n"
+            "- The fit term compares the estimate with the observations.\n"
+            "- The regularization term limits sensitivity to noise."}}),QByteArray("data: [DONE]\n\n")},20,200});
         server.responses.append({{MockChatServer::delta({{"content","partial area answer"}}),QByteArray("data: [DONE]\n\n")},20,200,true});
         const auto auditPath=qEnvironmentVariable("LYRA_READER_DOCUMENT_CACHE_DIR")+"/Audit/ai-requests.jsonl";
         const auto auditRows=[&]{QList<QJsonObject> rows;QFile audit(auditPath);if(audit.open(QIODevice::ReadOnly))for(const auto &line:audit.readAll().split('\n'))if(!line.isEmpty())rows.append(QJsonDocument::fromJson(line).object());return rows;};
@@ -5366,7 +5373,33 @@ private slots:
         QVERIFY(settleRegionControl(window,paperCard,send,reader));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
         QTRY_COMPARE_WITH_TIMEOUT(server.requests.size(),2,10000);const auto retry=server.requests[1];QCOMPARE(retry.mid(retry.indexOf("\r\n\r\n")+4),reviewedBody);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Synthetic area answer"));
-        auto *answer=window->findChild<QObject *>("aiRegionAnswer");QVERIFY(answer);QVERIFY(!answer->property("text").toString().contains("href=\"p.99\""));
+        QVERIFY(reader->aiState().value("output").toString().startsWith("Synthetic area answer."));
+        auto *answer=visualItem(paperCard,"aiRegionAnswer");QVERIFY(answer);
+        auto *questionBubble=visualItem(paperCard,"aiRegionAnswerQuestion");QVERIFY(questionBubble);
+        QTRY_COMPARE(questionBubble->property("text").toString(),QString("What is shown in this synthetic area?"));
+        QTRY_COMPARE(window->findChild<QQuickItem *>("aiRegionQuestion")->property("text").toString(),QString{});
+        QTRY_VERIFY(questionBubble->x()>answer->x() && qAbs(questionBubble->x()+questionBubble->width()-answer->width())<1);
+        QVERIFY(questionBubble->width()>180 && questionBubble->height()<45);
+        QVERIFY(answer->property("text").toString().contains("href=\"p.1\""));
+        QVERIFY(!answer->property("text").toString().contains("href=\"p.99\""));
+        QCOMPARE(window->property("secondaryRow").toString(),QString("lyra"));
+        QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,QString{}),Q_ARG(QVariant,true)));
+        QTRY_VERIFY(!window->property("regionSelecting").toBool() && card->property("opened").toBool());
+        const auto completedSnapshot=qEnvironmentVariable("LYRA_READER_COMPLETED_REGION_SNAPSHOT");
+        if(!completedSnapshot.isEmpty()) {
+            window->setProperty("paperAppearance","original");
+            QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"thumbnails")));
+            QTRY_VERIFY(visualItem(window->contentItem(),"thumbnailPaper0"));
+            auto *transcript=visualItem(paperCard,"aiRegionTranscript");QVERIFY(transcript);
+            auto *scroll=transcript->property("contentItem").value<QQuickItem *>();QVERIFY(scroll);
+            auto *contents=scroll->property("contentItem").value<QQuickItem *>();QVERIFY(contents);
+            QVERIFY(QMetaObject::invokeMethod(canvas,"showRegionCard",Q_ARG(QVariant,QVariant::fromValue(reader))));
+            card->setProperty("followTail",false);
+            scroll->setProperty("contentY",std::clamp(questionBubble->mapToItem(contents,QPointF(0,0)).y(),0.,
+                std::max(0.,scroll->property("contentHeight").toDouble()-scroll->height())));
+            QVERIFY(settleRegionControl(window,paperCard,questionBubble,reader));
+            QVERIFY(window->grabWindow().save(completedSnapshot));
+        }
         QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         const auto savedRegionId=reader->aiRegion().value("history_id").toString();QSignalSpy regionReads(reader,&ReaderController::commandFinished);
         const auto firstRead=reader->submit("region_get",{{"id",savedRegionId}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap firstEntry;
@@ -5386,6 +5419,12 @@ private slots:
         const auto projectedGap=[&]{return reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*window->property("zoom").toDouble()*canvas->property("paperProgress").toDouble();};
         QTRY_VERIFY_WITH_TIMEOUT(qAbs(projectedGap()-paperCard->height())<.01,10000);
         QTRY_VERIFY(paperCard->parentItem()->contains(stop->mapToItem(paperCard->parentItem(),QPointF(0,0))) && paperCard->parentItem()->contains(stop->mapToItem(paperCard->parentItem(),QPointF(stop->width(),stop->height()))));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,stop->mapToScene(QPointF(stop->width()/2,stop->height()/2)).toPoint());QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QCOMPARE(reader->aiRegion().value("question").toString(),QString("Second synthetic area question never logged"));
+        QTRY_COMPARE(reader->aiRegionPreviousTurns().size(),2);
+        auto *previousAnswer=visualItem(paperCard,"aiRegionEarlierAnswer1");QVERIFY(previousAnswer);
+        QVERIFY(previousAnswer->property("text").toString().contains("Synthetic area answer"));
+        QVERIFY(previousAnswer->property("text").toString().contains("href=\"p.1\""));
+        QVERIFY(!previousAnswer->property("text").toString().contains("href=\"p.99\""));
         QCOMPARE(auditRows().size(),initialAuditCount+3);QCOMPARE(auditRows().last().value("outcome").toString(),QString("cancelled"));
         QFile audit(auditPath);QVERIFY(audit.open(QIODevice::ReadOnly));const auto auditBytes=audit.readAll();QVERIFY(!auditBytes.contains("quick brown fox"));QVERIFY(!auditBytes.contains("Second synthetic"));QVERIFY(!auditBytes.contains(attachment.value("image_png").toByteArray()));QVERIFY(!auditBytes.contains("area.pdf"));
         audit.close();const auto restoreAudit=qScopeGuard([&]{QSaveFile restored(auditPath);if(restored.open(QIODevice::WriteOnly)){restored.write(auditBytes);restored.commit();}});
@@ -5415,6 +5454,13 @@ private slots:
         const auto generation=savedNotes->property("ownerGeneration");savedNotes->setProperty("ownerGeneration",generation.toInt()-1);QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));savedNotes->setProperty("ownerGeneration",generation);
         savedNotes->setProperty("turnIndex",3);QTRY_VERIFY(!visualItem(window->contentItem(),"regionNoteSource1"));QVERIFY(QMetaObject::invokeMethod(savedNotes,"followSource",Q_ARG(QVariant,1)));QVERIFY(window->property("operationStatus").toString().contains("unavailable"));
         QVERIFY(QMetaObject::invokeMethod(savedNotes,"close"));QCOMPARE(server.requests.size(),3);
+        reader->clearAiRegion();
+        QVERIFY(reader->reopenAiRegion(savedRegionId,reader->regionHistory().value("revision").toString()));
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        const auto earlier=reader->aiRegionPreviousTurns();
+        QCOMPARE(earlier.size(),3);
+        QCOMPARE(earlier[1].toMap().value("responsePlan").toMap().value("source_pages").toList(),reviewed.value("source_pages").toList());
+        QCOMPARE(earlier.last().toMap().value("state").toString(),QString("cancelled"));
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }
     void regionPaperUnfoldClipsNativeTextAndHoldsRasterDemand_data() {
@@ -5602,7 +5648,10 @@ private slots:
         canvas->forceActiveFocus();QTRY_VERIFY(!question->hasActiveFocus());QTest::qWait(30);
         const auto currentPlan=reader->aiRegionPaper();const auto ownerRow=currentPlan.value("card_row").toInt();const auto gapLocal=currentPlan.value("gap_top").toDouble()-currentPlan.value("rows").toList()[ownerRow].toMap().value("top").toDouble();
         QVERIFY(QMetaObject::invokeMethod(canvas,"positionAnchor",Q_ARG(QVariant,QVariantMap({{"page",ownerPage},{"y",gapLocal+90}})),Q_ARG(QVariant,0)));
-        const double cardPoint=200;
+        // Aim inside the card at every zoom. Near the bottom of the compact
+        // card a wrapping change can put the same pointer over PDF again.
+        const double cardPoint=std::min(200.0,paperCard->height()*.66);
+        QVERIFY(cardPoint>90);
         QTRY_VERIFY_WITH_TIMEOUT(paperCard->y()+cardPoint>0 && paperCard->y()+cardPoint<canvas->height(),3000);
         const double viewY=paperCard->y()+cardPoint;
         const bool lateLayout=QByteArray(QTest::currentDataTag()).endsWith("-late-layout");
@@ -5620,6 +5669,9 @@ private slots:
         const double expectedTail=foot && ownerPage==reader->pageCount()-1 ? fitting.value("inset").toDouble()*window->property("zoom").toDouble() : 0;
         for(const double zoom:{1.35,.9,1.0}) {
             if(zoom==.9){question->forceActiveFocus();QTRY_VERIFY(question->hasActiveFocus());}
+            QVERIFY2(viewY>=paperCard->y() && viewY<paperCard->y()+paperCard->height(),
+                qPrintable(QString("Pointer %1 outside card %2–%3 before zoom %4")
+                    .arg(viewY).arg(paperCard->y()).arg(paperCard->y()+paperCard->height()).arg(zoom)));
             QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,paperCard->x()+paperCard->width()*.4),Q_ARG(QVariant,viewY)));
             QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegionPaper().value("loading").toBool() && qAbs(reader->aiRegionPaper().value("card").toMap().value("gap_pt").toDouble()*window->property("zoom").toDouble()-paperCard->height())<.01,10000);
             if(lateLayout)QTRY_COMPARE_WITH_TIMEOUT(*nudges,2,3000);
@@ -8265,6 +8317,10 @@ private slots:
         QTRY_VERIFY((tile=visualItem(view.window->contentItem(),"thumbnailContent0")) && (selection=visualItem(view.window->contentItem(),"thumbnailSelection0")));
         QCOMPARE(selection->mapRectToItem(tile,selection->boundingRect()),tile->boundingRect().adjusted(-4,-4,4,4));
         QVERIFY(selection->width()<visualItem(view.window->contentItem(),"pagesSidebar")->width());
+        auto *miniature=visualItem(view.window->contentItem(),"thumbnailPaper0");QVERIFY(miniature);
+        const auto page=reader->pages().first().toMap();
+        QCOMPARE(miniature->width(),132.0);
+        QVERIFY(qAbs(miniature->height()/miniature->width()-page.value("height").toDouble()/page.value("width").toDouble())<.001);
         QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));
         auto *row=visualItem(view.window->contentItem(),"annotationToolRow");QVERIFY(row);QCOMPARE(row->height(),46.0);
         const QStringList groups{"annotateGroupMarkup","annotateGroupPointer","annotateGroupPlacement"};

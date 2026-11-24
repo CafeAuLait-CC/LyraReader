@@ -44,6 +44,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantList translationOverlays READ translationOverlays NOTIFY translationOverlaysChanged)
     Q_PROPERTY(QVariantMap translationState READ translationState NOTIFY translationsChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
+    Q_PROPERTY(QVariantList aiRegionPreviousTurns READ aiRegionPreviousTurns NOTIFY aiRegionPreviousTurnsChanged)
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
     Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QVariantMap readingNoteDraft READ readingNoteDraft NOTIFY regionNoteDraftChanged)
@@ -109,6 +110,7 @@ public:
     Q_INVOKABLE void invalidateDocumentReadingPreview();
     Q_INVOKABLE void dismissDocumentReadingChoice();
     QVariantMap aiRegion()const{return m_aiRegion;}
+    QVariantList aiRegionPreviousTurns()const{return m_aiRegionPreviousTurns;}
     QVariantMap aiRegionPaper()const{return m_aiRegionPaper;}
     Q_INVOKABLE void configureAiRegionPaper(const QString &mode,double pageGap,double cardGap);
     Q_INVOKABLE void clearAiRegionPaper();
@@ -244,6 +246,7 @@ signals:
     void summaryCatalogChanged();
     void documentReadingChanged();
     void aiRegionChanged();
+    void aiRegionPreviousTurnsChanged();
     void aiRegionPaperChanged();
     void aiRegionImageChanged();
     void regionHistoryChanged();
@@ -337,6 +340,7 @@ private:
     QTimer m_aiTimer;
     QVariantMap m_aiState;
     QVariantMap m_aiRegion;
+    QVariantList m_aiRegionPreviousTurns;
     QVariantMap m_aiRegionPaper,m_aiRegionPaperSpec;
     QVariantMap m_layoutConfiguration;
     QVariantMap m_fitPresentation;

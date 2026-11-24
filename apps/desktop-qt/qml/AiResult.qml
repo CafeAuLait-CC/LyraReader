@@ -9,6 +9,7 @@ ColumnLayout {
     required property var value
     property string answerName: "aiAnswerText"
     property bool showSources: false
+    property bool inlineConversation: false
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function revealCursor(area, owner, generation, target) {
@@ -111,12 +112,14 @@ ColumnLayout {
                   result.formulaMarkup)
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
         textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
+        Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
+        Binding { target: answerArea; property: "font.pixelSize"; value: 13; when: result.inlineConversation }
         Accessible.name: qsTr("AI response")
         Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
         onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }
     }
     RowLayout {
-        visible: !!result.value.output
+        visible: !!result.value.output && !result.inlineConversation
         Button { text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
         Label {
             objectName: result.answerName + "Usage"

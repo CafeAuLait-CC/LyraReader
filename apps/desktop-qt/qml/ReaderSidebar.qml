@@ -38,42 +38,64 @@ Pane {
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
-        RowLayout {
+        Item {
             Layout.fillWidth: true
             Layout.margins: 8
-            spacing: 0
-            Repeater {
-                model: [
-                    {
-                        key: "bookmarks",
-                        name: qsTr("Bookmarks"),
-                        icon: "bookmark"
-                    },
-                    {
-                        key: "outline",
-                        name: qsTr("Outline"),
-                        icon: "outline"
-                    },
-                    {
-                        key: "annotations",
-                        name: qsTr("Annotations"),
-                        icon: "annotations"
-                    },
-                    {
-                        key: "thumbnails",
-                        name: qsTr("Thumbnails"),
-                        icon: "overview"
+            implicitHeight: 32
+            Rectangle { anchors.fill: parent; color: app.colors.titlebarBg }
+            RowLayout {
+                anchors.fill: parent
+                spacing: 0
+                Repeater {
+                    model: [
+                        {
+                            key: "bookmarks",
+                            name: qsTr("Bookmarks"),
+                            icon: "bookmark"
+                        },
+                        {
+                            key: "outline",
+                            name: qsTr("Outline"),
+                            icon: "outline"
+                        },
+                        {
+                            key: "annotations",
+                            name: qsTr("Annotations"),
+                            icon: "annotations"
+                        },
+                        {
+                            key: "thumbnails",
+                            name: qsTr("Thumbnails"),
+                            icon: "overview"
+                        }
+                    ]
+                    LyraToolButton {
+                        id: sidebarTabButton
+                        required property var modelData
+                        required property int index
+                        Layout.fillWidth: true
+                        symbol: modelData.icon
+                        text: modelData.name
+                        selected: app.sidebarTab === modelData.key
+                        onClicked: app.showSidebar(modelData.key)
+                        background: Rectangle {
+                            color: sidebarTabButton.selected ? app.colors.selectedBg : sidebarTabButton.down ? app.colors.pressedBg
+                                  : sidebarTabButton.hovered ? app.colors.hoverBg : "transparent"
+                            Rectangle {
+                                visible: sidebarTabButton.index > 0
+                                width: 1; height: parent.height
+                                color: app.colors.separator
+                            }
+                            Rectangle {
+                                anchors.fill: parent
+                                visible: sidebarTabButton.visualFocus
+                                color: "transparent"; border.width: 2; border.color: app.colors.focusRing
+                            }
+                        }
                     }
-                ]
-                LyraToolButton {
-                    required property var modelData
-                    Layout.fillWidth: true
-                    symbol: modelData.icon
-                    text: modelData.name
-                    selected: app.sidebarTab === modelData.key
-                    onClicked: app.showSidebar(modelData.key)
                 }
             }
+            Rectangle { anchors.fill: parent; color: "transparent"; border.color: app.colors.separator }
         }
         RowLayout {
             Layout.fillWidth: true
@@ -118,10 +140,13 @@ Pane {
                 clip: true
                 model: app.currentReader.pages
                 currentIndex: app.currentPage
+                topMargin: 10
+                bottomMargin: 10
+                spacing: 10
                 boundsBehavior: Flickable.StopAtBounds
                 onCurrentIndexChanged: if (currentIndex >= 0)
                     positionViewAtIndex(currentIndex, ListView.Contain)
-                ScrollBar.vertical: ScrollBar {}
+                ScrollBar.vertical: AiReadingScrollBar {id: thumbnailBar}
                 delegate: ItemDelegate {
                     id: thumbnail
                     activeFocusOnTab: true
@@ -130,7 +155,7 @@ Pane {
                     required property var modelData
                     required property int index
                     width: thumbnails.width
-                    height: 178
+                    height: cell.height + 8
                     highlighted: app.currentPage === index
                     Accessible.name: qsTr("Page %1 thumbnail").arg(index + 1)
                     Accessible.selectable: true
@@ -149,11 +174,13 @@ Pane {
                     Column {
                         id: cell
                         objectName: "thumbnailContent" + thumbnail.index
-                        anchors.centerIn: parent
+                        x: (parent.width - thumbnailBar.gutterWidth - width) / 2
+                        anchors.verticalCenter: parent.verticalCenter
                         spacing: 4
                         Rectangle {
                             id: miniature
-                            readonly property real thumbnailScale: Math.min(102 / thumbnail.modelData.width, 135 / thumbnail.modelData.height)
+                            objectName: "thumbnailPaper" + thumbnail.index
+                            readonly property real thumbnailScale: Math.min(132 / thumbnail.modelData.width, 300 / thumbnail.modelData.height)
                             width: thumbnail.modelData.width * thumbnailScale
                             height: thumbnail.modelData.height * thumbnailScale
                             color: app.currentReader.paperBackground(app.paperAppearance)
@@ -167,7 +194,7 @@ Pane {
                                 paperAppearance: app.paperAppearance
                                 controller: app.currentReader
                                 pageIndex: thumbnail.index
-                                rasterScale: Math.min(100 / thumbnail.modelData.width, 133 / thumbnail.modelData.height)
+                                rasterScale: miniature.thumbnailScale
                             }
                             AnnotationsLayer {
                                 anchors.fill: parent
@@ -183,7 +210,7 @@ Pane {
                             horizontalAlignment: Text.AlignHCenter
                             text: thumbnail.index + 1
                             font.pixelSize: 11
-                            color: thumbnail.highlighted ? app.colors.selectedFg : app.colors.textTertiary
+                            color: thumbnail.highlighted ? app.colors.textPrimary : app.colors.textTertiary
                         }
                     }
                     onClicked: app.navigate(index)

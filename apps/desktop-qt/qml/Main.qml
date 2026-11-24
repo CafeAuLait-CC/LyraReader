@@ -164,7 +164,10 @@ ApplicationWindow {
         const leftLyra=previousSecondaryRow==="lyra" && secondaryRow!=="lyra";
         previousSecondaryRow=secondaryRow;
         if(leftLyra)aiPanelVisible=false;
-        if(secondaryRow!=="lyra"){cancelRegionSelection();aiRegionCard.close();}
+        if(secondaryRow!=="lyra"){
+            cancelRegionSelection();
+            if(secondaryRow.length)aiRegionCard.close();
+        }
         annotationToolsVisible=secondaryRow==="annotate";
         if (secondaryRow!=="fill") {clearFillTool();formToolActive=false;}
         if (secondaryRow==="edit" || secondaryRow==="fill") aiPanelVisible=false;
@@ -2402,7 +2405,7 @@ ApplicationWindow {
                 objectName: "readerSidebar"
                 app: root
                 visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !((root.aiPanelVisible || root.editInspectorVisible || root.fillInspectorVisible) && root.width < 1100)
-                Layout.preferredWidth: root.width < 850 ? 210 : 246
+                Layout.preferredWidth: root.width < 850 ? 210 : 250
                 Layout.fillHeight: true
             }
 
