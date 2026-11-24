@@ -42,10 +42,10 @@ use std::{
     ptr, slice,
 };
 
-/// Version of the Qt boundary, including the native ChatGPT sign-in worker.
+/// Version of the Qt boundary, including cache-only text selection geometry.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    18
+    19
 }
 
 /// Persist one resolved quit without deleting any draft. Resolution: 0=save, 1=discard.
@@ -1559,7 +1559,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 18);
+        assert_eq!(lyra_reader_desktop_abi_version(), 19);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

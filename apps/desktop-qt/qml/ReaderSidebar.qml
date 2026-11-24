@@ -136,20 +136,29 @@ Pane {
                     Accessible.selectable: true
                     Accessible.selected: highlighted
                     background: Rectangle {
-                        color: thumbnail.highlighted ? (app.active ? app.colors.selectedBg : app.colors.inactiveSelectionBg) : thumbnail.hovered ? app.colors.hoverBg : app.colors.sidebarBg
-                        border.width: thumbnail.visualFocus ? 2 : 0
-                        border.color: app.colors.focusRing
+                        objectName: "thumbnailSelection" + thumbnail.index
+                        x: cell.x - 4
+                        y: cell.y - 4
+                        width: cell.width + 8
+                        height: cell.height + 8
+                        radius: 6
+                        color: thumbnail.highlighted ? (app.active ? app.colors.selectedBg : app.colors.inactiveSelectionBg) : thumbnail.hovered ? app.colors.hoverBg : "transparent"
+                        border.width: thumbnail.visualFocus || app.selectedPages.indexOf(thumbnail.index) >= 0 ? 2 : 0
+                        border.color: thumbnail.visualFocus ? app.colors.focusRing : app.colors.accentBorder
                     }
                     Column {
+                        id: cell
+                        objectName: "thumbnailContent" + thumbnail.index
                         anchors.centerIn: parent
-                        spacing: 7
+                        spacing: 4
                         Rectangle {
+                            id: miniature
                             readonly property real thumbnailScale: Math.min(102 / thumbnail.modelData.width, 135 / thumbnail.modelData.height)
                             width: thumbnail.modelData.width * thumbnailScale
                             height: thumbnail.modelData.height * thumbnailScale
                             color: app.currentReader.paperBackground(app.paperAppearance)
-                            border.width: thumbnail.highlighted ? 2 : 1
-                            border.color: thumbnail.highlighted ? app.colors.accentBorder : app.colors.pageEdge
+                            border.width: 1
+                            border.color: app.colors.pageEdge
                             PdfPage {
                                 resourceActive: thumbnail.y + thumbnail.height > thumbnails.contentY && thumbnail.y < thumbnails.contentY + thumbnails.height
                                 anchors.fill: parent
@@ -170,9 +179,9 @@ Pane {
                         }
                         Label {
                             textFormat: Text.PlainText
-                            width: 102
+                            width: miniature.width
                             horizontalAlignment: Text.AlignHCenter
-                            text: qsTr("Page %1").arg(thumbnail.index + 1)
+                            text: thumbnail.index + 1
                             font.pixelSize: 11
                             color: thumbnail.highlighted ? app.colors.selectedFg : app.colors.textTertiary
                         }

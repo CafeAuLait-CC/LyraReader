@@ -341,12 +341,14 @@ ApplicationWindow {
         dialogs.flushAnnotation();dialogs.annotationDialog.close();annotationNotePaper.openNote(annotation,true,false);
     }
     property var annotationDraft: null
+    property var pendingTextMarkup: null
     property var redactionDraft: null
     property var eraseDraft: []
     property double pendingDraftRequestId: -1
     property double searchRequestId: -1
     property string brushColor: "#E8BC55"
     property real brushOpacity: 0.32
+    readonly property string markupColor: brushColor + Logic.hex(brushOpacity * 255)
     property real brushWidth: 2
     property string annotationFont: "LyraReader Sans SC"
     property var aiSettings: session ? session.preference("ai", {}) : ({})
@@ -436,6 +438,7 @@ ApplicationWindow {
         previousReader = currentReader;
         selectedAnnotation = null;
         annotationDraft = null;
+        pendingTextMarkup = null;
         redactionDraft = null;
         pendingDraftRequestId = -1;
         selection = null;
@@ -959,8 +962,11 @@ ApplicationWindow {
         session.copyText(copied.text);operationStatus=qsTr("Selection copied.");
     }
     function selectionFinished() {
-        if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0)
+        if (isTextMarkup(annotationTool))
             markSelection(annotationTool);
+    }
+    function isTextMarkup(tool) {
+        return tool === "highlight" || tool === "underline" || tool === "strikeout";
     }
     function pageClicked(page, x, y, sceneX, sceneY) {
         if(placedTextController.deferAction(function(){root.pageClicked(page,x,y,sceneX,sceneY);}))return;
@@ -1318,7 +1324,7 @@ ApplicationWindow {
         if(placedTextController.deferAction(function(){root.setAnnotationTool(tool);}))return;
         if (tool !== "select" && blockXfaWrite()) return;
         annotationTool = annotationTool === tool ? "select" : tool;
-        if (["highlight", "underline", "strikeout"].indexOf(annotationTool) >= 0 && selection)
+        if (isTextMarkup(annotationTool) && selection)
             markSelection(annotationTool);
     }
     property double pendingArtworkRequest: -1
@@ -1423,15 +1429,11 @@ ApplicationWindow {
         if (blockXfaWrite()) return;
         if (!selection)return;
         const entry={kind:kind,page:selection.page,start:Math.min(selection.start,selection.end),
-            end:Math.max(selection.start,selection.end),color:brushColor+Logic.hex(brushOpacity*255),note:""};
-        const text=currentReader.textPages[selection.page.toString()];
-        if(text && (text.selection_excluded_indices || []).length) {
-            // Freeze new selection geometry; existing cached ranges and PDF-owned
-            // annotation appearances are not reinterpreted by a newer recognizer.
-            entry.quads=Logic.quads(text.chars,selection.start,selection.end,text.selection_excluded_indices);
-            if(!entry.quads.length){operationStatus=qsTr("The selection contains no selectable text.");return;}
-        }
-        currentReader.submit("mark_create",{entry:entry});
+            end:Math.max(selection.start,selection.end),color:markupColor,note:""};
+        pendingTextMarkup = Object.assign({},entry,{
+            request:currentReader.submit("mark_create",{entry:entry}),
+            generation:currentReader.documentGeneration
+        });
         selection=null;
     }
     function updateSelectedAnnotation(patch) {
@@ -2388,16 +2390,6 @@ ApplicationWindow {
                 }
             }
         }
-        SecondaryTools {
-            id:secondaryTools
-            objectName:"secondaryTools"
-            app:root
-            visible:root.secondaryRow.length>0 && currentReader.pageCount>0 && !root.overviewVisible && !root.textViewVisible
-            Layout.fillWidth:true
-            Layout.preferredHeight:46
-            Layout.minimumHeight:46
-            Layout.maximumHeight:46
-        }
         DocumentDraftBar {
             app: root
             Layout.fillWidth: true
@@ -2464,6 +2456,13 @@ ApplicationWindow {
                             drop.accepted = true;
                         }
                     }
+                }
+                SecondaryTools {
+                    id:secondaryTools
+                    objectName:"secondaryTools"
+                    app:root
+                    anchors.top:parent.top
+                    width:parent.width
                 }
             }
             ContentInspector {
@@ -2749,6 +2748,12 @@ ApplicationWindow {
         }
         function onCommandFinished(id, op, result, error) {
             const artworkPlacement=id===root.pendingArtworkRequest;
+            const textMarkup=root.pendingTextMarkup && id===root.pendingTextMarkup.request ? root.pendingTextMarkup : null;
+            if (textMarkup) {
+                root.pendingTextMarkup=null;
+                if (error.length && !root.selection && root.annotationTool===textMarkup.kind)
+                    root.selection={page:textMarkup.page,start:textMarkup.start,end:textMarkup.end};
+            }
             if (op.indexOf("ink_erase_") === 0) {
                 if (id !== root.eraserPending || !root.eraserToken.length)
                     return;
@@ -2819,9 +2824,14 @@ ApplicationWindow {
             }
             if (op === "mark_create" || op === "file_adopt") {
                 if (result.selected_id) {
-                    root.selectedAnnotation = root.annotations.find(function (a) {
+                    const created = root.annotations.find(function (a) {
                         return a.id === result.selected_id;
                     }) || null;
+                    // A drag that has just become markup should look like its preview.
+                    // Users can still select it deliberately for note and property editing.
+                    if (op === "mark_create" && created && root.isTextMarkup(created.kind))
+                        return;
+                    root.selectedAnnotation = created;
                     const inlineText=placedTextController.owner===root.currentReader && (placedTextController.creationRequest===id || (placedTextController.active && placedTextController.entry.id===result.selected_id));
                     // A first click adopts/selects FreeText. Opening the legacy property
                     // dialog here would intercept the second click of a real double-click.

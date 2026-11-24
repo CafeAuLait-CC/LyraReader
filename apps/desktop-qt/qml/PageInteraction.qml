@@ -20,7 +20,15 @@ Item {
         chars: [],
         text: ""
     }
-    readonly property var selectedRects: app.selection && app.selection.page === page ? Logic.quads(textPage.chars, app.selection.start, app.selection.end,textPage.selection_excluded_indices) : []
+    readonly property var activeRange: app.selection && app.selection.page === page ? app.selection : null
+    readonly property var pendingRange: {
+        const pending=app.pendingTextMarkup;
+        return pending && pending.page===page && pending.generation===app.currentReader.documentGeneration ? pending : null;
+    }
+    readonly property var displayedRange: activeRange || pendingRange
+    readonly property var selectedRects: displayedRange && textPage.chars.length
+                                         ? app.currentReader.selectionRects(page, displayedRange.start, displayedRange.end) : []
+    readonly property bool markupSelection: (!activeRange && pendingRange !== null) || app.isTextMarkup(app.annotationTool)
     readonly property var searchRects: app.activeSearchHit && app.activeSearchHit.page === page ? Logic.quads(textPage.chars, app.activeSearchHit.start, app.activeSearchHit.end - 1) : []
     Component.onCompleted: app.currentReader.requestText(page)
     Repeater {
@@ -37,28 +45,22 @@ Item {
             border.color: app.colors.accentBorder
         }
     }
-    Repeater {
-        model: annotationLayer.paperActive ? [] : annotationLayer.selectedRects
-        Rectangle {
-            required property var modelData
-            x: modelData.x * app.zoom
-            y: modelData.y * app.zoom
-            width: modelData.width * app.zoom
-            height: modelData.height * app.zoom
-            color: app.colors.textSelectionBg
-            opacity: 0.55
-        }
-    }
-    // Reuse the native clipped vector renderer; selection colors remain UI colors rather
-    // than document-paper colors, and ordinary untorn pages retain their existing nodes.
+    // Reuse the committed markup renderer, including clipping around opened conversation paper.
     PdfAnnotations {
         objectName: "paperTextSelection"
         anchors.fill: parent
-        visible: annotationLayer.paperActive
+        visible: annotations.length > 0
         zoom: app.zoom
         paperMap: annotationLayer.paperMap
-        opacity: .55
-        annotations: annotationLayer.paperActive ? [ {id:"ui-text-selection",kind:"highlight",blend:"normal",color:app.colors.textSelectionBg,quads:annotationLayer.selectedRects} ] : []
+        paperAppearance: annotationLayer.markupSelection || app.paperAppearance === "night" ? app.paperAppearance : "original"
+        annotations: annotationLayer.selectedRects.length ? [{
+            id:"ui-text-selection",
+            kind:!annotationLayer.activeRange && annotationLayer.pendingRange ? annotationLayer.pendingRange.kind
+                 : annotationLayer.markupSelection ? app.annotationTool : "highlight",
+            color:!annotationLayer.activeRange && annotationLayer.pendingRange ? annotationLayer.pendingRange.color
+                  : annotationLayer.markupSelection ? app.markupColor : Qt.alpha(app.colors.textSelectionBg, .55),
+            quads:annotationLayer.selectedRects
+        }] : []
     }
     PdfAnnotations {
         objectName: "paperSearchSelection"

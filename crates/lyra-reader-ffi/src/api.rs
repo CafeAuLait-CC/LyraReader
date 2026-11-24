@@ -2318,8 +2318,7 @@ impl LyraReaderDocument {
     /// fresh read, and the build also prepares the selection cache as a side effect, so the
     /// page the shell just loaded answers its first pointer event without another PDFium read.
     ///
-    /// This is the **only** method that extracts a page for the selection cache. The
-    /// synchronous hit-test/range/string entry points below never call PDFium; on a cache miss
+    /// The synchronous hit-test/range/string entry points below never call PDFium; on a cache miss
     /// they return `Ok(None)` ("not prepared") and the shell answers from its own page model.
     pub fn text_page(&self, page: u32) -> Result<TextPage, LyraReaderFfiError> {
         let model = self.extract_text_page(page)?;
@@ -4765,8 +4764,8 @@ impl LyraReaderDocument {
 
     /// Prepares `page` and counts the PDFium extraction that produced it.
     ///
-    /// Only [`LyraReaderDocument::text_page`] calls this; the synchronous selection entry points
-    /// deliberately cannot, so `loads` also proves that a pointer event never extracts.
+    /// The synchronous selection entry points cannot call this, so `loads` also
+    /// proves that a pointer event never extracts.
     fn retain_selection_text_page(
         &self,
         page: u32,
@@ -4808,6 +4807,22 @@ impl LyraReaderDocument {
         }
         cache.misses += 1;
         Ok(None)
+    }
+
+    /// Worker-only selection preparation for writing a text markup. Keep the
+    /// returned page alive even if another worker evicts its cache entry.
+    pub fn load_selection_text_page(
+        &self,
+        page: u32,
+    ) -> Result<Arc<lyra_reader_text::SelectionTextPage>, LyraReaderFfiError> {
+        if let Some(prepared) = self.prepared_selection_text_page(page)? {
+            return Ok(prepared);
+        }
+        let prepared = Arc::new(lyra_reader_text::SelectionTextPage::new(
+            self.extract_text_page(page)?,
+        ));
+        self.retain_selection_text_page(page, Arc::clone(&prepared));
+        Ok(prepared)
     }
 }
 

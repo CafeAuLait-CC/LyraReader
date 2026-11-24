@@ -90,6 +90,7 @@ public:
 };
 QSGMaterialShader *MultiplyMaterial::createShader(QSGRendererInterface::RenderMode)const{return new MultiplyShader;}
 QColor rgba(const QVariant &value){
+    if(value.metaType()==QMetaType::fromType<QColor>())return value.value<QColor>();
     const auto s=value.toString();
     if(s.size()==9 && s.startsWith('#'))return QColor(s.mid(1,2).toInt(nullptr,16),s.mid(3,2).toInt(nullptr,16),s.mid(5,2).toInt(nullptr,16),s.mid(7,2).toInt(nullptr,16));
     const auto color=value.value<QColor>();return color.isValid()?color:QColor(232,188,85,82);
@@ -176,17 +177,29 @@ QSGNode *AnnotationOverlay::updatePaintNode(QSGNode *old,UpdatePaintNodeData *){
     for(const auto &entry:m_annotations){
         const auto a=entry.toMap();if(a.value(QStringLiteral("visible"),true).toBool()==false)continue;
         const auto kind=a.value(QStringLiteral("kind")).toString();
-        const auto color=PaperAppearance::displayColor(rgba(a.value(QStringLiteral("color"))),PaperAppearance::mode(m_paperAppearance));
+        const auto sourceColor=rgba(a.value(QStringLiteral("color")));
+        const int appearance=PaperAppearance::mode(m_paperAppearance);
+        auto color=PaperAppearance::displayColor(sourceColor,appearance);
         const double width=qMax(0.5,a.value(QStringLiteral("strokeWidth"),2.0).toDouble());
-        QVector<QPointF> vertices;
+        QVector<QPointF> vertices, frame;
+        const bool selected=a.value(QStringLiteral("id")).toString()==m_selected;
+        const auto appendFrame=[&](const QRectF &rect,double padding) {
+            const auto r=rect.adjusted(-padding,-padding,padding,padding);
+            stroke(frame,{r.topLeft(),r.topRight(),r.bottomRight(),r.bottomLeft(),r.topLeft()},1.0/m_zoom);
+        };
         bool multiply=false;
         QRectF bounds=rectangle(a.value(QStringLiteral("rect")).toMap());
         if(kind==QStringLiteral("highlight")||kind==QStringLiteral("underline")||kind==QStringLiteral("strikeout")){
             multiply=a.value(QStringLiteral("blend"),QStringLiteral("multiply")).toString()==QStringLiteral("multiply");
+            if(multiply && m_paperAppearance==QStringLiteral("night")){
+                color=PaperAppearance::nightMarkupColor(sourceColor);
+                multiply=false;
+            }
             for(const auto &q:a.value(QStringLiteral("quads")).toList()){
                 auto r=rectangle(q.toMap());bounds=bounds.isEmpty()?r:bounds.united(r);
-                if(kind==QStringLiteral("underline")){r.setTop(r.bottom()-qMax(0.8,r.height()*0.055));}
-                else if(kind==QStringLiteral("strikeout")){const double y=r.center().y();r.setTop(y-0.45);r.setBottom(y+0.45);}
+                if(selected && !r.isEmpty())appendFrame(r,3);
+                if(kind==QStringLiteral("underline")){r.setTop(r.top()+r.height()*.9);}
+                else if(kind==QStringLiteral("strikeout")){const double h=r.height();r.setTop(r.top()+h*.45);r.setHeight(h*.12);}
                 quad(vertices,r);
             }
         }else if(kind==QStringLiteral("ink")){
@@ -207,11 +220,8 @@ QSGNode *AnnotationOverlay::updatePaintNode(QSGNode *old,UpdatePaintNodeData *){
             stroke(vertices,points,width);
         }
         draw(vertices,color,multiply);
-        if(a.value(QStringLiteral("id")).toString()==m_selected && !bounds.isEmpty()){
-            QVector<QPointF> frame;const auto r=bounds.adjusted(-2,-2,2,2);
-            stroke(frame,{r.topLeft(),r.topRight(),r.bottomRight(),r.bottomLeft(),r.topLeft()},1.0/m_zoom);
-            draw(frame,QColor(154,106,25),false);
-        }
+        if(selected && frame.isEmpty() && !bounds.isEmpty())appendFrame(bounds,2);
+        draw(frame,QColor(154,106,25),false);
     }
     return root;
 }

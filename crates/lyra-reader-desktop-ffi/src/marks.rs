@@ -1410,7 +1410,47 @@ impl Marks {
                 if !validate(&entry, self.page_count)? {
                     return Err("Unsupported annotation schema".into());
                 }
-                Self::quads(&entry, document)?;
+                if ["highlight", "underline", "strikeout"].contains(&kind(&entry))
+                    && entry["quads"].is_null()
+                {
+                    let index = |key| {
+                        entry[key]
+                            .as_u64()
+                            .and_then(|value| u32::try_from(value).ok())
+                            .ok_or("Invalid annotation text range")
+                    };
+                    let page = document
+                        .load_selection_text_page(index("page")?)
+                        .map_err(|error| error.to_string())?;
+                    let (start, end) = (index("start")?, index("end")?);
+                    if start > end || end as usize >= page.chars().len() {
+                        return Err(
+                            "Annotation text range is outside the page. Writes are blocked.".into(),
+                        );
+                    }
+                    let rects = page.layout().selection_rects(start, end);
+                    if rects.is_empty() {
+                        return Err("The selection contains no selectable text.".into());
+                    }
+                    // Freeze the displayed geometry. Old cached ranges and PDF-owned
+                    // QuadPoints keep their existing interpretation.
+                    entry["quads"] = Value::Array(
+                        rects
+                            .into_iter()
+                            .map(|rect| {
+                                json!({
+                                    "x": rect.min_x(), "y": rect.min_y(),
+                                    "width": rect.size.width, "height": rect.size.height
+                                })
+                            })
+                            .collect(),
+                    );
+                    if !validate(&entry, self.page_count)? {
+                        return Err("Unsupported annotation geometry".into());
+                    }
+                } else {
+                    Self::quads(&entry, document)?;
+                }
                 self.change(|s| {
                     s.entries.push(Entry::Known(entry));
                     Ok(())

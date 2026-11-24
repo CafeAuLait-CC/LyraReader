@@ -546,6 +546,36 @@ QVariantMap ReaderController::selectionText(int page,int start,int end) const {
     if(status==LyraReaderSelectionStatus::NotPrepared)return {{QStringLiteral("ready"),false}};
     return {{QStringLiteral("ready"),true},{QStringLiteral("text"),takeError(out)}};
 }
+QVariantList ReaderController::selectionRects(int page,int start,int end) {
+    if (!m_document || page<0 || start<0 || end<0) return {};
+    LyraReaderSelectionRects out{};
+    LyraReaderBuffer error{};
+    const auto status=lyra_reader_desktop_selection_rects(m_document.get(),uint(page),uint(start),uint(end),&out,&error);
+    if (status==LyraReaderSelectionStatus::Error) {
+        qWarning().noquote()<<takeError(error);
+        return {};
+    }
+    if (status==LyraReaderSelectionStatus::NotPrepared) {
+        // The bounded Rust page cache can evict geometry while the Qt text
+        // layer is still available. Warm it off the GUI thread once per page.
+        if (!m_textPending.contains(page)) {
+            m_textPending.insert(page);
+            const auto generation=m_generation;
+            QMetaObject::invokeMethod(this,[this,page,generation] {
+                if (generation==m_generation) submit(QStringLiteral("text"),{{QStringLiteral("page"),page}});
+            },Qt::QueuedConnection);
+        }
+        return {};
+    }
+    QVariantList rects;
+    rects.reserve(qsizetype(out.len));
+    for (std::size_t i=0;i<out.len;++i) {
+        const auto &r=out.rects[i];
+        rects.append(QVariantMap{{"x",r.x},{"y",r.y},{"width",r.width},{"height",r.height}});
+    }
+    lyra_reader_desktop_selection_rects_free(out);
+    return rects;
+}
 QVariantMap ReaderController::normalizedCopiedText(const QString &text) const {
     // At most three UTF-8 bytes per UTF-16 unit; bound the conversion before allocating.
     if(quint64(text.size())>lyra_reader_desktop_selection_copy_limit()/3)

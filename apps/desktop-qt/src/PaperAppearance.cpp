@@ -99,6 +99,14 @@ QColor PaperAppearance::displayColor(const QColor &source,int mode) {
     const auto channels=convert(r,g,b,mode);
     return QColor::fromRgbF(channels[0],channels[1],channels[2],source.alphaF());
 }
+QColor PaperAppearance::nightMarkupColor(const QColor &source) {
+    // Match the night overlay in the shared GPU renderer: lift the paper
+    // towards the displayed ink while leaving solid glyphs unchanged.
+    const double luminance=.2126*linear(source.redF())+.7152*linear(source.greenF())+.0722*linear(source.blueF());
+    auto ink=displayColor(Qt::black,2);
+    ink.setAlphaF(source.alphaF()*(1-luminance));
+    return ink;
+}
 namespace {
 const std::array<QRgb,65536> &grayFigureColours() {
     // Freeze the existing scalar colour conversion, including QColor's alpha rounding.

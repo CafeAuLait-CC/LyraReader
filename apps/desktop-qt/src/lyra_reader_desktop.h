@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 18;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 19;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -136,6 +136,10 @@ void lyra_reader_desktop_cancel_translation(const LyraReaderDesktopDocument *doc
 enum class LyraReaderSelectionStatus : std::uint32_t { Error=0, NotPrepared=1, Ready=2 };
 LyraReaderSelectionStatus lyra_reader_desktop_selection_text(const LyraReaderDesktopDocument *,
     std::uint32_t page,std::uint32_t start,std::uint32_t end,LyraReaderBuffer *output,LyraReaderBuffer *error);
+struct LyraReaderSelectionRects { LyraReaderTileRect *rects; std::size_t len; };
+LyraReaderSelectionStatus lyra_reader_desktop_selection_rects(const LyraReaderDesktopDocument *,
+    std::uint32_t page,std::uint32_t start,std::uint32_t end,LyraReaderSelectionRects *output,LyraReaderBuffer *error);
+void lyra_reader_desktop_selection_rects_free(LyraReaderSelectionRects batch);
 std::size_t lyra_reader_desktop_selection_copy_limit();
 bool lyra_reader_desktop_selection_copy_text(const std::uint8_t *text,std::size_t text_len,
     LyraReaderBuffer *output,LyraReaderBuffer *error);

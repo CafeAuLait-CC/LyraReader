@@ -358,12 +358,20 @@ Item {
     }
     function changeZoom(value, anchorX, anchorY) {
         if(contentDrag.active)contentDrag.cancel();
+        const previous=pendingPaperZoom;
         stopPaperZoomSettlement();++interactionEpoch;
         const cardFrame=regionCardFrame(app.currentReader);
         const card=app.regionPaper;
+        // The previous zoom can leave the gap temporarily shorter than the
+        // unchanged controls while its new plan is pending. Another wheel step
+        // at the same view point is still anchored to that conversation.
+        const continuing=previous && cardFrame && card && previous.owner===app.currentReader
+                && previous.id===paperState.id && previous.interaction+1===interactionEpoch
+                && Math.abs(previous.viewY-anchorY)<1 && card.height<card.fullHeight;
+        const cardHeight=card ? (continuing ? card.fullHeight : card.height) : 0;
         pendingPaperZoom=cardFrame && card && card.opened && anchorX>=cardFrame.x
                 && anchorX<cardFrame.x+cardFrame.width && anchorY>=cardFrame.y
-                && anchorY<cardFrame.y+card.height ? {owner:app.currentReader,id:paperState.id,
+                && anchorY<cardFrame.y+cardHeight ? {owner:app.currentReader,id:paperState.id,
                     interaction:interactionEpoch,viewY:anchorY,offsetY:anchorY-cardFrame.y} : null;
         const anchor = readingAnchor(anchorY,true);
         const old = app.zoom;
@@ -451,6 +459,10 @@ Item {
                     property alias focusTarget: pageInteraction.focusTarget
                     required property var modelData
                     readonly property var displayGeometry:canvas.paperActive ? canvas.paperState.pages[modelData.index] : modelData
+                    readonly property var cut: canvas.paperActive && canvas.paperState.card.page === modelData.index ? canvas.paperState.card : null
+                    readonly property real splitY: cut ? cut.split_pt * app.zoom : 0
+                    readonly property real gapHeight: cut ? cut.gap_pt * canvas.paperProgress * app.zoom : 0
+                    readonly property color paperFill: app.currentReader.paperBackground(app.paperAppearance)
                     function syncPaper() {
                         if(!pdfPage || pdfPage.pageIndex!==modelData.index)return;
                         const card=canvas.paperState.card;
@@ -471,7 +483,9 @@ Item {
                     height: (canvas.paperActive ? canvas.paperMetric(modelData.height,displayGeometry.height) : modelData.height) * app.zoom
                     y:canvas.rowLeading(rowItem.index)
                     x: (pageList.contentWidth - app.currentReader.documentWidth * app.zoom) / 2 + modelData.left * app.zoom
-                    color: app.currentReader.paperBackground(app.paperAppearance)
+                    color: gapHeight > 0 ? "transparent" : paperFill
+                    Rectangle {visible:sheet.gapHeight>0;width:sheet.width;height:sheet.splitY;color:sheet.paperFill}
+                    Rectangle {visible:sheet.gapHeight>0;y:sheet.splitY+sheet.gapHeight;width:sheet.width;height:Math.max(0,sheet.height-y);color:sheet.paperFill}
                     PdfPage {
                         id: pdfPage
                         objectName: "pdfPage" + sheet.modelData.index
@@ -486,6 +500,18 @@ Item {
                         visibleRegion:sheet.sourceViewport()
                         Accessible.role: Accessible.Graphic
                         Accessible.name: qsTr("PDF page %1").arg(sheet.modelData.index + 1)
+                    }
+                    Loader {
+                        active: sheet.cut !== null
+                        anchors.fill: parent
+                        sourceComponent: PaperTearEdges {
+                            objectName: "aiRegionPaperTear"
+                            page: sheet.modelData.index
+                            split: sheet.splitY
+                            gap: sheet.gapHeight
+                            zoom: app.zoom
+                            colors: app.colors
+                        }
                     }
                     Item {id:objectDragHost;anchors.fill:parent;clip:true}
                     AnnotationsLayer {

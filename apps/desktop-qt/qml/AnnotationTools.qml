@@ -18,8 +18,9 @@ ToolBar {
         selected:tools.app.annotationTool===kind
         onClicked:tools.app.setAnnotationTool(kind)
     }
-    Row {
-        x:14;y:7;spacing:0
+    SecondaryToolStrip {
+        anchors.fill:parent
+        spacing:0
         Row {
             objectName:"annotateGroupMarkup"
             spacing:2

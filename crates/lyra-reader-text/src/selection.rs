@@ -168,6 +168,48 @@ impl SelectionLayout {
         &self.lines
     }
 
+    /// Visual runs for an inclusive drag range in page-local view points. Use the
+    /// same line height and distance rule as Swift's selectionRects(in:).
+    pub fn selection_rects(&self, start: u32, end: u32) -> Vec<Rect> {
+        let (first, last) = (start.min(end), start.max(end));
+        let relevant = self
+            .lines
+            .partition_point(|line| line.stops.last().is_some_and(|stop| stop.index < first));
+        let mut rects = Vec::new();
+        for line in &self.lines[relevant..] {
+            if line.stops.first().is_some_and(|stop| stop.index > last) {
+                break;
+            }
+            let height = line.bounds.size.height;
+            let offset = line.stops.partition_point(|stop| stop.index < first);
+            let mut run: Option<Rect> = None;
+            for stop in &line.stops[offset..] {
+                if stop.index > last {
+                    break;
+                }
+                let rect = Rect::new(
+                    stop.rect.min_x(),
+                    line.bounds.min_y(),
+                    stop.rect.size.width,
+                    height,
+                );
+                if let Some(current) = run {
+                    let gap = (rect.min_x() - current.max_x()).max(current.min_x() - rect.max_x());
+                    if gap <= height * 1.5 {
+                        run = Some(current.union(rect));
+                        continue;
+                    }
+                    if current.size.width > 0.0 {
+                        rects.push(current);
+                    }
+                }
+                run = Some(rect);
+            }
+            rects.extend(run.filter(|rect| rect.size.width > 0.0));
+        }
+        rects
+    }
+
     /// Original PDF character indices of confidently recognized manuscript line numbers.
     pub fn excluded_indices(&self) -> &[u32] {
         &self.excluded_indices
@@ -880,6 +922,31 @@ mod tests {
         assert_eq!(stops.len(), 3, "the space gets an interpolated stop");
         assert_eq!(stops[1].index, 1);
         assert!(stops[1].rect.size.width > 0.0);
+    }
+
+    #[test]
+    fn markup_rects_join_words_without_filling_a_line_break_or_gutter() {
+        let chars = vec![
+            character('g' as u32, 10.0, 10.0, 6.0, 10.0),
+            character(' ' as u32, 0.0, 0.0, 0.0, 0.0),
+            character('a' as u32, 21.0, 10.0, 5.0, 7.0),
+            character('b' as u32, 80.0, 10.0, 5.0, 8.0),
+            character('\n' as u32, 0.0, 0.0, 0.0, 0.0),
+            character('c' as u32, 10.0, 28.0, 7.0, 7.0),
+        ];
+        let layout = SelectionLayout::build(&chars);
+        let expected = [
+            Rect::new(10.0, 10.0, 16.0, 10.0),
+            Rect::new(80.0, 10.0, 5.0, 10.0),
+            Rect::new(10.0, 28.0, 7.0, 7.0),
+        ];
+        assert_eq!(layout.selection_rects(0, 5), expected);
+        assert_eq!(layout.selection_rects(5, 0), expected);
+        assert_eq!(
+            layout.selection_rects(2, 2),
+            [Rect::new(21.0, 10.0, 5.0, 10.0)]
+        );
+        assert!(layout.selection_rects(4, 4).is_empty());
     }
 
     #[test]

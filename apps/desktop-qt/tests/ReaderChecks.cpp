@@ -1640,10 +1640,20 @@ private slots:
         const auto readConfig=[&]{const auto value=window->property("aiSettings");return value.metaType()==QMetaType::fromType<QJSValue>() ? value.value<QJSValue>().toVariant().toMap() : value.toMap();};const auto config=readConfig();
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());auto *choice=settings->findChild<QObject *>("settingsRegionConversationStyle");QVERIFY(choice);const int index=style=="window" ? 0 : 1;choice->setProperty("currentIndex",index);QVERIFY(QMetaObject::invokeMethod(choice,"activated",Q_ARG(int,index)));QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
         QVERIFY(card->property("opened").toBool());QCOMPARE(readConfig(),config);
-        auto *transcript=window->findChild<QQuickItem *>("aiRegionTranscript"),*crop=window->findChild<QQuickItem *>("aiRegionImage");QVERIFY(transcript && crop);QTRY_COMPARE(crop->property("status").toInt(),1);
-        const auto readable=[&]{const auto imageRect=crop->mapRectToItem(card,crop->boundingRect()),viewport=transcript->mapRectToItem(card,transcript->boundingRect());return imageRect.height()>=32 && imageRect.top()>=viewport.top()-1 && imageRect.bottom()<=viewport.bottom()+1;};
-        qInfo()<<"Region style actual viewport"<<window->size()<<"card"<<card->size()<<"transcript"<<transcript->height()<<"capture"<<crop->height();QVERIFY2(readable(),"The complete captured-area thumbnail must fit in the transcript viewport");
+        auto *transcript=window->findChild<QQuickItem *>("aiRegionTranscript"),*crop=window->findChild<QQuickItem *>("aiRegionImage");QVERIFY(transcript && crop);
+        auto *captureButton=window->findChild<QQuickItem *>("viewAiRegionCapture");QVERIFY(captureButton);
+        auto *popup=window->findChild<QObject *>("aiRegionCapturePreview");QVERIFY(popup);
+        auto *captureScroll=window->findChild<QQuickItem *>("aiRegionCaptureScroll");QVERIFY(captureScroll);
+        QVERIFY(!popup->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(captureButton,"clicked"));QTRY_VERIFY(popup->property("visible").toBool());QTRY_COMPARE(crop->property("status").toInt(),1);
+        const auto readable=[&]{const auto imageRect=crop->mapRectToItem(captureScroll,crop->boundingRect());return imageRect.height()>=32 && imageRect.top()>=-1 && imageRect.bottom()<=captureScroll->height()+1;};
+        qInfo()<<"Region style actual viewport"<<window->size()<<"card"<<card->size()<<"transcript"<<transcript->height()<<"capture"<<crop->height();QVERIFY2(readable(),"The complete captured-area thumbnail must fit in its popover");
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());
         QCOMPARE(card->property("parchment").toBool(),style=="parchment");QCOMPARE(surface->property("color").value<QColor>(),colors->property(style=="window" ? "raisedBg" : "panelBg").value<QColor>());QCOMPARE(question->property("placeholderTextColor").value<QColor>(),colors->property("textPlaceholder").value<QColor>());
+        for(const auto &name:{"aiRegionPaperFold","aiRegionPaperFibres"}) {
+            auto *decoration=visualItem(surface,name);QVERIFY(decoration);QCOMPARE(decoration->isVisible(),style=="parchment");
+        }
+        auto *tear=visualItem(window->contentItem(),"aiRegionPaperTear");QVERIFY(tear && tear->isVisible());
         if(style=="window")QCOMPARE(field->property("color").value<QColor>(),colors->property("fieldBg").value<QColor>());
         QTest::qWait(150);QCOMPARE(reader->aiRegion(),capture);QCOMPARE(reader->aiState().value("plan"),plan);QCOMPARE(reader->aiRegionImage(),image);QCOMPARE(imageChanges.size(),0);QCOMPARE(reader->documentGeneration(),generation);QCOMPARE(reader->completedRasters(),rasters);QCOMPARE(server.requests.size(),0);
         question->forceActiveFocus();QTRY_VERIFY(question->hasActiveFocus());
@@ -1655,11 +1665,16 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());auto *baseUrl=settings->findChild<QObject *>("settingsBaseUrl");QVERIFY(baseUrl);baseUrl->setProperty("text",server.baseUrl()+"/changed");QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(reader->aiState().value("plan").toMap().isEmpty());QCOMPARE(readConfig().value("futureSetting").toString(),QString("keep-region-style"));
         if(qEnvironmentVariableIsSet("LYRA_READER_REGION_STYLE_NARROW")) {
             window->resize(640,440);QVERIFY(settleReaderViewport(window));QTRY_VERIFY_WITH_TIMEOUT(card->property("opened").toBool() && !card->property("motionActive").toBool() && card->y()>=-1 && card->y()+card->height()<=card->parentItem()->height()+1,10000);
+            QVERIFY(QMetaObject::invokeMethod(captureButton,"clicked"));QTRY_VERIFY(popup->property("visible").toBool());
             QTRY_VERIFY2_WITH_TIMEOUT(readable(),"The complete capture must remain usable at the minimum window size",10000);
+            QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());
             auto *prepare=window->findChild<QQuickItem *>("prepareAiRegion"),*send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(prepare && send);auto *status=window->findChild<QQuickItem *>("aiRegionRequestStatus"),*persistence=window->findChild<QQuickItem *>("aiRegionPersistenceStatus");QVERIFY(status && persistence);for(auto *button:{prepare,send,status,persistence}){if(!button->isVisible())continue;const auto bounds=button->mapRectToItem(card,button->boundingRect());QVERIFY(bounds.top()>=0 && bounds.bottom()<=card->height()+1);}
             qInfo()<<"Region style minimum actual viewport"<<window->size()<<"transcript"<<transcript->height()<<"capture"<<crop->height();if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-minimum.png"));
-            auto *saveNote=window->findChild<QQuickItem *>("saveAiRegionNote");QVERIFY(saveNote);QTRY_VERIFY(saveNote->isEnabled());saveNote->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(saveNote->hasActiveFocus());
-            const auto actionVisible=[&]{const auto bounds=saveNote->mapRectToItem(transcript,saveNote->boundingRect());return bounds.top()>=-1 && bounds.bottom()<=transcript->height()+1;};QTRY_VERIFY2_WITH_TIMEOUT(actionVisible(),"Keyboard focus must reveal the auxiliary action inside the bounded transcript",5000);if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-minimum-actions.png"));
+            auto *actions=window->findChild<QQuickItem *>("aiRegionActions");QVERIFY(actions);
+            actions->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(actions->hasActiveFocus());QTest::keyClick(window,Qt::Key_Space);
+            auto *saveNote=window->findChild<QQuickItem *>("saveAiRegionNote");QVERIFY(saveNote);QTRY_VERIFY(saveNote->isVisible() && saveNote->isEnabled());
+            if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"-"+appearance+"-"+style+"-minimum-actions.png"));
+            QTest::keyClick(window,Qt::Key_Escape);
         }
         QCOMPARE(server.requests.size(),0);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),sourceBytes);
     }
@@ -1826,14 +1841,20 @@ private slots:
         QTRY_VERIFY(!window->property("positionRestoring").toBool());
         auto *list=visualItem(window->contentItem(),"pageList");QVERIFY(list);
         QVERIFY(settleReaderViewport(window));
-        // The tool row changes the real viewport even when a tiling compositor
-        // owns the top-level height and declines application resize requests.
+        // Opening a tool overlay must not act like a viewport resize.
         QVERIFY(QMetaObject::invokeMethod(window,"toggleSecondaryRow",Q_ARG(QVariant,"annotate")));QVERIFY(settleReaderViewport(window));
         const double calibration=window->property("calibrationFactor").toDouble();
         auto choose=[&](double percent){window->setProperty("fitting",false);return QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,percent/100*calibration),Q_ARG(QVariant,0),Q_ARG(QVariant,0));};
         QVERIFY(choose(25));window->resize(window->width()+40,window->height());QVERIFY(settleReaderViewport(window));
         QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
+        const auto initialHeight=list->height();
         QVERIFY(QMetaObject::invokeMethod(window,"toggleSecondaryRow",Q_ARG(QVariant,"annotate")));
+        QVERIFY(settleReaderViewport(window));
+        QCOMPARE(list->height(),initialHeight);
+        QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
+        window->resize(window->width(),window->height()+80);
+        QTRY_VERIFY(list->height()>initialHeight);
+        QVERIFY(settleReaderViewport(window));
         const auto pageHeight=reader->pages().first().toMap().value("height").toDouble();
         const auto pageWidth=reader->pages().first().toMap().value("width").toDouble();
         const auto fit=[&]{return std::clamp(std::floor(std::min((list->height()-16)/pageHeight,(list->width()-64)/pageWidth)/calibration*100),25.0,400.0);};
@@ -1898,7 +1919,10 @@ private slots:
             const double calibrated=window->property("calibrationFactor").toDouble();
             QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,.25*calibrated),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
             QVERIFY(reader->fitPresentation().isEmpty());
+            const auto height=list->height();
             QVERIFY(QMetaObject::invokeMethod(window,"toggleSecondaryRow",Q_ARG(QVariant,"annotate")));QVERIFY(settleReaderViewport(window));
+            QCOMPARE(list->height(),height);QCOMPARE(window->property("zoomPercent").toDouble(),25.0);
+            window->resize(window->width(),window->height()+28);QTRY_VERIFY(list->height()>height);QVERIFY(settleReaderViewport(window));
             QVERIFY(window->property("zoomPercent").toDouble()>25);QVERIFY(!reader->fitPresentation().isEmpty());
             const double fitted=window->property("zoomPercent").toDouble();
             window->setProperty("sidebarVisible",!window->property("sidebarVisible").toBool());QTest::qWait(80);
@@ -2881,7 +2905,9 @@ private slots:
         QVERIFY(sidebar);
         auto *current = sidebar->property("currentItem").value<QQuickItem *>();
         QVERIFY(current);
-        const auto point = current->mapToScene(QPointF(current->width() - 10, current->height() / 2));
+        auto *selection=visualItem(current,"thumbnailSelection0");
+        QVERIFY(selection);
+        const auto point = selection->mapToScene(QPointF(3, selection->height() / 2));
         const double sx = double(frame.width()) / window->width();
         const double sy = double(frame.height()) / window->height();
         const auto selected = frame.pixelColor(qRound(point.x() * sx), qRound(point.y() * sy));
@@ -3015,6 +3041,128 @@ private slots:
         // Updating an unrelated item must not multiply the unchanged highlight
         // onto an already tinted backing store outside the software dirty clip.
         for(int i=0;i<12;++i){window->setProperty("pulse",double(i%2));QTest::qWait(16);const auto frame=window->grabWindow();QCOMPARE(frame.pixelColor(qRound(30*sx),qRound(40*sy)),paper);QCOMPARE(frame.pixelColor(qRound(90*sx),qRound(40*sy)),ink);}
+    }
+    void liveTextSelectionPreservesInkAndMarkupUsesTheSameContinuousLine() {
+        QTemporaryDir scratch;
+        const auto path=scratch.filePath("selected-line.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;
+        auto *window=view.window;
+        QVERIFY(window);
+        window->setProperty("appearance","light");
+        window->setProperty("paperAppearance","original");
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==1 && !reader->pendingCommands(),10000);
+        QVERIFY(settleReaderViewport(window));
+        reader->requestText(0);
+        QTRY_VERIFY_WITH_TIMEOUT(reader->textPages().contains("0"),10000);
+        QQuickItem *page=nullptr;
+        QTRY_VERIFY_WITH_TIMEOUT((page=visualItem(window->contentItem(),"pdfPage0")) && page->property("texturesReady").toBool(),10000);
+        auto *paint=visualItem(window->contentItem(),"paperTextSelection");
+        QVERIFY(paint);
+        const auto chars=reader->textPages().value("0").toMap().value("chars").toList();
+        QString text;
+        for(const auto &c:chars) {
+            const auto u=c.toMap().value("unicode").toUInt();
+            text.append(u<128 ? QChar(u) : QChar(0xfffd));
+        }
+        const QString phrase="The quick brown fox";
+        const int start=int(text.indexOf(phrase)),end=start+int(phrase.size())-1;
+        QVERIFY(start>=0);
+        const auto map=[](const QVariant &v) {
+            return v.metaType()==QMetaType::fromType<QJSValue>() ? v.value<QJSValue>().toVariant().toMap() : v.toMap();
+        };
+        const auto selectedRange=QVariantMap{{"page",0},{"start",end},{"end",start}};
+        const auto plain=window->grabWindow();
+        QVERIFY(!plain.isNull());
+        const auto zoom=window->property("zoom").toDouble();
+        const auto glyphCenter=[&](int index) {
+            const auto glyph=chars.at(index).toMap();
+            return page->mapToScene(QPointF((glyph.value("x_pt").toDouble()+glyph.value("width_pt").toDouble()/2)*zoom,
+                                           (glyph.value("y_pt").toDouble()+glyph.value("height_pt").toDouble()/2)*zoom)).toPoint();
+        };
+        QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,glyphCenter(end));
+        QTest::mouseMove(window,glyphCenter(start),20);
+        QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,glyphCenter(start));
+        QTRY_VERIFY(paint->isVisible());
+        QCOMPARE(map(window->property("selection")),selectedRange);
+        const auto selection=paint->property("annotations").toList().first().toMap();
+        const auto quadList=selection.value("quads").toList();
+        QCOMPARE(quadList.size(),1);
+        const auto bounds=quadList.first().toMap();
+        const QRectF rect=page->mapRectToScene(QRectF(bounds.value("x").toDouble()*zoom,bounds.value("y").toDouble()*zoom,
+                                      bounds.value("width").toDouble()*zoom,bounds.value("height").toDouble()*zoom));
+        const double sx=double(plain.width())/window->width(),sy=double(plain.height())/window->height();
+        const QRect pixels=QRectF(rect.x()*sx,rect.y()*sy,rect.width()*sx,rect.height()*sy).toAlignedRect().adjusted(1,1,-1,-1);
+        QVERIFY(plain.rect().contains(pixels));
+        QPoint whitePixel(-1,-1);
+        for(int y=pixels.top();y<=pixels.bottom() && whitePixel.x()<0;++y)
+            for(int x=pixels.left();x<=pixels.right();++x)
+                if(qGray(plain.pixel(x,y))>250){whitePixel=QPoint(x,y);break;}
+        QVERIFY(pixels.contains(whitePixel));
+        const auto readPixels=[&](const QImage &before,const QImage &after,bool night) {
+            if(after.size()!=before.size())return false;
+            int ink=0,paper=0;
+            for(int y=pixels.top();y<=pixels.bottom();++y)for(int x=pixels.left();x<=pixels.right();++x) {
+                const auto a=before.pixelColor(x,y),b=after.pixelColor(x,y);
+                if(night ? qGray(a.rgb())>185 : qGray(a.rgb())<32) {
+                    // At a fractional zoom the raster may contain only antialiased gray
+                    // strokes. Dark ink may darken under Multiply, but must not lighten.
+                    if(night ? (b.red()>=a.red()-2 && b.green()>=a.green()-2 && b.blue()>=a.blue()-2)
+                             : (b.red()<=a.red()+2 && b.green()<=a.green()+2 && b.blue()<=a.blue()+2))++ink;
+                } else if(night ? (qGray(a.rgb())<40 && qGray(b.rgb())>qGray(a.rgb())+10)
+                                : (qGray(a.rgb())>250 && b.blue()<a.blue()-15))++paper;
+            }
+            return ink>5 && paper>10;
+        };
+        const auto capture=qEnvironmentVariable("LYRA_READER_QT_UI_CAPTURE");
+        if(!capture.isEmpty()){
+            QTest::qWait(80);
+            QVERIFY(plain.save(capture+"/selection-plain.png"));
+            QVERIFY(window->grabWindow().save(capture+"/text-selection.png"));
+            qInfo()<<"Selection sample in pixels"<<pixels<<"rgba"<<selection.value("color")<<"paint"<<paint->mapRectToScene(paint->boundingRect());
+        }
+        QTRY_VERIFY(readPixels(plain,window->grabWindow(),false));
+        window->setProperty("selection",QVariant());
+        window->setProperty("paperAppearance","night");
+        QImage dark;
+        QTRY_VERIFY(!(dark=window->grabWindow()).isNull() && qGray(dark.pixel(whitePixel))<60);
+        window->setProperty("selection",selectedRange);
+        QTRY_VERIFY(readPixels(dark,window->grabWindow(),true));
+        window->setProperty("selection",QVariant());
+        window->setProperty("paperAppearance","original");
+        QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));
+        QVERIFY(QMetaObject::invokeMethod(window,"setAnnotationTool",Q_ARG(QVariant,"highlight")));
+        window->setProperty("selection",selectedRange);
+        const auto live=paint->property("annotations").toList().first().toMap();
+        QCOMPARE(live.value("kind").toString(),QString("highlight"));
+        QCOMPARE(live.value("color").toString(),window->property("markupColor").toString());
+        QCOMPARE(live.value("quads").toList(),quadList);
+        QVERIFY(QMetaObject::invokeMethod(window,"selectionFinished"));
+        QCOMPARE(paint->property("annotations").toList().first().toMap(),live);
+        QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        const auto marks=reader->data().value("marks").toMap().value("annotations").toList();
+        QCOMPARE(marks.size(),1);
+        QCOMPARE(marks.first().toMap().value("quads").toList().size(),1);
+        QVERIFY(!paint->isVisible());
+        QVERIFY(map(window->property("selectedAnnotation")).isEmpty());
+        auto *rows=visualItem(window->contentItem(),"secondaryTools");
+        QVERIFY(rows);
+        QTRY_COMPARE(rows->height(),46.0);
+        if(!capture.isEmpty())QVERIFY(window->grabWindow().save(capture+"/continuous-highlight.png"));
+        QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->pendingCommands() && !reader->hasUnsavedChanges(),15000);
+        ReaderController reopened;
+        reopened.openFile(QUrl::fromLocalFile(path));
+        QTRY_VERIFY_WITH_TIMEOUT(reopened.pageCount()==1 && !reopened.pendingCommands(),10000);
+        const auto saved=reopened.data().value("annotations").toList();
+        QCOMPARE(saved.size(),1);
+        const auto savedQuads=saved.first().toMap().value("quads").toList();
+        QCOMPARE(savedQuads.size(),1);
+        const auto savedRect=savedQuads.first().toMap();
+        QVERIFY(qAbs(savedRect.value("width_pt").toDouble()-bounds.value("width").toDouble())<0.05);
     }
     void printingUsesImmutableEditedPagesAndKeepsTheSourceUntouched() {
         QTemporaryDir scratch;
@@ -5167,7 +5315,7 @@ private slots:
         QVERIFY(std::abs(attachment.value("width_pt").toDouble()-420)<pointerTolerance);QVERIFY(std::abs(attachment.value("height_pt").toDouble()-180)<pointerTolerance);
         QVERIFY(std::abs(picture.width()-840)<=std::ceil(pointerTolerance*2));QVERIFY(std::abs(picture.height()-360)<=std::ceil(pointerTolerance*2));
         if(qEnvironmentVariableIsSet("LYRA_READER_REGION_DARK_NARROW")){window->setProperty("appearance","dark");window->resize(700,600);QTest::qWait(100);}
-        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QTRY_VERIFY(card->property("visible").toBool());auto *crop=window->findChild<QObject *>("aiRegionImage");QVERIFY(crop);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QTRY_VERIFY(card->property("visible").toBool());
         QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool(),10000);
         auto *paperCard=qobject_cast<QQuickItem *>(card);QVERIFY(paperCard);QCOMPARE(paperCard->parentItem()->objectName(),QString("documentCanvas"));
         QCOMPARE(reader->pages(),sourcePages);QCOMPARE(reader->layoutRows(),sourceRows);QCOMPARE(visualItem(window->contentItem(),"pdfPage0"),page);
@@ -5186,8 +5334,13 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(card,"open"));QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool(),10000);
         QTRY_VERIFY(!card->property("motionActive").toBool() && paperCard->y()>=-1 && paperCard->y()+paperCard->height()<=canvas->height()+1);
         const auto paperSnapshot=qEnvironmentVariable("LYRA_READER_REGION_PAPER_SNAPSHOT");if(!paperSnapshot.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(paperSnapshot));}
+        auto *crop=window->findChild<QObject *>("aiRegionImage"),*popup=window->findChild<QObject *>("aiRegionCapturePreview"),*captureButton=window->findChild<QObject *>("viewAiRegionCapture");
+        QVERIFY(crop && popup && captureButton);
+        QVERIFY(QMetaObject::invokeMethod(captureButton,"clicked"));QTRY_VERIFY(popup->property("visible").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
         QVERIFY2(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-double(picture.width())/picture.height())<.001,"The captured area must keep its pixel aspect ratio in the bounded preview");
         window->setProperty("paperAppearance","night");QCOMPARE(reader->aiRegion().value("image_png"),attachment.value("image_png"));QCOMPARE(crop->property("paperAppearance").toString(),QString("original"));
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());
         QSignalSpy imageChanges(reader,&ReaderController::aiRegionImageChanged);const auto imageUrl=reader->aiRegionImage();
         reader->setAiRegionQuestion("What is shown in this synthetic area?");QCOMPARE(imageChanges.size(),0);QCOMPARE(reader->aiRegionImage(),imageUrl);QVERIFY(QMetaObject::invokeMethod(card,"prepare"));
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),10000);QCOMPARE(server.requests.size(),0);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
@@ -5246,7 +5399,11 @@ private slots:
         for(const auto &row:regionReads)if(row[0].toULongLong()==blockedRead){QVERIFY(row[3].toString().isEmpty());blockedEntry=row[2].toMap();}
         QCOMPARE(blockedEntry.value("turns").toList().size(),4);QCOMPARE(blockedEntry.value("turns").toList()[2].toMap().value("state").toString(),QString("cancelled"));QVERIFY(blockedEntry.value("turns").toList()[2].toMap().value("answer").toString().contains("partial area answer"));QVERIFY(!blockedEntry.value("turns").toList().last().toMap().contains("sourcePages"));QCOMPARE(server.requests.size(),3);
 
-        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);QVERIFY(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",220},{"height",440}},1));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiRegion().value("image_png").toString().isEmpty(),10000);
+        QVERIFY(QMetaObject::invokeMethod(captureButton,"clicked"));QTRY_VERIFY(popup->property("visible").toBool());
+        QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
+        QTRY_VERIFY_WITH_TIMEOUT(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-.5)<.001,10000);
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());
         window->setProperty("textViewVisible",true);auto *readable=visualItem(window->contentItem(),"accessiblePageText");QVERIFY(readable);QTRY_VERIFY(readable->isVisible());
         QVERIFY(QMetaObject::invokeMethod(card,"close"));QTRY_VERIFY(readable->hasActiveFocus());QVERIFY(reader->aiRegionPaper().isEmpty());QVERIFY(!card->property("opened").toBool());QCOMPARE(server.requests.size(),3);
         QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *savedNotes=window->findChild<QObject *>("regionNotes");QVERIFY(savedNotes);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
@@ -5287,9 +5444,9 @@ private slots:
         window->setProperty("secondaryRow","lyra");QVERIFY(QMetaObject::invokeMethod(card,"open"));
         QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegionPaper().contains("rows") && card->property("motionActive").toBool(),10000);
         QTRY_VERIFY_WITH_TIMEOUT(card->property("revealProgress").toDouble()>0,10000);
-        auto *crop=window->findChild<QObject *>("aiRegionImage");QVERIFY(crop);
-        QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
-        // A single PNG decode belongs to opening the card, not to its geometry frames.
+        auto *capturePreview=window->findChild<QObject *>("aiRegionCapturePreview");QVERIFY(capturePreview);
+        QVERIFY(!capturePreview->property("visible").toBool());
+        // The separate capture popover does not participate in the reveal geometry.
         auto *animation=window->findChild<QObject *>("paperRevealMotion");QVERIFY(animation);QCOMPARE(animation->property("duration").toInt(),220);
         QVERIFY(QMetaObject::invokeMethod(animation,"pause"));QVERIFY(card->property("motionActive").toBool());
         const auto before=enqueued();const auto plans=reader->tilePlanBatches();
@@ -6265,8 +6422,10 @@ private slots:
         const auto candidate=[&]{return reader->aiState().value("regionNoteCandidate").toMap();};
         const auto review=[&](int previous,const QString &reply) {
             QVERIFY(QMetaObject::invokeMethod(card,"open"));
+            auto *actions=card->findChild<QObject *>("aiRegionActions"),*menu=card->findChild<QObject *>("aiRegionActionMenu");QVERIFY(actions && menu);
+            QVERIFY(QMetaObject::invokeMethod(actions,"clicked"));
             QTRY_VERIFY(preview->property("visible").toBool() && preview->property("enabled").toBool());
-            QVERIFY(QMetaObject::invokeMethod(preview,"clicked"));
+            QVERIFY(QMetaObject::invokeMethod(preview,"triggered"));QVERIFY(QMetaObject::invokeMethod(menu,"close"));
             QTRY_COMPARE(plan().value("kind").toString(),QString("region_knowledge_note"));
             QTRY_VERIFY(send->property("enabled").toBool());QCOMPARE(server.requests.size(),previous);
             const auto exact=plan().value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
@@ -7804,8 +7963,19 @@ private slots:
         WorkspaceController workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
         workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         auto *rows=window->findChild<QQuickItem *>("secondaryTools");QVERIFY(rows);
+        auto *area=visualItem(window->contentItem(),"readingArea");QVERIFY(area);
+        auto *list=visualItem(area,"pageList");QVERIFY(list);
+        QVERIFY(settleReaderViewport(window));
+        const auto viewport=list->mapRectToScene(list->boundingRect());
         for(const auto &row:{"annotate","edit","fill","export","lyra"}) {
-            QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,row),Q_ARG(QVariant,false)));QTRY_COMPARE(window->property("secondaryRow").toString(),QString(row));QTRY_VERIFY(rows->isVisible());QCOMPARE(rows->height(),46.0);
+            QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,row),Q_ARG(QVariant,false)));QTRY_COMPARE(window->property("secondaryRow").toString(),QString(row));QTRY_VERIFY(rows->isVisible());QTRY_COMPARE(rows->height(),46.0);
+            QCOMPARE(rows->mapRectToItem(area,rows->boundingRect()),QRectF(0,0,area->width(),46));
+            QCOMPARE(list->mapRectToScene(list->boundingRect()),viewport);
+            for(const auto &name:{"editTextTool","fillTooldate","exportCommandsaveAs","lyraRegionTool","lyraWorkspacesummary"}) {
+                auto *button=visualItem(rows,name);QVERIFY(button);
+                if(button->isVisible() && button->width()>34)
+                    QTRY_VERIFY(button->property("implicitContentWidth").toDouble()<=button->property("availableWidth").toDouble());
+            }
             int visible=0;for(const auto &name:{"annotationToolRow","editToolRow","fillSignToolRow","exportToolRow","lyraToolRow"}){auto *item=rows->findChild<QQuickItem *>(name);QVERIFY(item);if(item->isVisible())++visible;}QCOMPARE(visible,1);
             if(qEnvironmentVariableIsSet("LYRA_READER_QT_UI_CAPTURE")) {const auto directory=qEnvironmentVariable("LYRA_READER_QT_UI_CAPTURE");QVERIFY(QDir().mkpath(directory));QTest::qWait(80);const auto image=window->grabWindow();QVERIFY(!image.isNull());QVERIFY(image.save(directory+"/row-"+row+".png"));}
         }
@@ -8090,15 +8260,32 @@ private slots:
         QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
         NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
         QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSidebar",Q_ARG(QVariant,"thumbnails")));
+        QQuickItem *tile=nullptr,*selection=nullptr;
+        QTRY_VERIFY((tile=visualItem(view.window->contentItem(),"thumbnailContent0")) && (selection=visualItem(view.window->contentItem(),"thumbnailSelection0")));
+        QCOMPARE(selection->mapRectToItem(tile,selection->boundingRect()),tile->boundingRect().adjusted(-4,-4,4,4));
+        QVERIFY(selection->width()<visualItem(view.window->contentItem(),"pagesSidebar")->width());
         QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));
         auto *row=visualItem(view.window->contentItem(),"annotationToolRow");QVERIFY(row);QCOMPARE(row->height(),46.0);
         const QStringList groups{"annotateGroupMarkup","annotateGroupPointer","annotateGroupPlacement"};
         const QStringList buttons{"annotateToolhighlight","annotateToolunderline","annotateToolstrikeout","annotateToolink","annotateTooleraser","annotateTooltextBox","annotateShapes","annotateToolstickyNote","annotateStamp","annotateSignature"};
         for(int width:{1200,700,640}) {
-            view.window->setWidth(width);QTest::qWait(50);double right=-20;
-            for(const auto &name:groups){auto *group=visualItem(row,name);QVERIFY(group);const auto frame=group->mapRectToItem(row,group->boundingRect());QCOMPARE(frame.left()-right,34.0);right=frame.right();}
-            for(const auto &name:buttons){auto *button=visualItem(row,name);QVERIFY(button && button->isVisible());QCOMPARE(button->width(),34.0);QCOMPARE(button->height(),32.0);const auto frame=button->mapRectToItem(row,button->boundingRect());QVERIFY(frame.left()>=0 && frame.right()<=width);auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible && !accessible->text(QAccessible::Name).isEmpty());}
-            auto *colour=visualItem(row,"annotateColour");QVERIFY(colour);QVERIFY(colour->mapRectToItem(row,colour->boundingRect()).right()<=width);
+            view.window->setWidth(width);QTest::qWait(80);double left=0,right=0;
+            for(const auto &name:groups){auto *group=visualItem(row,name);QVERIFY(group);const auto frame=group->mapRectToItem(row,group->boundingRect());if(name==groups.first())left=frame.left();else QCOMPARE(frame.left()-right,34.0);right=frame.right();}
+            for(const auto &name:buttons){auto *button=visualItem(row,name);QVERIFY(button && button->isVisible());QCOMPARE(button->width(),34.0);QCOMPARE(button->height(),32.0);const auto frame=button->mapRectToItem(row,button->boundingRect());QVERIFY(frame.left()>=0 && frame.right()<=width);QCOMPARE(frame.center().y(),23.0);auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible && !accessible->text(QAccessible::Name).isEmpty());}
+            auto *colour=visualItem(row,"annotateColour");QVERIFY(colour);
+            const auto toolbarRight=colour->mapRectToItem(row,colour->boundingRect()).right();
+            if(row->width()>=toolbarRight-left+28) {
+                QVERIFY(qAbs(left-(row->width()-toolbarRight))<=1.0);
+                QTRY_COMPARE(visualItem(view.window->contentItem(),"secondaryTools")->height(),46.0);
+                const auto painted=[&] {
+                    const auto frame=view.window->grabWindow();
+                    const auto center=colour->mapToScene(colour->boundingRect().center());
+                    const QPoint sample(qRound(center.x()*frame.width()/view.window->width()),qRound(center.y()*frame.height()/view.window->height()));
+                    return frame.rect().contains(sample) && frame.pixelColor(sample)==QColor(view.window->property("brushColor").toString());
+                };
+                QTRY_VERIFY(painted());
+            }
             const auto capture=qEnvironmentVariable("LYRA_READER_ANNOTATE_SNAPSHOT");if(!capture.isEmpty())QVERIFY(view.window->grabWindow().save(capture+QString::number(width)+".png"));
         }
         QVERIFY(QMetaObject::invokeMethod(visualItem(row,"annotateShapes"),"clicked"));

@@ -5,11 +5,30 @@ ToolButton {
     id: control
     property string symbol: ""
     property bool selected: false
+    property bool fitLabel: false
+    readonly property real labelledWidth: labelProbe.item ? Math.ceil(labelProbe.item.implicitWidth) + 1 : 34
     property var theme: ApplicationWindow.window ? ApplicationWindow.window.colors : null
-    implicitWidth: display === AbstractButton.IconOnly ? 32 : implicitContentWidth + 18
+    implicitWidth: display === AbstractButton.IconOnly ? (fitLabel ? 34 : 32) : fitLabel ? labelledWidth : implicitContentWidth + 18
     implicitHeight: 32
     padding: 7
     display: AbstractButton.IconOnly
+    Binding { target: control; property: "font.pixelSize"; value: 12; when: control.fitLabel }
+    Binding { target: control; property: "spacing"; value: 5; when: control.fitLabel }
+    Loader {
+        id: labelProbe
+        active: control.fitLabel
+        visible: false
+        // The current native style measures its own icon, font, spacing and
+        // mnemonic text even when the live button is in its icon-only state.
+        sourceComponent: ToolButton {
+            text: control.text
+            icon: control.icon
+            font: control.font
+            spacing: control.spacing
+            padding: control.padding
+            display: AbstractButton.TextBesideIcon
+        }
+    }
     icon.source: symbol.length ? "qrc:/icons/" + symbol + ".svg" : ""
     icon.width: 18
     icon.height: 18

@@ -1,6 +1,5 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Layouts
 import QtQuick.Dialogs
 
 ToolBar {
@@ -8,10 +7,11 @@ ToolBar {
     readonly property bool tabTransferDialogVisible: typedSignature.visible || drawnSignature.visible || imagePicker.visible
     required property var app
     implicitHeight:46
+    padding:0
     background:Rectangle {color:app.colors.panelBg}
-    RowLayout {
-        anchors.centerIn:parent
-        spacing:6
+    SecondaryToolStrip {
+        id:strip
+        anchors.fill:parent
         Repeater {
             model:[{kind:"text",name:qsTr("Text"),icon:"free-text"},
                 {kind:"signature",name:qsTr("Signature"),icon:"signature"},
@@ -25,7 +25,8 @@ ToolBar {
                 required property var modelData
                 objectName:modelData.kind==="stamp" ? "stampToolButton" : modelData.kind==="signature" ? "signatureToolButton" : "fillTool"+modelData.kind
                 symbol:modelData.icon;text:modelData.name;selected:app.fillTool===modelData.kind
-                display:app.width<1000 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                fitLabel:true
+                display:strip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 enabled:app.canModifyPdf
                 onClicked: {
                     app.setFillTool(modelData.kind);

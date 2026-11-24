@@ -9,12 +9,17 @@ Item {
     required property var app
     readonly property bool parchment:app.regionConversationStyle!=="window"
     readonly property color dividerColor:parchment ? Qt.rgba(app.colors.accentBorder.r,app.colors.accentBorder.g,app.colors.accentBorder.b,.18) : app.colors.separator
+    property bool showingNote: false
     property var owner:null
     readonly property var attachment:owner ? owner.aiRegion : ({})
     readonly property var state:owner ? owner.aiState : ({})
     readonly property var chatGptAccounts:app.session ? app.session.chatGptAccounts : null
     readonly property bool chatGptAvailable:!!chatGptAccounts && chatGptAccounts.connected && !!chatGptAccounts.model
     readonly property bool running:!!state.running
+    readonly property bool regionRunning:running && (state.responseView==="region" || noteRunning)
+    readonly property bool hasNote:!!knowledgeResult.output || noteRunning
+    readonly property var savedRegion:owner ? (owner.regionHistory.entries || []).find(entry=>entry.id===attachment.history_id) : null
+    readonly property string captureLabel:qsTr("Page %1 · Region %2").arg((attachment.page || 0)+1).arg(savedRegion ? savedRegion.number || 1 : 1)
     readonly property bool canPrepare:!!attachment.image_png && !!(attachment.question || "").trim()
         && !running && !!owner && owner.pendingCommands===0
     readonly property bool notePreview:state.previewView==="region_note"
@@ -93,7 +98,7 @@ Item {
         motionAnchor=app.documentCanvas.viewportAnchor(0);motionInteraction=app.documentCanvas.interactionEpoch;
         const frame=app.documentCanvas.regionCardFrame(owner);
         motionGapBottom=frame && frame.y<0 && frame.y+frame.height>0 ? frame.y+frame.height : NaN;
-        payload.close();reveal.to=0;reveal.start();
+        payload.close();capturePreview.close();actions.close();reveal.to=0;reveal.start();
     }
     onRevealProgressChanged: {
         // Bindings must publish the interpolated row sizes before clamping its scroll.
@@ -118,6 +123,7 @@ Item {
         app.overviewVisible=false;app.textViewVisible=false;
         owner=app.currentReader;ownerGeneration=owner.documentGeneration;
         const immediateError=!!owner.aiRegion.error;
+        if(!wasOpened)showingNote=!!owner.aiRegion.knowledge_note;
         revealProgress=wasOpened || !canAnimate || immediateError ? 1 : 0;
         opened=true;needsReveal=!immediateError;forceActiveFocus();requestPaper();
         if(paper.rows && !paper.loading) {
@@ -129,7 +135,7 @@ Item {
         if(!opened)return;
         const current=owner===app.currentReader && ownerGeneration===owner.documentGeneration;
         const anchor=preserve && current ? app.documentCanvas.viewportAnchor(0) : null;
-        opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();discardChanges.close();
+        opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();discardChanges.close();capturePreview.close();actions.close();
         if(owner){if(preserve)owner.flushAiRegionNote();owner.clearAiRegionPaper();}
         if(anchor && current)app.documentCanvas.restoreViewportAnchor(anchor,0);
         if(current)app.focusReadingView();
@@ -223,7 +229,13 @@ Item {
     }
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){closeAnimated();event.accepted=true;}
-    function prepare(){if(owner===app.currentReader)owner.prepareAiRegion(app.aiSettings);}
+    function prepare(){if(owner===app.currentReader){showingNote=false;owner.prepareAiRegion(app.aiSettings);}}
+    function submitQuestion() {
+        if (previewReady && !running && owner && !owner.pendingCommands)
+            app.sendAi(owner,plan);
+        else if (canPrepare)
+            prepare();
+    }
     function prepareWithChatGpt() {
         if (owner!==app.currentReader || !chatGptAvailable || chatGptAccounts.busy) return;
         owner.prepareAiRegion({baseUrl:"https://api.openai.com/v1", model:chatGptAccounts.model,
@@ -240,17 +252,66 @@ Item {
         width:card.width;height:card.fullHeight;padding:card.veryCompact ? 4 : card.compact ? 8 : 12
         opacity:.65+.35*card.revealProgress
         enabled:!card.closing
-        background:Rectangle {
+        background:RegionPaperSurface {
             objectName:"aiRegionCardSurface"
-            color:card.parchment ? card.app.colors.panelBg : card.app.colors.raisedBg
-            border.color:card.parchment ? card.dividerColor : card.app.colors.border
-            radius:card.parchment ? 5 : 10
+            colors:card.app.colors
+            parchment:card.parchment
         }
     contentItem:ColumnLayout {
         spacing:card.veryCompact ? 1 : card.compact ? 4 : 8
         RowLayout {
-            Label {text:qsTr("Ask about this area");font.bold:true;Layout.fillWidth:true}
-            ToolButton {objectName:"closeAiRegionCard";text:qsTr("Close");onClicked:card.closeAnimated()}
+            spacing:7
+            Text {
+                Layout.preferredWidth:21;Layout.preferredHeight:21
+                text:"✧";font.pixelSize:21;color:card.app.colors.accent
+                horizontalAlignment:Text.AlignHCenter;verticalAlignment:Text.AlignVCenter
+                Accessible.ignored:true
+            }
+            LyraToolButton {
+                id: captureButton
+                objectName:"viewAiRegionCapture"
+                text:card.attachment.image_png ? card.captureLabel+" ⌄" : qsTr("Region question")
+                display:AbstractButton.TextOnly
+                enabled:!!card.attachment.image_png
+                Accessible.name:qsTr("View selected region · %1").arg(card.captureLabel)
+                onClicked:capturePreview.open()
+            }
+            Label {
+                Layout.fillWidth:true
+                text:card.showingNote ? qsTr("Reading note") : card.regionRunning ? qsTr("Responding…") : ""
+                elide:Text.ElideRight;font.pixelSize:12;color:card.app.colors.textSecondary
+            }
+            LyraToolButton {
+                objectName:"aiRegionActions";symbol:"more";text:qsTr("Conversation actions")
+                onClicked:actions.popup(0,height)
+                Menu {
+                    id: actions
+                    objectName:"aiRegionActionMenu"
+                    MenuItem {text:card.showingNote ? qsTr("Show Conversation") : qsTr("Show Reading Note");enabled:card.hasNote;onTriggered:card.showingNote=!card.showingNote}
+                    MenuItem {
+                        objectName:"prepareAiRegionKnowledge"
+                        text:qsTr("Finish & Make Note…")
+                        enabled:!!card.attachment.completed_turn_count && !card.candidate && !!card.owner && !!card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
+                        onTriggered:{card.showingNote=true;card.owner.prepareAiRegion(card.app.aiSettings,true);}
+                    }
+                    MenuItem {objectName:"saveAiRegionNote";text:qsTr("Save to Reading Notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onTriggered:card.owner.saveAiRegionNote()}
+                    MenuItem {text:qsTr("Request Details");enabled:card.previewReady;onTriggered:payload.open()}
+                    MenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable;height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
+                    MenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openRegionNotes()}
+                    MenuItem {text:qsTr("Open in AI Panel");enabled:!!card.attachment.saved && !!card.attachment.history_id;onTriggered:card.app.openSavedReadingNote(card.attachment.history_id)}
+                    MenuSeparator {}
+                    MenuItem {text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onTriggered:card.app.armRegion()}
+                    MenuItem {text:qsTr("Clear area");enabled:!card.running && !!card.owner;onTriggered:card.owner.clearAiRegion()}
+                }
+            }
+            LyraToolButton {
+                objectName:"closeAiRegionCard"
+                display:AbstractButton.TextOnly
+                text:"⌃"
+                Accessible.name:qsTr("Collapse and keep conversation")
+                ToolTip.text:Accessible.name
+                onClicked:card.closeAnimated()
+            }
         }
         Rectangle {Layout.fillWidth:true;Layout.preferredHeight:1;color:card.dividerColor}
         BusyIndicator {running:!!card.attachment.loading;visible:running;Layout.alignment:Qt.AlignHCenter}
@@ -264,15 +325,157 @@ Item {
                 objectName:"aiRegionTranscriptContent"
                 width:resultScroll.availableWidth;spacing:8
                 Label {text:card.attachment.error || card.paper.error || "";textFormat:Text.PlainText;visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg}
+                AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";visible:!card.showingNote;Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
+                Label {
+                    visible:card.showingNote && !!card.candidate
+                    text:qsTr("Generated knowledge note · unsaved")
+                    font.bold:true;Layout.fillWidth:true;wrapMode:Text.Wrap
+                }
+                AiResult {
+                    app:card.app;viewport:resultScroll.contentItem;value:card.knowledgeResult
+                    answerName:"aiRegionKnowledge";Layout.fillWidth:true;visible:card.showingNote && card.hasNote
+                }
+                ColumnLayout {
+                    id:details;objectName:"aiRegionDetails";Layout.fillWidth:true
+                    spacing:card.compact ? 4 : 8
+                    Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
+                    RowLayout {
+                        visible:card.owner && !!card.owner.documentReading.choice_pending
+                        Layout.fillWidth:true
+                        Button {text:qsTr("Read document (optional)…");Layout.fillWidth:true;onClicked:card.app.openDocumentReading()}
+                        ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
+                    }
+                    RowLayout {
+                        visible:!!card.candidate;Layout.fillWidth:true
+                        Button {
+                            objectName:"saveAiRegionKnowledge"
+                            text:qsTr("Save generated note")
+                            enabled:!!card.owner && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
+                            onClicked:card.owner.saveGeneratedRegionNote()
+                        }
+                        Button {text:qsTr("Dismiss");enabled:!!card.owner && !card.owner.pendingCommands;onClicked:card.owner.dismissGeneratedRegionNote()}
+                    }
+                    Button {objectName:"discardFailedAiRegion";text:qsTr("Discard unsaved changes…");visible:!!card.attachment.image_png && card.owner && !!card.owner.regionPersistenceError;enabled:card.owner && !card.running && !card.owner.pendingCommands;onClicked:discardChanges.open()}
+                }
+            }
+        }
+        Rectangle {Layout.fillWidth:true;Layout.preferredHeight:1;color:card.dividerColor}
+        RowLayout {
+            Layout.fillWidth:true
+            visible:!!card.attachment.image_png
+            spacing:6
+        ScrollView {
+            id:composer
+            visible:!!card.attachment.image_png
+            Layout.fillWidth:true;Layout.preferredHeight:Math.min(80,Math.max(card.veryCompact ? 36 : 48,card.heightLimit*.18));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
+            TextArea {
+                id:questionEditor;objectName:"aiRegionQuestion"
+                width:composer.availableWidth;text:card.attachment.question || ""
+                readOnly:card.running
+                wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
+                placeholderText:card.attachment.completed_turn_count ? qsTr("Ask a follow-up…") : qsTr("Ask about this region…")
+                Accessible.name:qsTr("Question about area")
+                color:card.app.colors.textPrimary;placeholderTextColor:card.app.colors.textPlaceholder
+                selectionColor:card.app.colors.textSelectionBg;selectedTextColor:card.app.colors.textSelectionFg
+                padding:9
+                background:Rectangle {
+                    objectName:"aiRegionQuestionSurface"
+                    color:card.parchment ? Qt.rgba(card.app.colors.raisedBg.r,card.app.colors.raisedBg.g,card.app.colors.raisedBg.b,.45) : card.app.colors.fieldBg
+                    radius:card.parchment ? 3 : 7
+                    border.width:card.parchment ? 0 : 1
+                    border.color:questionEditor.activeFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
+                    Rectangle {
+                        visible:card.parchment;anchors.left:parent.left;anchors.right:parent.right;anchors.bottom:parent.bottom
+                        height:questionEditor.activeFocus ? 1.5 : .7
+                        color:questionEditor.activeFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
+                    }
+                }
+                onTextChanged:if(activeFocus && card.owner)card.owner.setAiRegionQuestion(text)
+                Keys.onReturnPressed:function(event) {
+                    if(event.modifiers & Qt.ControlModifier){card.submitQuestion();event.accepted=true;}
+                    else event.accepted=false;
+                }
+            }
+        }
+            LyraToolButton {
+                objectName:"prepareAiRegion";symbol:"arrow";text:qsTr("Preview Question")
+                visible:!card.previewReady && !card.regionRunning;enabled:card.canPrepare
+                onClicked:card.prepare()
+            }
+            LyraToolButton {
+                objectName:"inspectAiRegion";symbol:"info";text:qsTr("Inspect payload")
+                visible:card.previewReady && !card.regionRunning
+                onClicked:payload.open()
+            }
+            LyraToolButton {
+                objectName:"sendAiRegion";symbol:"arrow"
+                text:card.notePreview ? card.plan && card.plan.consolidation ? qsTr("Send note synthesis") : qsTr("Send note request") : qsTr("Send")
+                visible:card.previewReady && !card.regionRunning
+                enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0
+                icon.color:enabled ? card.app.colors.onAccent : card.app.colors.textDisabled
+                background:Rectangle {
+                    radius:7
+                    color:parent.enabled ? (parent.down ? card.app.colors.accentPressed : card.app.colors.accent) : card.app.colors.panelBg
+                    border.width:parent.visualFocus ? 2 : 0
+                    border.color:card.app.colors.focusRing
+                }
+                onClicked:card.submitQuestion()
+            }
+            LyraToolButton {
+                objectName:"stopAiRegion";symbol:"square";text:qsTr("Stop response")
+                visible:card.regionRunning;onClicked:card.owner.cancelAi()
+            }
+        }
+        Label {
+            objectName:"aiRegionRequestStatus"
+            text:card.running && card.state.responseView!=="region" && !card.noteRunning ? qsTr("Another assistant request is running in this tab.")
+                : card.state.statusView==="region" || card.state.statusView==="region_note" ? card.state.status || "" : ""
+            textFormat:Text.PlainText
+            visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;font.pixelSize:11;color:card.app.colors.textSecondary
+        }
+        Label {
+            visible:card.previewReady;Layout.fillWidth:true;wrapMode:Text.Wrap
+            text:card.plan ? (card.plan.chatgpt_account
+                ? qsTr("ChatGPT plan: %1 (%2)").arg(card.plan.model).arg(card.plan.host)
+                : qsTr("Destination: %1").arg(card.plan.host)) + qsTr(" · %1 request(s). Nothing is sent before Send.").arg(card.plan.parts.length) : ""
+            color:card.app.colors.infoFg;font.pixelSize:11
+        }
+        Label {
+            objectName:"aiRegionPersistenceStatus"
+            Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:card.app.colors.textSecondary
+            text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : card.owner && card.owner.regionPersistenceError ? qsTr("This conversation has not been saved. Retry saving to keep the latest changes.") : qsTr("Saving this area and its conversation to Reading notes on this device…")
+        }
+        Label {text:card.owner ? card.owner.regionHistory.error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg;textFormat:Text.PlainText}
+    }
+    }
+    Popup {
+        id:capturePreview
+        objectName:"aiRegionCapturePreview"
+        parent:Overlay.overlay
+        readonly property point anchor:captureButton.mapToItem(parent,0,captureButton.height+4)
+        width:Math.min(380,card.app.width-24)
+        height:Math.min(330,card.app.height-24)
+        x:Math.max(12,Math.min(anchor.x,card.app.width-width-12))
+        y:Math.max(12,Math.min(anchor.y,card.app.height-height-12))
+        focus:true
+        padding:12
+        closePolicy:Popup.CloseOnEscape|Popup.CloseOnPressOutside
+        background:Rectangle {color:card.app.colors.raisedBg;radius:7;border.color:card.app.colors.border}
+        contentItem:ScrollView {
+            id:captureScroll
+            objectName:"aiRegionCaptureScroll"
+            clip:true;contentWidth:availableWidth
+            ColumnLayout {
+                width:captureScroll.availableWidth;spacing:8
                 Item {
                     visible:!!card.attachment.image_png
-                    Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
+                    Layout.fillWidth:true;Layout.preferredHeight:Math.min(180,captureScroll.availableWidth*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1))
                     PdfCrop {
                         objectName:"aiRegionImage"
                         anchors.horizontalCenter:parent.horizontalCenter
                         anchors.top:parent.top
                         // Fit the painted crop without feeding the viewport size back into paper height.
-                        readonly property real heightBudget:Math.min(parent.height,Math.max(32,resultScroll.availableHeight-24))
+                        readonly property real heightBudget:Math.min(parent.height,Math.max(32,captureScroll.availableHeight-66))
                         width:Math.min(parent.width,heightBudget*(card.attachment.image_width_px || 1)/(card.attachment.image_height_px || 1))
                         height:width*(card.attachment.image_height_px || 1)/(card.attachment.image_width_px || 1)
                         source:card.owner ? card.owner.aiRegionImage : ""
@@ -299,129 +502,15 @@ Item {
                         if (card.plan && card.plan.chatgpt_account)
                             return qsTr("The ChatGPT plan preview includes the captured PNG.");
                         if (card.app.aiSettings.imageInput)
-                            return qsTr("Image input is enabled. The captured PNG above will be included.");
+                            return qsTr("Image input is enabled. The captured PNG will be included.");
                         if (card.chatGptAvailable)
                             return qsTr("The API-key preview is text only. The ChatGPT plan preview includes the PNG.");
                         return qsTr("Text only. To send the captured PNG, enable region images for this model in Settings.");
                     }
                     color:card.app.colors.textSecondary;font.pixelSize:11
                 }
-                AiResult {app:card.app;viewport:resultScroll.contentItem;value:card.result;answerName:"aiRegionAnswer";Layout.fillWidth:true;onCitation:function(link,plan){card.follow(link,plan);}}
-                Label {
-                    visible:!!card.knowledgeResult.output
-                    text:card.candidate ? qsTr("Generated knowledge note · unsaved") : qsTr("Knowledge note")
-                    font.bold:true;Layout.fillWidth:true;wrapMode:Text.Wrap
-                }
-                AiResult {
-                    app:card.app;viewport:resultScroll.contentItem;value:card.knowledgeResult
-                    answerName:"aiRegionKnowledge";Layout.fillWidth:true;visible:!!card.knowledgeResult.output
-                }
-                ColumnLayout {
-                    id:details;objectName:"aiRegionDetails";Layout.fillWidth:true
-                    spacing:card.compact ? 4 : 8
-                    Label {visible:!!card.attachment.restored;text:qsTr("Saved conversation · %1 completed turns. Preview includes the recent context.").arg(card.attachment.completed_turn_count || 0);wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.textSecondary}
-                    RowLayout {
-                        visible:card.owner && !!card.owner.documentReading.choice_pending
-                        Layout.fillWidth:true
-                        Button {text:qsTr("Read document (optional)…");Layout.fillWidth:true;onClicked:card.app.openDocumentReading()}
-                        ToolButton {text:qsTr("Skip");Accessible.name:qsTr("Continue without document reading");onClicked:card.owner.dismissDocumentReadingChoice()}
-                    }
-                    Button {objectName:"saveAiRegionNote";text:qsTr("Save to Reading notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onClicked:card.owner.saveAiRegionNote()}
-                    Button {
-                        objectName:"prepareAiRegionKnowledge"
-                        text:qsTr("Preview knowledge note")
-                        visible:!!card.attachment.completed_turn_count && !card.candidate
-                        enabled:!!card.owner && !!card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
-                        onClicked:card.owner.prepareAiRegion(card.app.aiSettings,true)
-                    }
-                    RowLayout {
-                        visible:!!card.candidate;Layout.fillWidth:true
-                        Button {
-                            objectName:"saveAiRegionKnowledge"
-                            text:qsTr("Save generated note")
-                            enabled:!!card.owner && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
-                            onClicked:card.owner.saveGeneratedRegionNote()
-                        }
-                        Button {text:qsTr("Dismiss");enabled:!!card.owner && !card.owner.pendingCommands;onClicked:card.owner.dismissGeneratedRegionNote()}
-                    }
-                    Button {objectName:"discardFailedAiRegion";text:qsTr("Discard unsaved changes…");visible:!!card.attachment.image_png && card.owner && !!card.owner.regionPersistenceError;enabled:card.owner && !card.running && !card.owner.pendingCommands;onClicked:discardChanges.open()}
-                    RowLayout {
-                        Button {objectName:"newAiRegion";text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onClicked:card.app.armRegion()}
-                        Button {objectName:"clearAiRegion";text:qsTr("Clear area");enabled:!card.running;onClicked:card.owner.clearAiRegion()}
-                    }
-                }
             }
         }
-        Rectangle {Layout.fillWidth:true;Layout.preferredHeight:1;color:card.dividerColor}
-        ScrollView {
-            id:composer
-            visible:!!card.attachment.image_png
-            Layout.fillWidth:true;Layout.preferredHeight:Math.min(80,Math.max(card.veryCompact ? 36 : 48,card.heightLimit*.18));Layout.maximumHeight:Layout.preferredHeight;contentWidth:availableWidth;clip:true
-            TextArea {
-                id:questionEditor;objectName:"aiRegionQuestion"
-                width:composer.availableWidth;text:card.attachment.question || ""
-                readOnly:card.running
-                wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
-                placeholderText:qsTr("Question about this area…");Accessible.name:qsTr("Question about area")
-                color:card.app.colors.textPrimary;placeholderTextColor:card.app.colors.textPlaceholder
-                selectionColor:card.app.colors.textSelectionBg;selectedTextColor:card.app.colors.textSelectionFg
-                padding:9
-                background:Rectangle {
-                    objectName:"aiRegionQuestionSurface"
-                    color:card.parchment ? Qt.rgba(card.app.colors.raisedBg.r,card.app.colors.raisedBg.g,card.app.colors.raisedBg.b,.45) : card.app.colors.fieldBg
-                    radius:card.parchment ? 3 : 7
-                    border.width:card.parchment ? 0 : 1
-                    border.color:questionEditor.activeFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
-                    Rectangle {
-                        visible:card.parchment;anchors.left:parent.left;anchors.right:parent.right;anchors.bottom:parent.bottom
-                        height:questionEditor.activeFocus ? 1.5 : .7
-                        color:questionEditor.activeFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
-                    }
-                }
-                onTextChanged:if(activeFocus && card.owner)card.owner.setAiRegionQuestion(text)
-            }
-        }
-        Label {
-            objectName:"aiRegionRequestStatus"
-            text:card.running && card.state.responseView!=="region" && !card.noteRunning ? qsTr("Another assistant request is running in this tab.")
-                : card.state.statusView==="region" || card.state.statusView==="region_note" ? card.state.status || "" : ""
-            textFormat:Text.PlainText
-            visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;font.pixelSize:11;color:card.app.colors.textSecondary
-        }
-        Label {
-            visible:card.previewReady;Layout.fillWidth:true;wrapMode:Text.Wrap
-            text:card.plan ? (card.plan.chatgpt_account
-                ? qsTr("ChatGPT plan: %1 (%2)").arg(card.plan.model).arg(card.plan.host)
-                : qsTr("Destination: %1").arg(card.plan.host)) + qsTr(" · %1 request(s). Nothing is sent before Send.").arg(card.plan.parts.length) : ""
-            color:card.app.colors.infoFg;font.pixelSize:11
-        }
-        Button {
-            objectName:"prepareAiRegionWithChatGpt"
-            text:qsTr("Preview with ChatGPT plan")
-            visible:card.chatGptAvailable
-            enabled:card.canPrepare && !!card.chatGptAccounts && !card.chatGptAccounts.busy
-            onClicked:card.prepareWithChatGpt()
-        }
-        RowLayout {
-            Layout.fillWidth:true
-            Button {objectName:"prepareAiRegion";text:qsTr("Preview Question");enabled:card.canPrepare;onClicked:card.prepare()}
-            Button {objectName:"inspectAiRegion";text:qsTr("Inspect payload");enabled:card.previewReady;onClicked:payload.open()}
-            Button {
-                objectName:"sendAiRegion"
-                text:card.notePreview ? card.plan && card.plan.consolidation ? qsTr("Send note synthesis") : qsTr("Send note request") : qsTr("Send")
-                visible:!card.running || (card.state.responseView!=="region" && !card.noteRunning)
-                enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0
-                onClicked:card.app.sendAi(card.owner,card.plan)
-            }
-            Button {objectName:"stopAiRegion";visible:card.running && (card.state.responseView==="region" || card.noteRunning);text:qsTr("Stop response");onClicked:card.owner.cancelAi()}
-        }
-        Label {
-            objectName:"aiRegionPersistenceStatus"
-            Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:card.app.colors.textSecondary
-            text:card.attachment.saved ? qsTr("Saved in Reading notes on this device.") : card.owner && card.owner.regionPersistenceError ? qsTr("This conversation has not been saved. Retry saving to keep the latest changes.") : qsTr("Saving this area and its conversation to Reading notes on this device…")
-        }
-        Label {text:card.owner ? card.owner.regionHistory.error || "" : "";visible:text.length>0;wrapMode:Text.Wrap;Layout.fillWidth:true;color:card.app.colors.warningFg;textFormat:Text.PlainText}
-    }
     }
     Dialog {
         id:discardChanges;objectName:"discardAiRegionConfirmation";title:qsTr("Discard unsaved conversation changes?");modal:true

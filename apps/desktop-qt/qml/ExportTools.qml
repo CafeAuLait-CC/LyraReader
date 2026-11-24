@@ -1,11 +1,11 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Layouts
 
 ToolBar {
     id: tools
     required property var app
     implicitHeight: 46
+    padding:0
     property var requestedOwner: null
     property var requestedGeneration: null
     readonly property var commands: [
@@ -29,16 +29,17 @@ ToolBar {
     onVisibleChanged: if(visible){requestedOwner=null;refresh();}
     Connections {target:app;function onCurrentReaderChanged(){tools.refresh();}}
     Connections {target:app.currentReader;function onDocumentChanged(){tools.refresh();}}
-    RowLayout {
-        anchors.centerIn:parent
-        spacing:6
+    SecondaryToolStrip {
+        id:strip
+        anchors.fill:parent
         Repeater {
             model:tools.commands
             LyraToolButton {
                 required property var modelData
                 objectName:"exportCommand"+modelData.id
                 symbol:modelData.icon;text:modelData.title
-                display:app.width<1000 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                fitLabel:true
+                display:strip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 enabled:app.exportActionReason(modelData.id).length===0
                 Accessible.name:modelData.name
                 ToolTip.text:app.exportActionReason(modelData.id) || modelData.name

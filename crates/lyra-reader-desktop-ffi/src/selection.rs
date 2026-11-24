@@ -1,5 +1,5 @@
 //! Cache-only native selection adapters. Recognition and copy normalization live in text.
-use crate::{Buffer, bytes, document::DesktopDocument, run};
+use crate::{Buffer, bytes, document::DesktopDocument, run, tile_plan::Rect};
 
 const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -62,6 +62,78 @@ pub unsafe extern "C" fn lyra_reader_desktop_selection_text(
         })
     }
     .unwrap_or(CacheStatus::Error) // An explicit failed-call status, never an empty success.
+}
+
+#[repr(C)]
+pub struct SelectionRects {
+    pub rects: *mut Rect,
+    pub len: usize,
+}
+
+/// # Safety
+/// The document stays live and aligned. Output and error are distinct aligned writable
+/// empty slots. Only Ready writes output. Free its owned rectangle array once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_selection_rects(
+    document: *const DesktopDocument,
+    page: u32,
+    start: u32,
+    end: u32,
+    output: *mut SelectionRects,
+    error: *mut Buffer,
+) -> CacheStatus {
+    // SAFETY: the caller owns the live handle and both slots. Validate the layout
+    // slot before writing and transfer one boxed allocation to the matching free.
+    unsafe {
+        run(error, || {
+            output_slot(output)?;
+            let current = document
+                .as_ref()
+                .ok_or("Selection document is null")?
+                .active()?;
+            let Some(prepared) = current
+                .prepared_selection_text_page(page)
+                .map_err(|error| error.to_string())?
+            else {
+                return Ok(CacheStatus::NotPrepared);
+            };
+            let rects: Box<[Rect]> = prepared
+                .layout()
+                .selection_rects(start, end)
+                .into_iter()
+                .map(|r| Rect {
+                    x: r.min_x(),
+                    y: r.min_y(),
+                    width: r.size.width,
+                    height: r.size.height,
+                })
+                .collect();
+            let len = rects.len();
+            let rects = if len == 0 {
+                std::ptr::null_mut()
+            } else {
+                Box::into_raw(rects).cast()
+            };
+            output.write(SelectionRects { rects, len });
+            Ok(CacheStatus::Ready)
+        })
+    }
+    .unwrap_or(CacheStatus::Error)
+}
+
+/// # Safety
+/// Batch must be the unchanged output of one successful selection_rects call, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_selection_rects_free(batch: SelectionRects) {
+    if !batch.rects.is_null() {
+        // SAFETY: a nonempty batch originated from Box<[Rect]> with this exact length.
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                batch.rects,
+                batch.len,
+            )));
+        }
+    }
 }
 
 /// # Safety
@@ -136,6 +208,10 @@ mod tests {
         let current = doc.active().unwrap();
         let mut out = empty();
         let mut error = empty();
+        let mut geometry = SelectionRects {
+            rects: ptr::null_mut(),
+            len: 0,
+        };
         // SAFETY: the document and distinct empty slots stay live throughout. The final
         // deliberately null output follows the documented rejection path before access.
         unsafe {
@@ -144,10 +220,42 @@ mod tests {
                 CacheStatus::NotPrepared
             );
             assert!(out.data.is_null() && out.len == 0 && error.data.is_null());
+            assert_eq!(
+                lyra_reader_desktop_selection_rects(
+                    &doc,
+                    0,
+                    0,
+                    u32::MAX,
+                    &mut geometry,
+                    &mut error
+                ),
+                CacheStatus::NotPrepared
+            );
+            assert!(geometry.rects.is_null() && geometry.len == 0 && error.data.is_null());
             assert_eq!(current.text_page_cache_stats().loads, 0);
             let page = current.text_page(0).unwrap();
             assert_eq!(page.selection_excluded_indices.len(), 60);
             assert!(page.text.contains("001") && page.text.contains("020"));
+            assert_eq!(
+                lyra_reader_desktop_selection_rects(
+                    &doc,
+                    0,
+                    u32::MAX,
+                    0,
+                    &mut geometry,
+                    &mut error
+                ),
+                CacheStatus::Ready
+            );
+            // The result is live until the matching ABI free below.
+            assert!(geometry.len > 0);
+            let runs = std::slice::from_raw_parts(geometry.rects, geometry.len);
+            assert!(
+                runs.iter()
+                    .all(|rect| rect.x >= 60.0 && rect.x + rect.width < 550.0)
+            );
+            assert!(runs.iter().any(|rect| rect.width > 100.0));
+            lyra_reader_desktop_selection_rects_free(geometry);
             for (start, end) in [(0, u32::MAX), (u32::MAX, 0)] {
                 assert_eq!(
                     lyra_reader_desktop_selection_text(&doc, 0, start, end, &mut out, &mut error),

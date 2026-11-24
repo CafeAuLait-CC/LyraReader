@@ -187,6 +187,7 @@ public:
     Q_INVOKABLE void requestText(int page);
     Q_INVOKABLE quint64 requestNoteMarkers(int page, const QVariantList &entries);
     Q_INVOKABLE QVariantMap selectionText(int page,int start,int end) const;
+    Q_INVOKABLE QVariantList selectionRects(int page,int start,int end);
     Q_INVOKABLE QVariantMap normalizedCopiedText(const QString &text) const;
     Q_INVOKABLE QVariantList aiMathMarkup(const QString &text) const;
     Q_INVOKABLE void setLayout(const QString &mode, double gap);
