@@ -81,9 +81,6 @@ struct OpenResult {
 };
 struct RasterResult { ResidentImage image,backdrop; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false,pressure=false; };
 struct CommandResult { QVariant result; QString error; std::shared_ptr<NativeRasterSource> source; };
-double quantizedRasterScale(double scale) {
-    return scale>=.125 ? std::ceil(scale*8)/8.0 : std::exp2(std::ceil(std::log2(scale)*4)/4);
-}
 }
 
 ReaderController::ReaderController(QObject *parent) : QObject(parent),m_cachePrefix(QUuid::createUuid().toString()+QLatin1Char('/')),m_mutations(std::make_shared<CommandQueue>()) {
@@ -651,7 +648,7 @@ double ReaderController::clampScroll(double offset,double contentHeight,double v
 }
 
 QString ReaderController::rasterKey(int page, double scale,bool embedded) {
-    return QString::number(page) + QLatin1Char(':') + QString::number(quantizedRasterScale(scale),'g',14)+(embedded?QStringLiteral(":annotations"):QString{});
+    return QString::number(page) + QLatin1Char(':') + QString::number(RasterCache::quantizedScale(scale),'g',14)+(embedded?QStringLiteral(":annotations"):QString{});
 }
 
 QImage ReaderController::cachedPage(int page,double scale,bool embedded) const {
@@ -677,7 +674,7 @@ void ReaderController::requestPageForConsumer(quintptr consumer,int page,double 
 }
 void ReaderController::requestPageInternal(int page,double scale,bool embedded,bool manual) {
     if(!m_source || page<0 || page>=pageCount() || !std::isfinite(scale) || scale<=0 || scale>128)return;
-    scale=quantizedRasterScale(scale);const auto dimensions=m_pages.at(page).toMap();
+    scale=RasterCache::quantizedScale(scale);const auto dimensions=m_pages.at(page).toMap();
     const QRectF region(0,0,dimensions.value(QStringLiteral("width")).toDouble(),dimensions.value(QStringLiteral("height")).toDouble());
     if(manual && !RasterCache::contains(m_cachePrefix+rasterKey(page,scale,embedded)))m_manualDemand.insert(rasterKey(page,scale,embedded));
     enqueue({page,scale,rasterKey(page,scale,embedded),embedded,false,region,embedded?0:2});startNextRaster();
@@ -770,8 +767,23 @@ void ReaderController::startNextRaster() {
         if(ticket->cancelled.load()){result.cancelled=true;return result;}
         auto reservation=RenderBudget::reserve(RenderBudget::Kind::Resident,RenderBudget::maximumJobBytes);
         if(!reservation){result.pressure=true;return result;}
-        auto image=source->crop(request.page,request.region,request.scale,annotated,false,&result.error,&result.actualScale);
-        if(!image.isNull())result.image=ResidentImage::publish(std::move(reservation),std::move(image));
+        const double width=request.region.width()*request.scale,height=request.region.height()*request.scale;
+        const bool smallThumbnail=request.embedded && !request.tile && width<=512 && height<=1024;
+        // Match the Mac thumbnail path: PDFium's minimum-width stroke is
+        // integrated over a larger raster before reducing to display pixels.
+        const double renderScale=smallThumbnail?qMin(128.0,request.scale*4):request.scale;
+        auto image=source->crop(request.page,request.region,renderScale,annotated,false,&result.error,&result.actualScale);
+        if(smallThumbnail && !image.isNull() && result.actualScale>request.scale) {
+            const QSize target(qCeil(width),qCeil(height));
+            auto reducedCharge=RenderBudget::reserve(RenderBudget::Kind::Resident,qint64(target.width())*target.height()*4);
+            if(!reducedCharge){result.pressure=true;return result;}
+            auto reduced=image.scaled(target,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+            if(reduced.isNull()){result.error=QStringLiteral("Could not reduce the page thumbnail.");return result;}
+            result.image=ResidentImage::publish(std::move(reducedCharge),std::move(reduced));
+            result.actualScale=request.scale;
+        } else if(!image.isNull()) {
+            result.image=ResidentImage::publish(std::move(reservation),std::move(image));
+        }
         if(retainBackdrop && !result.image.isNull() && !ticket->cancelled.load()) {
             // No extra PDFium work or GUI-thread downsampling. Reserve before allocating the
             // bounded reduction; cache pressure may skip this optional history entry.

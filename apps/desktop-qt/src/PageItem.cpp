@@ -1,6 +1,7 @@
 #include "PageItem.h"
 #include "PaperAppearance.h"
 #include "BudgetedTexture.h"
+#include "RasterCache.h"
 #include <QQuickWindow>
 #include <QSGImageNode>
 #include <QSGTransformNode>
@@ -276,6 +277,10 @@ double PageItem::fallbackScale() const {
     const auto page=m_controller->pages().at(m_page).toMap();
     const double area=page.value(QStringLiteral("width")).toDouble()*page.value(QStringLiteral("height")).toDouble();
     const double bytes=needsTiles()?qMin<qint64>(4*1024*1024,m_targetBytes/4):qMax<qint64>(4096,m_targetBytes/2);
+    const double wanted=RasterCache::quantizedScale(effectiveScale());
+    // A completed full-page/thumbnail raster must cover its screen pixels.
+    // Only round down when a source-pixel budget actually prevents that demand.
+    if(wanted*wanted*area*4<=bytes)return wanted;
     const double scale=qMin(effectiveScale(),std::sqrt(bytes/(area*4)));
     return scale>=.125?std::floor(scale*8)/8:std::exp2(std::floor(std::log2(scale)*4)/4);
 }

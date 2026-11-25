@@ -1,10 +1,14 @@
 #include "RasterCache.h"
 #include <QCache>
 #include "RenderBudget.h"
+#include <cmath>
 
 namespace {
 QCache<QString,QImage> &images() {static QCache<QString,QImage> cache(RasterCache::maximumKiB);return cache;}
 QCache<QString,ResidentImage> &backdrops() {static QCache<QString,ResidentImage> cache(RasterCache::maximumBackdropKiB);return cache;}
+}
+double RasterCache::quantizedScale(double scale) {
+    return scale>=.125 ? std::ceil(scale*8)/8.0 : std::exp2(std::ceil(std::log2(scale)*4)/4);
 }
 QImage RasterCache::get(const QString &key) {auto *image=images().object(key);return image ? *image : QImage{};}
 bool RasterCache::contains(const QString &key) {return images().contains(key);}

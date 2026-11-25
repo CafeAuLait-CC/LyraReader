@@ -57,6 +57,7 @@
 #include <QProcess>
 #include <QQuickStyle>
 #include <QQuickWindow>
+#include <QStyleHints>
 #include <QQuickItemGrabResult>
 #include <QQuickTextDocument>
 #include <QTextCursor>
@@ -2932,6 +2933,120 @@ private slots:
         QTRY_VERIFY(workspace.recentDocuments().isEmpty());QTRY_COMPARE(recent->property("count").toInt(),0);
         const auto snapshots=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");
         if(!snapshots.isEmpty())QVERIFY(window->grabWindow().save(snapshots+"/lyrareader-welcome-narrow.png"));
+    }
+    void settledPageRasterCoversItsScreenPixels_data() {
+        QTest::addColumn<double>("scale");
+        QTest::addColumn<bool>("embedded");
+        QTest::newRow("main-149-percent")<<1.49<<false;
+        QTest::newRow("thumbnail-132-pixels")<<(132.0/595.0)<<true;
+    }
+    void settledPageRasterCoversItsScreenPixels() {
+        QFETCH(double,scale);QFETCH(bool,embedded);
+        const auto evidencePdf=qEnvironmentVariable("LYRA_READER_RASTER_EVIDENCE_PDF");
+        const auto input=evidencePdf.isEmpty()?root+"/tests/fixtures/text-page.pdf":evidencePdf;
+        QFile file(input);QVERIFY(file.open(QIODevice::ReadOnly));const auto originalHash=QCryptographicHash::hash(file.readAll(),QCryptographicHash::Sha256);file.close();
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(input));
+        QTRY_VERIFY(reader.pageCount()>0);QTRY_COMPARE(reader.pendingCommands(),0);
+        const auto size=reader.pages().first().toMap();
+        const double w=size.value("width").toDouble(),h=size.value("height").toDouble();
+        if(embedded)scale=132.0/w;
+        QQuickWindow window;window.setColor(Qt::white);window.resize(evidencePdf.isEmpty()?1100:1700,evidencePdf.isEmpty()?900:1350);
+        if(!embedded && !evidencePdf.isEmpty())scale=1372.0/(w*window.effectiveDevicePixelRatio());
+        PageItem page;page.setParentItem(window.contentItem());page.setController(&reader);
+        page.setPageIndex(0);page.setRasterScale(scale);page.setEmbeddedAnnotations(embedded);
+        page.setSize(QSizeF(w*scale,h*scale));window.show();
+        QTRY_VERIFY_WITH_TIMEOUT(page.refined() && page.texturesReady(),10000);
+        const auto required=scale*window.effectiveDevicePixelRatio();
+        const auto image=reader.cachedPage(0,required,embedded);
+        QVERIFY2(!image.isNull(),"A settled raster must cover the requested screen scale, including fractional zoom and DPR");
+        qInfo()<<"screen raster coverage"<<embedded<<"requested"<<required
+               <<"pixels"<<image.size()<<"target"<<QSizeF(w*required,h*required);
+        QVERIFY(image.width()>=std::ceil(w*required));
+        QVERIFY(image.height()>=std::ceil(h*required));
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_RASTER_EVIDENCE");
+        if(!snapshot.isEmpty()) {
+            const auto name=snapshot+(embedded?"-thumbnail":"-main");
+            QVERIFY(image.save(name+"-source.png"));
+            QTest::qWait(100);QVERIFY(window.grabWindow().save(name+"-scene.png"));
+        }
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        QCOMPARE(QCryptographicHash::hash(file.readAll(),QCryptographicHash::Sha256),originalHash);
+    }
+    void readerWheelUsesScreenLinesAndAppliesPreciseMotionOnce_data() {
+        QTest::addColumn<double>("zoom");
+        QTest::newRow("normal")<<1.;
+        QTest::newRow("fractional")<<1.49;
+    }
+    void readerWheelUsesScreenLinesAndAppliesPreciseMotionOnce() {
+        QFETCH(double,zoom);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        const int previousLines=QGuiApplication::styleHints()->wheelScrollLines();
+        const auto restore=qScopeGuard([&]{QGuiApplication::styleHints()->setWheelScrollLines(previousLines);});
+        QGuiApplication::styleHints()->setWheelScrollLines(3);
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));
+        auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==9 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(view.window));
+        view.window->setProperty("fitting",false);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"navigate",Q_ARG(QVariant,3),Q_ARG(QVariant,100)));
+        auto *canvas=visualItem(view.window->contentItem(),"documentCanvas"),*list=visualItem(view.window->contentItem(),"pageList");
+        QVERIFY(canvas && list);QVERIFY(settleReaderViewport(view.window));
+        const auto point=list->mapToScene(QPointF(list->width()/2,list->height()/2));
+        const auto wheel=[&](QPoint pixels,QPoint angle,Qt::KeyboardModifiers modifiers=Qt::NoModifier) {
+            QWheelEvent event(point,view.window->mapToGlobal(point.toPoint()),pixels,angle,
+                              Qt::NoButton,modifiers,Qt::NoScrollPhase,false);
+            QGuiApplication::sendEvent(view.window,&event);
+        };
+        const auto position=[&]{return list->property("contentY").toDouble()-list->property("originY").toDouble();};
+        // Fractional-height ListView rows can shift their virtual origin by one
+        // logical pixel when the burst instantiates another row.
+        constexpr double tolerance=1.01;
+        auto y=position();
+        wheel({},QPoint(0,-120));
+        QTRY_VERIFY(qAbs(position()-y-75)<tolerance);
+        y=position();wheel({},QPoint(0,-360));
+        QTRY_VERIFY2(qAbs(position()-y-225)<tolerance,qPrintable(QString("Wheel displacement %1, expected 225").arg(position()-y)));
+        y=position();wheel({},QPoint(0,-60));
+        QTRY_VERIFY(qAbs(position()-y-37.5)<tolerance);
+        y=position();wheel(QPoint(0,-17),QPoint(0,-120));
+        QTRY_VERIFY(qAbs(position()-y-17)<tolerance);
+        QVERIFY(!list->property("moving").toBool());
+        const auto stopped=position();QTest::qWait(100);
+        QVERIFY2(qAbs(position()-stopped)<tolerance,
+            qPrintable(QString("Post-input displacement %1").arg(position()-stopped)));
+        QVERIFY(!list->property("moving").toBool());
+        const auto oldZoom=view.window->property("zoom").toDouble();
+        wheel({},QPoint(0,120),Qt::ControlModifier);
+        QTRY_VERIFY(view.window->property("zoom").toDouble()>oldZoom);
+    }
+    void thumbnailsReduceSupersampledHairlinesBeforePublishing() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-hairlines.pdf");
+        {QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(400,500),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));
+            QPainter painter(&pdf);QVERIFY(painter.isActive());painter.fillRect(QRectF(0,0,400,500),Qt::white);
+            painter.setPen(QPen(Qt::black,.1));painter.drawLine(QPointF(40,100),QPointF(360,100));
+            painter.setPen(QPen(Qt::black,.4));painter.drawLine(QPointF(40,200),QPointF(360,200));
+            painter.setFont(QFont("DejaVu Serif",12));painter.drawText(QPointF(40,240),"Public fraction and footnote fixture");}
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE(reader.pageCount(),1);QTRY_COMPARE(reader.pendingCommands(),0);
+        constexpr double scale=.375;
+        reader.requestPage(0,scale,true);QTRY_VERIFY(!reader.cachedPage(0,scale,true).isNull());
+        const auto actual=reader.cachedPage(0,scale,true);
+        QString error;const auto source=reader.renderSource();QVERIFY(source);
+        const QRectF region(0,0,400,500);
+        const auto direct=source->crop(0,region,scale,true,false,&error);
+        const auto large=source->crop(0,region,scale*4,true,false,&error);
+        QVERIFY2(error.isEmpty(),qPrintable(error));
+        const auto expected=large.scaled(actual.size(),Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+        QCOMPARE(actual,expected);QVERIFY(actual!=direct);
+        const auto coverage=[](const QImage &image) {
+            double ink=0;
+            for(int y=35;y<41;++y)for(int x=25;x<125;++x)ink+=255-qGray(image.pixel(x,y));
+            return ink;
+        };
+        qInfo()<<"hairline integrated coverage: direct"<<coverage(direct)<<"supersampled"<<coverage(actual);
+        QVERIFY(coverage(actual)>0 && coverage(actual)<coverage(direct)*.8);
     }
     void wholeWindowSurvivesTextureReplacementAndPageJump() {
         ReaderController reader;

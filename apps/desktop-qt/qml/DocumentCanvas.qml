@@ -558,13 +558,19 @@ Item {
                 }
             }
         }
-        WheelHandler {
-            acceptedModifiers: Qt.ControlModifier
-            onWheel: function (event) {
+        ReadingWheelHandler {
+            scrollEnabled: pageList.interactive
+            onZoomRequested: function (factor, x, y) {
                 app.fitting = false;
-                const delta = event.pixelDelta.y !== 0 ? event.pixelDelta.y : event.angleDelta.y;
-                app.changeZoom(app.zoom * Math.pow(1.0015, delta), event.x, event.y);
-                event.accepted = true;
+                app.changeZoom(app.zoom * factor, x, y);
+            }
+            onScrollRequested: function (dx, dy) {
+                pageList.cancelFlick();
+                ++canvas.interactionEpoch;
+                canvas.pendingPaperZoom = null;
+                canvas.stopPaperZoomSettlement();
+                pageList.contentX = Math.max(0, Math.min(pageList.contentWidth - pageList.width, pageList.contentX - dx));
+                pageList.contentY = canvas.clampY(pageList.contentY - dy);
             }
         }
         PinchHandler {

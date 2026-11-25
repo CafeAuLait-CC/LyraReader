@@ -5,6 +5,8 @@ struct ResidentImage;
 
 // GUI-thread LRU shared by tabs and windows. Visible items can retain a shared image after eviction.
 namespace RasterCache {
+// Shared upward scale buckets for page demand and cache identity.
+double quantizedScale(double scale);
 QImage get(const QString &key);
 bool contains(const QString &key);
 void put(const QString &key,const QImage &image);

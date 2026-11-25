@@ -141,11 +141,13 @@ ApplicationWindow {
         }
         ScrollBar.vertical:ScrollBar {}
         ScrollBar.horizontal:ScrollBar {}
-        HoverHandler {id:zoomHover}
-        WheelHandler {
-            target:null
-            acceptedModifiers:Qt.ControlModifier
-            onWheel:function(event){preview.fitting=false;preview.changeZoom(preview.zoom*Math.pow(1.0015,event.angleDelta.y),zoomHover.point.position.x,zoomHover.point.position.y);event.accepted=true;}
+        ReadingWheelHandler {
+            onZoomRequested:function(factor,x,y){preview.fitting=false;preview.changeZoom(preview.zoom*factor,x,y);}
+            onScrollRequested:function(dx,dy) {
+                view.cancelFlick();
+                view.contentX=Math.max(0,Math.min(view.contentWidth-view.width,view.contentX-dx));
+                view.contentY=Math.max(0,Math.min(view.contentHeight-view.height,view.contentY-dy));
+            }
         }
     }
     ScrollView {
