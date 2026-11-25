@@ -648,7 +648,7 @@ double ReaderController::clampScroll(double offset,double contentHeight,double v
 }
 
 QString ReaderController::rasterKey(int page, double scale,bool embedded) {
-    return QString::number(page) + QLatin1Char(':') + QString::number(RasterCache::quantizedScale(scale),'g',14)+(embedded?QStringLiteral(":annotations"):QString{});
+    return QString::number(page) + QLatin1Char(':') + QString::number(scale,'g',14)+(embedded?QStringLiteral(":annotations"):QString{});
 }
 
 QImage ReaderController::cachedPage(int page,double scale,bool embedded) const {
@@ -674,7 +674,9 @@ void ReaderController::requestPageForConsumer(quintptr consumer,int page,double 
 }
 void ReaderController::requestPageInternal(int page,double scale,bool embedded,bool manual) {
     if(!m_source || page<0 || page>=pageCount() || !std::isfinite(scale) || scale<=0 || scale>128)return;
-    scale=RasterCache::quantizedScale(scale);const auto dimensions=m_pages.at(page).toMap();
+    // Settled pages use the requested physical density. Tile LOD stays in the
+    // shared planner; whole-page buckets would resample text a second time.
+    const auto dimensions=m_pages.at(page).toMap();
     const QRectF region(0,0,dimensions.value(QStringLiteral("width")).toDouble(),dimensions.value(QStringLiteral("height")).toDouble());
     if(manual && !RasterCache::contains(m_cachePrefix+rasterKey(page,scale,embedded)))m_manualDemand.insert(rasterKey(page,scale,embedded));
     enqueue({page,scale,rasterKey(page,scale,embedded),embedded,false,region,embedded?0:2});startNextRaster();

@@ -4,6 +4,7 @@ import QtQuick.Layouts
 
 ListView {
     id: root
+    PanelWheelHandler { viewport: root }
     objectName: "summaryBatchRows"
     required property var app
     required property var owner

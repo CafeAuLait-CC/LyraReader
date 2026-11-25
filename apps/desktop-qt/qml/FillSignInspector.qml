@@ -10,6 +10,7 @@ Pane {
     background:Rectangle {color:app.colors.sidebarBg;border.color:app.colors.separator}
     ScrollView {
       id:scroll
+      PanelWheelHandler { viewport: scroll.contentItem }
       anchors.fill:parent
       clip:true
       contentWidth:availableWidth

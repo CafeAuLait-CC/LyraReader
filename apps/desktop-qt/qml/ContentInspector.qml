@@ -33,6 +33,7 @@ Pane {
         }
         ScrollView {
             id:inspectorScroll
+            PanelWheelHandler { viewport: inspectorScroll.contentItem }
             Layout.fillWidth:true
             Layout.fillHeight:true
             contentWidth: availableWidth

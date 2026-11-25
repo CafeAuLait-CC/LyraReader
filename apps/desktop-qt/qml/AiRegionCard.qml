@@ -393,10 +393,7 @@ Item {
             Layout.preferredHeight:64
             Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth;clip:true
             contentHeight:transcript.implicitHeight
-            WheelHandler {
-                target:null;blocking:false
-                onWheel:function(event) {if(event.angleDelta.y>0 || event.pixelDelta.y>0)card.followTail=false;event.accepted=false;}
-            }
+            onScrollIntent:function(dx,dy) {if(dy>0)card.followTail=false;}
             onVerticalBarPressedChanged: if(verticalBarPressed)card.followTail=false;
             Connections {
                 target:resultScroll.contentItem

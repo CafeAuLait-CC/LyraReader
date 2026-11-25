@@ -6,6 +6,7 @@ ColumnLayout {
     id: chrome
     objectName: "readerChrome"
     required property var app
+    property real readingCenter: width / 2
     readonly property bool menuOpen: viewMenu.visible || zoomMenu.visible || moreMenu.visible
     readonly property bool tabDragActive: !!tabStrip.tabDrag
     readonly property string nativeTabMime: "application/x-lyrareader-tab"
@@ -312,6 +313,7 @@ ColumnLayout {
     }
     ToolBar {
         id: primaryTools
+        padding: 0
         Layout.fillWidth: true
         Layout.preferredHeight: 46
         background: Rectangle {
@@ -322,277 +324,314 @@ ColumnLayout {
             anchors.leftMargin: 10
             anchors.rightMargin: 10
             spacing: app.width < 1000 ? 3 : 7
-            LyraToolButton {
-                symbol: "sidebar"
-                text: qsTr("Toggle sidebar (Ctrl+B)")
-                selected: app.sidebarVisible
-                onClicked: {
-                    app.overviewVisible = false;
-                    app.sidebarVisible = !app.sidebarVisible;
-                }
-            }
-            LyraToolButton {
-                objectName:"navigationBack"
-                symbol: "back"
-                text: qsTr("Back to reading position (Alt+Left)")
-                visible: app.canGoBack
-                onClicked: app.goBack()
-            }
-            LyraToolButton {
-                objectName:"navigationForward"
-                symbol:"forward"
-                text:qsTr("Forward to reading position (Alt+Right)")
-                visible:app.canGoForward
-                onClicked:app.goForward()
-            }
-            LyraToolButton {
-                symbol: "overview"
-                text: qsTr("Page overview")
-                selected: app.overviewVisible
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.showOverview()
-            }
-            LyraToolButton {
-                id: viewMenuButton
-                objectName: "viewMenuButton"
-                symbol: "view"
-                text: qsTr("View settings")
-                onClicked: viewMenu.popup(0, height)
-            }
-            Menu {
-                id: viewMenu
-                objectName: "viewSettingsMenu"
-                parent: viewMenuButton
-                focus: true
-                MenuItem {
-                    text: qsTr("Read Page Text (Ctrl+Shift+R)")
-                    checkable: true
-                    checked: app.textViewVisible
-                    enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.setTextViewEnabled(!app.textViewVisible)
-                }
-                MenuSeparator {}
-                MenuItem {
-                    text: qsTr("Continuous Pages")
-                    checkable: true
-                    checked: app.layoutMode === "Continuous"
-                    onTriggered: app.setPageLayout("Continuous")
-                }
-                MenuItem {
-                    text: qsTr("Facing Pages")
-                    checkable: true
-                    checked: app.layoutMode === "Facing"
-                    onTriggered: app.setPageLayout("Facing")
-                }
-                MenuSeparator {}
-                MenuItem {
-                    text: qsTr("Fit Width")
-                    enabled: !app.textViewVisible
-                    onTriggered: app.fitWidth()
-                }
-                MenuItem {
-                    text: qsTr("Actual Size")
-                    enabled: !app.textViewVisible
-                    onTriggered: {
-                        app.actualSize();
+            RowLayout {
+                id: navigationTools
+                objectName: "primaryNavigationTools"
+                spacing: app.width < 1000 ? 3 : 7
+                LyraToolButton {
+                    symbol: "sidebar"
+                    text: qsTr("Toggle sidebar (Ctrl+B)")
+                    selected: app.sidebarVisible
+                    onClicked: {
+                        app.overviewVisible = false;
+                        app.sidebarVisible = !app.sidebarVisible;
                     }
                 }
-                MenuItem {
-                    text: qsTr("Reading Appearance…")
-                    onTriggered: app.showSettings()
+                LyraToolButton {
+                    objectName:"navigationBack"
+                    symbol: "back"
+                    text: qsTr("Back to reading position (Alt+Left)")
+                    visible: app.canGoBack
+                    onClicked: app.goBack()
                 }
-            }
-            ToolSeparator {}
-            LyraToolButton {
-                symbol: "minus"
-                text: qsTr("Zoom Out (Ctrl+−)")
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.zoomBy(1 / 1.2)
-            }
-            ToolButton {
-                id: zoomMenuButton
-                objectName: "zoomMenuButton"
-                text: Math.round((app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent)) + (app.textViewVisible ? "%" : "% ▾")
-                Layout.preferredWidth: 72
-                Layout.minimumWidth: 72
-                onClicked: zoomMenu.popup(0, height)
-                enabled: app.currentReader.pageCount > 0 && !app.textViewVisible
-            }
-            Menu {
-                id: zoomMenu
-                objectName: "zoomPresetMenu"
-                parent: zoomMenuButton
-                focus: true
-                MenuItem {
-                    text: qsTr("Actual Size (100%)")
-                    onTriggered: {
-                        app.actualSize();
+                LyraToolButton {
+                    objectName:"navigationForward"
+                    symbol:"forward"
+                    text:qsTr("Forward to reading position (Alt+Right)")
+                    visible:app.canGoForward
+                    onClicked:app.goForward()
+                }
+                LyraToolButton {
+                    symbol: "overview"
+                    text: qsTr("Page overview")
+                    selected: app.overviewVisible
+                    enabled: app.currentReader.pageCount > 0
+                    onClicked: app.showOverview()
+                }
+                LyraToolButton {
+                    id: viewMenuButton
+                    objectName: "viewMenuButton"
+                    symbol: "view"
+                    text: qsTr("View settings")
+                    onClicked: viewMenu.popup(0, height)
+                }
+                Menu {
+                    id: viewMenu
+                    objectName: "viewSettingsMenu"
+                    parent: viewMenuButton
+                    focus: true
+                    MenuItem {
+                        text: qsTr("Read Page Text (Ctrl+Shift+R)")
+                        checkable: true
+                        checked: app.textViewVisible
+                        enabled: app.currentReader.pageCount > 0
+                        onTriggered: app.setTextViewEnabled(!app.textViewVisible)
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        text: qsTr("Continuous Pages")
+                        checkable: true
+                        checked: app.layoutMode === "Continuous"
+                        onTriggered: app.setPageLayout("Continuous")
+                    }
+                    MenuItem {
+                        text: qsTr("Facing Pages")
+                        checkable: true
+                        checked: app.layoutMode === "Facing"
+                        onTriggered: app.setPageLayout("Facing")
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        text: qsTr("Fit Width")
+                        enabled: !app.textViewVisible
+                        onTriggered: app.fitWidth()
+                    }
+                    MenuItem {
+                        text: qsTr("Actual Size")
+                        enabled: !app.textViewVisible
+                        onTriggered: {
+                            app.actualSize();
+                        }
+                    }
+                    MenuItem {
+                        text: qsTr("Reading Appearance…")
+                        onTriggered: app.showSettings()
                     }
                 }
-                MenuItem {
-                    text: qsTr("Fit Width")
-                    onTriggered: app.fitWidth()
-                }
-                MenuItem {
-                    text: qsTr("Fit Page")
-                    onTriggered: app.fitPage()
-                }
-            }
-            LyraToolButton {
-                symbol: "plus"
-                text: qsTr("Zoom In (Ctrl++)")
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.zoomBy(1.2)
-            }
-            ToolSeparator {}
-            LyraToolButton {
-                objectName: "annotateButton"
-                symbol: "annotations"
-                text: qsTr("Annotate")
-                selected: app.secondaryRow === "annotate"
-                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                enabled: app.canModifyPdf
-                onClicked: app.toggleSecondaryRow("annotate")
-            }
-            LyraToolButton {
-                objectName: "editPdfButton"
-                symbol: "pen"
-                text: qsTr("Edit")
-                selected: app.secondaryRow === "edit"
-                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                enabled: app.canModifyPdf
-                onClicked: app.toggleSecondaryRow("edit")
-            }
-            LyraToolButton {
-                objectName: "fillSignButton"
-                symbol: "form"
-                text: qsTr("Fill && Sign")
-                Accessible.name:qsTr("Fill & Sign")
-                ToolTip.text:qsTr("Fill & Sign")
-                selected: app.secondaryRow === "fill"
-                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                enabled: app.canModifyPdf
-                onClicked: app.toggleSecondaryRow("fill")
-            }
-            LyraToolButton {
-                objectName: "exportButton"
-                symbol: "export"
-                text: qsTr("Export")
-                selected: app.secondaryRow === "export"
-                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.toggleSecondaryRow("export")
-            }
-            LyraToolButton {
-                objectName: "lyraButton"
-                symbol: "ai"
-                text: qsTr("Lyra")
-                selected: app.secondaryRow === "lyra"
-                display: app.width < 1250 ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                enabled: app.currentReader.pageCount > 0
-                onClicked: app.toggleSecondaryRow("lyra")
-            }
-            LyraToolButton {
-                id: moreCommandsButton
-                objectName: "moreCommands"
-                symbol: "more"
-                text: qsTr("More commands")
-                onClicked: moreMenu.popup(0, height)
-            }
-            Menu {
-                id: moreMenu
-                objectName: "moreCommandsMenu"
-                parent: moreCommandsButton
-                focus: true
-                MenuItem {
-                    text: qsTr("Fill && Sign")
-                    Accessible.name: qsTr("Fill & Sign")
-                    enabled: app.canModifyPdf
-                    onTriggered: app.toggleForms()
-                }
-                MenuItem {
-                    text: qsTr("AI Assistant")
+                ToolSeparator {}
+                LyraToolButton {
+                    symbol: "minus"
+                    text: qsTr("Zoom Out (Ctrl+−)")
                     enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.showSidebar("ai")
+                    onClicked: app.zoomBy(1 / 1.2)
                 }
-                MenuItem {
-                    text: qsTr("Page operations")
+                ToolButton {
+                    id: zoomMenuButton
+                    objectName: "zoomMenuButton"
+                    text: Math.round((app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent)) + (app.textViewVisible ? "%" : "% ▾")
+                    Layout.preferredWidth: 72
+                    Layout.minimumWidth: 72
+                    onClicked: zoomMenu.popup(0, height)
+                    enabled: app.currentReader.pageCount > 0 && !app.textViewVisible
+                }
+                Menu {
+                    id: zoomMenu
+                    objectName: "zoomPresetMenu"
+                    parent: zoomMenuButton
+                    focus: true
+                    MenuItem {
+                        text: qsTr("Actual Size (100%)")
+                        onTriggered: {
+                            app.actualSize();
+                        }
+                    }
+                    MenuItem {
+                        text: qsTr("Fit Width")
+                        onTriggered: app.fitWidth()
+                    }
+                    MenuItem {
+                        text: qsTr("Fit Page")
+                        onTriggered: app.fitPage()
+                    }
+                }
+                LyraToolButton {
+                    symbol: "plus"
+                    text: qsTr("Zoom In (Ctrl++)")
                     enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.showOverview()
-                }
-                MenuSeparator {}
-                MenuItem {
-                    text: qsTr("Open PDF…")
-                    onTriggered: app.openDialog()
-                }
-                MenuItem {
-                    text: qsTr("Add Bookmark")
-                    enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.addBookmark()
-                }
-                MenuItem {
-                    text: qsTr("Merge PDFs…")
-                    enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
-                    onTriggered: app.showMergeDialog()
-                }
-                MenuItem {
-                    text: qsTr("Split PDF…")
-                    enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
-                    onTriggered: app.showSplitDialog()
-                }
-                MenuItem {
-                    text: qsTr("Document Information…")
-                    enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.showDocumentInformation()
-                }
-                MenuItem {
-                    text: qsTr("Print…")
-                    enabled: app.currentReader.pageCount > 0
-                    onTriggered: app.printDocument()
-                }
-                MenuSeparator {}
-                MenuItem {
-                    text: qsTr("Settings…")
-                    onTriggered: app.showSettings()
-                }
-            }
-            Label {
-                textFormat: Text.PlainText
-                visible: (app.originalReadOnly || app.xfaReadOnly) && app.width >= 1000
-                text: app.xfaReadOnly ? qsTr("XFA · read only") : qsTr("Signed · edits to copy")
-                color: app.colors.textSecondary
-                font.pixelSize: 11
-                ToolTip.visible: signedHover.hovered
-                ToolTip.text: app.readOnlyReason
-                HoverHandler {
-                    id: signedHover
+                    onClicked: app.zoomBy(1.2)
                 }
             }
             Item {
+                id: categorySpace
                 Layout.fillWidth: true
-            }
-            LyraToolButton {
-                objectName:"searchButton"
-                visible:app.width<850
-                symbol:"search";text:qsTr("Search document (Ctrl+F)")
-                onClicked:app.focusSearch()
-            }
-            TextField {
-                visible:app.width>=850
-                id: searchField
-                objectName: "searchField"
-                Layout.preferredWidth: app.width < 850 ? 120 : app.width < 1000 ? 135 : 220
-                Layout.minimumWidth: 100
-                implicitHeight: 30
-                placeholderText: qsTr("Search document")
-                text: app.searchQuery
-                onTextEdited: {
-                    app.searchQuery = text;
-                    app.searchDebounce.restart();
+                Layout.minimumWidth: 5 * 34 + 4 * categoryTools.spacing
+                implicitHeight: 32
+                Row {
+                    id: categoryTools
+                    objectName: "primaryCategoryTools"
+                    spacing: app.width < 1000 ? 3 : 7
+                    readonly property bool compact: labelledWidth > categorySpace.width
+                    readonly property real labelledWidth: annotateButton.labelledWidth + editButton.labelledWidth + fillButton.labelledWidth + exportButton.labelledWidth + lyraButton.labelledWidth + 4 * spacing
+                    x: Math.max(0, Math.min(categorySpace.width - width, chrome.readingCenter - categorySpace.mapToItem(chrome, 0, 0).x - width / 2))
+                    anchors.verticalCenter: parent.verticalCenter
+                    LyraToolButton {
+                        id: annotateButton
+                        objectName: "annotateButton"
+                        mainLabel: true
+                        fitLabel: true
+                        symbol: "annotations"
+                        text: qsTr("Annotate")
+                        selected: app.secondaryRow === "annotate"
+                        display: categoryTools.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                        enabled: app.canModifyPdf
+                        onClicked: app.toggleSecondaryRow("annotate")
+                    }
+                    LyraToolButton {
+                        id: editButton
+                        objectName: "editPdfButton"
+                        mainLabel: true
+                        fitLabel: true
+                        symbol: "pen"
+                        text: qsTr("Edit")
+                        selected: app.secondaryRow === "edit"
+                        display: categoryTools.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                        enabled: app.canModifyPdf
+                        onClicked: app.toggleSecondaryRow("edit")
+                    }
+                    LyraToolButton {
+                        id: fillButton
+                        objectName: "fillSignButton"
+                        mainLabel: true
+                        fitLabel: true
+                        symbol: "form"
+                        text: qsTr("Fill && Sign")
+                        Accessible.name:qsTr("Fill & Sign")
+                        ToolTip.text:qsTr("Fill & Sign")
+                        selected: app.secondaryRow === "fill"
+                        display: categoryTools.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                        enabled: app.canModifyPdf
+                        onClicked: app.toggleSecondaryRow("fill")
+                    }
+                    LyraToolButton {
+                        id: exportButton
+                        objectName: "exportButton"
+                        mainLabel: true
+                        fitLabel: true
+                        symbol: "export"
+                        text: qsTr("Export")
+                        selected: app.secondaryRow === "export"
+                        display: categoryTools.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                        enabled: app.currentReader.pageCount > 0
+                        onClicked: app.toggleSecondaryRow("export")
+                    }
+                    LyraToolButton {
+                        id: lyraButton
+                        objectName: "lyraButton"
+                        mainLabel: true
+                        fitLabel: true
+                        symbol: "lyra-quill"
+                        text: qsTr("Lyra")
+                        selected: app.secondaryRow === "lyra"
+                        display: categoryTools.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
+                        enabled: app.currentReader.pageCount > 0
+                        onClicked: app.toggleSecondaryRow("lyra")
+                    }
                 }
-                onAccepted: app.runSearch()
-                Accessible.name: qsTr("Search document (Ctrl+F)")
-                Component.onCompleted: app.chromeSearchField = searchField
+            }
+            RowLayout {
+                objectName: "primaryTrailingTools"
+                spacing: app.width < 1000 ? 3 : 7
+                LyraToolButton {
+                    id: moreCommandsButton
+                    objectName: "moreCommands"
+                    symbol: "more"
+                    text: qsTr("More commands")
+                    // The trailing menu grows to the left so it stays anchored to
+                    // its button even in the compact reader.
+                    onClicked: moreMenu.popup(width - moreMenu.width, height)
+                }
+                Menu {
+                    id: moreMenu
+                    objectName: "moreCommandsMenu"
+                    parent: moreCommandsButton
+                    focus: true
+                    MenuItem {
+                        text: qsTr("Fill && Sign")
+                        Accessible.name: qsTr("Fill & Sign")
+                        enabled: app.canModifyPdf
+                        onTriggered: app.toggleForms()
+                    }
+                    MenuItem {
+                        text: qsTr("AI Assistant")
+                        enabled: app.currentReader.pageCount > 0
+                        onTriggered: app.showSidebar("ai")
+                    }
+                    MenuItem {
+                        text: qsTr("Page operations")
+                        enabled: app.currentReader.pageCount > 0
+                        onTriggered: app.showOverview()
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        text: qsTr("Open PDF…")
+                        onTriggered: app.openDialog()
+                    }
+                    MenuItem {
+                        text: qsTr("Add Bookmark")
+                        enabled: app.currentReader.pageCount > 0
+                        onTriggered: app.addBookmark()
+                    }
+                    MenuItem {
+                        text: qsTr("Merge PDFs…")
+                        enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
+                        onTriggered: app.showMergeDialog()
+                    }
+                    MenuItem {
+                        text: qsTr("Split PDF…")
+                        enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
+                        onTriggered: app.showSplitDialog()
+                    }
+                    MenuItem {
+                        text: qsTr("Document Information…")
+                        enabled: app.currentReader.pageCount > 0
+                        onTriggered: app.showDocumentInformation()
+                    }
+                    MenuItem {
+                        text: qsTr("Print…")
+                        enabled: app.currentReader.pageCount > 0
+                        onTriggered: app.printDocument()
+                    }
+                    MenuSeparator {}
+                    MenuItem {
+                        text: qsTr("Settings…")
+                        onTriggered: app.showSettings()
+                    }
+                }
+                Label {
+                    textFormat: Text.PlainText
+                    visible: (app.originalReadOnly || app.xfaReadOnly) && app.width >= 1000
+                    text: app.xfaReadOnly ? qsTr("XFA · read only") : qsTr("Signed · edits to copy")
+                    color: app.colors.textSecondary
+                    font.pixelSize: 11
+                    ToolTip.visible: signedHover.hovered
+                    ToolTip.text: app.readOnlyReason
+                    HoverHandler {
+                        id: signedHover
+                    }
+                }
+                LyraToolButton {
+                    objectName:"searchButton"
+                    visible:app.width<850
+                    symbol:"search";text:qsTr("Search document (Ctrl+F)")
+                    onClicked:app.focusSearch()
+                }
+                TextField {
+                    visible:app.width>=850
+                    id: searchField
+                    objectName: "searchField"
+                    Layout.preferredWidth: app.width < 850 ? 120 : app.width < 1000 ? 135 : 220
+                    Layout.minimumWidth: 100
+                    implicitHeight: 30
+                    placeholderText: qsTr("Search document")
+                    text: app.searchQuery
+                    onTextEdited: {
+                        app.searchQuery = text;
+                        app.searchDebounce.restart();
+                    }
+                    onAccepted: app.runSearch()
+                    Accessible.name: qsTr("Search document (Ctrl+F)")
+                    Component.onCompleted: app.chromeSearchField = searchField
+                }
             }
         }
     }

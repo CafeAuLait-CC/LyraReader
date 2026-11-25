@@ -136,6 +136,7 @@ Pane {
                 })[app.sidebarTab] || 0
             ListView {
                 id: thumbnails
+                PanelWheelHandler { viewport: thumbnails }
                 objectName: "pagesSidebar"
                 clip: true
                 model: app.currentReader.pages
@@ -213,11 +214,16 @@ Pane {
                             color: thumbnail.highlighted ? app.colors.textPrimary : app.colors.textTertiary
                         }
                     }
-                    onClicked: app.navigate(index)
+                    onClicked: {
+                        app.selectPage(index, Qt.NoModifier);
+                        app.navigate(index);
+                    }
                 }
             }
             ListView {
                 id: outline
+                objectName: "outlineSidebar"
+                PanelWheelHandler { viewport: outline }
                 clip: true
                 model: app.currentReader.data.outline || []
                 ScrollBar.vertical: ScrollBar {}
@@ -255,6 +261,8 @@ Pane {
             }
             ListView {
                 id: bookmarkList
+                objectName: "bookmarksSidebar"
+                PanelWheelHandler { viewport: bookmarkList }
                 clip: true
                 model: app.bookmarks
                 ScrollBar.vertical: ScrollBar {}
@@ -305,6 +313,7 @@ Pane {
             }
             ListView {
                 id: annotationList
+                PanelWheelHandler { viewport: annotationList }
                 clip: true
                 objectName: "annotationThreadList"
                 model: app.annotationThreads.rows

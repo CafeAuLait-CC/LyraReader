@@ -2361,6 +2361,7 @@ ApplicationWindow {
     header: ReaderChrome {
         id: readerChrome
         app: root
+        readingCenter: readingArea.x + readingArea.width / 2
     }
 
     ColumnLayout {

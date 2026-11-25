@@ -187,6 +187,7 @@ Pane {
         }
         ListView {
             id:list;objectName:"regionNotesList"
+            PanelWheelHandler { viewport: list }
             visible:!notes.detail && !notes.readId && !notes.emptyHistory && (!notes.listLoadId || count>0)
             activeFocusOnTab:true
             Layout.fillWidth:true;Layout.fillHeight:true

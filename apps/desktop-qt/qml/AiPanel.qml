@@ -493,6 +493,7 @@ Pane {
         }
         ListView {
             id: paragraphList
+            PanelWheelHandler { viewport: paragraphList }
             objectName: "aiPairedTranslation"
             visible: aiPanel.pairedTranslation.length > 0 && !rawTranslation.checked
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
@@ -618,6 +619,7 @@ Pane {
         }
         ScrollView {
             id: composerScroll
+            PanelWheelHandler { viewport: composerScroll.contentItem }
             objectName: "aiComposerScroll"
             visible: (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) || aiPanel.workspace === "chat"
             Layout.fillWidth: true; Layout.preferredHeight: 64; Layout.maximumHeight: 64

@@ -61,6 +61,8 @@ Pane {
         }
         ListView {
             id: results
+            objectName: "searchResultList"
+            PanelWheelHandler { viewport: results }
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true

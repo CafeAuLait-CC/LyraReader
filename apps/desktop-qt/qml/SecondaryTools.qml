@@ -63,28 +63,28 @@ Item {
             visible:rows.presentedRow==="lyra"
             LyraToolButton {
                 objectName:"lyraRegionTool"
-                readonly property string caption: qsTr("Select & Ask")
-                symbol:"ai";fitLabel:true
+                readonly property string caption: qsTr("Interleaf")
+                symbol:"interleaf";fitLabel:true
                 display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 text:caption.replace(/&/g,"&&")
-                Accessible.name:caption
-                ToolTip.text:caption
+                Accessible.name:qsTr("Interleaf · Select & Ask")
+                ToolTip.text:qsTr("Select & Ask")
                 selected:app.regionSelecting
                 enabled:app.currentReader.pageCount>0 && !app.currentReader.loading && (!!app.currentReader.aiRegion.image_png || !app.currentReader.aiState.running)
                 onClicked:app.openRegionTool()
             }
-            LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Notes");Accessible.name:qsTr("Reading notes");fitLabel:true;display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon;selected:app.aiPanelVisible && app.aiPanelMode==="notes";enabled:app.currentReader.pageCount>0;onClicked:app.openRegionNotes()}
             Repeater {
                 model:[{key:"summary",title:qsTr("Summary")},{key:"translation",title:qsTr("Translate")},{key:"chat",title:qsTr("Chat")}]
                 LyraToolButton {
                     required property var modelData
                     objectName:"lyraWorkspace"+modelData.key
-                    symbol:"ai";text:modelData.title;fitLabel:true
+                    symbol:modelData.key === "translation" ? "translation" : modelData.key; text:modelData.title;fitLabel:true
                     display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                     selected:app.aiPanelVisible && app.aiPanelMode!=="notes" && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
                     onClicked:app.openAiWorkspace(modelData.key)
                 }
             }
+            LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Reading notes");Accessible.name:qsTr("Reading notes");fitLabel:true;display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon;selected:app.aiPanelVisible && app.aiPanelMode==="notes";enabled:app.currentReader.pageCount>0;onClicked:app.openRegionNotes()}
         }
         Rectangle {anchors.bottom:parent.bottom;width:parent.width;height:1;color:app.colors.separator}
     }

@@ -33,13 +33,7 @@ AiReadingScrollView {
         if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(event.key) >= 0) followTail = false;
         event.accepted = false;
     }
-    // Wheel events still reach the ScrollView. A deliberate upward gesture stops
-    // following before the next streaming chunk changes the content height.
-    WheelHandler {
-        target: null
-        blocking: false
-        onWheel: function(event) { if (event.angleDelta.y > 0 || event.pixelDelta.y > 0) conversation.followTail = false; event.accepted = false; }
-    }
+    onScrollIntent: function(dx, dy) { if (dy > 0) followTail = false; }
     Connections {
         target: conversation.contentItem
         function onMovementStarted() { conversation.followTail = false; }

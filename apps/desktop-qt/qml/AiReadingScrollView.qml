@@ -2,6 +2,11 @@ import QtQuick.Controls
 
 ScrollView {
     id: view
+    signal scrollIntent(real dx, real dy)
+    PanelWheelHandler {
+        viewport: view.contentItem
+        onScrollIntent: function(dx, dy) { view.scrollIntent(dx, dy); }
+    }
     readonly property bool verticalBarPressed: verticalBar.pressed
     readonly property real gutterWidth: verticalBar.gutterWidth
     leftPadding: mirrored ? gutterWidth : 0

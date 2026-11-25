@@ -2019,7 +2019,7 @@ private slots:
             QCOMPARE(accessible->text(QAccessible::Name),QStringLiteral("Fill & Sign"));
             QCOMPARE(fill->property("text").toString(),QStringLiteral("Fill && Sign"));
         }
-        const auto actual=body->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto expected=button->mapToGlobal(QPointF(0,button->height()));
+        const auto actual=body->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto expected=button->mapToGlobal(QPointF(buttonName=="moreCommands"?button->width()-menu->property("width").toDouble():0,button->height()));
         qInfo()<<"Toolbar popup anchor"<<buttonName<<actual<<expected<<"window"<<window->size();
         QVERIFY2(QLineF(actual,expected).length()<2,"The menu must open below its own toolbar button");
         QTRY_VERIFY(menu->property("activeFocus").toBool());
@@ -2972,6 +2972,29 @@ private slots:
         QVERIFY(file.open(QIODevice::ReadOnly));
         QCOMPARE(QCryptographicHash::hash(file.readAll(),QCryptographicHash::Sha256),originalHash);
     }
+    void settledPageKeepsNativeRasterPixels() {
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QTRY_VERIFY(reader.pageCount()==1 && !reader.loading() && !reader.pendingCommands());
+        const auto info=reader.pages().first().toMap();const double w=info.value("width").toDouble(),h=info.value("height").toDouble();
+        QQuickWindow window;window.setColor(Qt::white);window.resize(1100,900);
+        const double scale=1.49,density=scale*window.effectiveDevicePixelRatio();
+        PageItem page;page.setParentItem(window.contentItem());page.setController(&reader);page.setPageIndex(0);
+        page.setRasterScale(scale);page.setSize(QSizeF(w*scale,h*scale));window.show();
+        QTRY_VERIFY_WITH_TIMEOUT(page.refined() && page.texturesReady(),10000);
+        const auto cached=reader.cachedPage(0,density);QVERIFY(!cached.isNull());
+        QString error;const auto native=reader.renderSource()->crop(0,QRectF(0,0,w,h),density,false,false,&error);
+        QVERIFY2(!native.isNull(),qPrintable(error));QCOMPARE(cached,native);
+        QTest::qWait(100);const auto scene=window.grabWindow();QVERIFY(!scene.isNull());
+        double difference=0;quint64 channels=0;
+        for(int y=40;y<std::min(scene.height()-20,native.height()-20);++y)
+            for(int x=40;x<std::min(scene.width()-20,native.width()-20);++x) {
+                const auto a=scene.pixelColor(x,y),b=native.pixelColor(x,y);
+                difference+=std::abs(a.red()-b.red())+std::abs(a.green()-b.green())+std::abs(a.blue()-b.blue());channels+=3;
+            }
+        const double mean=difference/channels;
+        qInfo()<<"Native raster to settled scene mean channel difference"<<mean;
+        QVERIFY2(mean<.35,qPrintable(QString("The displayed page resampled its native text pixels: %1").arg(mean)));
+    }
     void readerWheelUsesScreenLinesAndAppliesPreciseMotionOnce_data() {
         QTest::addColumn<double>("zoom");
         QTest::newRow("normal")<<1.;
@@ -3020,6 +3043,148 @@ private slots:
         const auto oldZoom=view.window->property("zoom").toDouble();
         wheel({},QPoint(0,120),Qt::ControlModifier);
         QTRY_VERIFY(view.window->property("zoom").toDouble()>oldZoom);
+    }
+    void toolbarHierarchyAndLyraToolsMatchMac() {
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        view.window->setProperty("reduceMotion",true);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"lyra"),Q_ARG(QVariant,false)));
+        const QStringList primary{"annotateButton","editPdfButton","fillSignButton","exportButton","lyraButton"};
+        const QStringList secondary{"lyraRegionTool","lyraWorkspacesummary","lyraWorkspacetranslation","lyraWorkspacechat","lyraReadingNotes"};
+        const QStringList icons{"interleaf","summary","translation","chat","note"};
+        for(int width:{1600,1200,700}) {
+            view.window->setWidth(width);QTest::qWait(120);
+            auto *reading=visualItem(view.window->contentItem(),"readingArea");
+            auto *categories=visualItem(view.window->contentItem(),"primaryCategoryTools");
+            QVERIFY(reading && categories);
+            double previous=-1;
+            for(const auto &name:primary) {
+                auto *button=visualItem(view.window->contentItem(),name);QVERIFY(button && button->isVisible());
+                const auto frame=button->mapRectToScene(button->boundingRect());
+                QVERIFY(frame.left()>previous && frame.left()>=0 && frame.right()<=width);previous=frame.left();
+                const auto font=qvariant_cast<QFont>(button->property("font"));QCOMPARE(font.pixelSize(),14);QCOMPARE(font.weight(),QFont::Medium);
+            }
+            previous=-1;
+            for(int i=0;i<secondary.size();++i) {
+                auto *button=visualItem(view.window->contentItem(),secondary[i]);QVERIFY(button && button->isVisible());
+                const auto frame=button->mapRectToScene(button->boundingRect());
+                QVERIFY(frame.left()>previous && frame.left()>=0 && frame.right()<=width);previous=frame.left();
+                QCOMPARE(button->property("symbol").toString(),icons[i]);
+                const auto font=qvariant_cast<QFont>(button->property("font"));QCOMPARE(font.pixelSize(),12);QCOMPARE(font.weight(),QFont::Normal);
+            }
+            if(width==1600) {
+                const auto center=reading->mapToScene(QPointF(reading->width()/2,0)).x();
+                const auto actual=categories->mapToScene(QPointF(categories->width()/2,0)).x();
+                QVERIFY2(qAbs(center-actual)<1.01,qPrintable(QString("Toolbar center %1, reader center %2").arg(actual).arg(center)));
+                const auto capture=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");
+                if(!capture.isEmpty())QVERIFY(view.window->grabWindow().save(capture+".png"));
+            }
+        }
+        QCOMPARE(visualItem(view.window->contentItem(),"lyraButton")->property("symbol").toString(),QString("lyra-quill"));
+        for(const auto &entry:{QPair<const char *,const char *>{"lyra-quill","LyraAIIcon"},QPair<const char *,const char *>{"interleaf","LyraReader-Interleaf"}}) {
+            QFile bundled(QString("%1/icons/%2.svg").arg(":",entry.first));
+            QFile mac(root+"/apps/macos/Support/"+entry.second+".svg");
+            QVERIFY(bundled.open(QIODevice::ReadOnly));QVERIFY(mac.open(QIODevice::ReadOnly));QCOMPARE(bundled.readAll(),mac.readAll());
+        }
+    }
+    void thumbnailActivationMovesThePageSelectionBorder_data() {
+        QTest::addColumn<QString>("appearance");
+        QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void thumbnailActivationMovesThePageSelectionBorder() {
+        QFETCH(QString,appearance);
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->setProperty("appearance",appearance);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==3 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSidebar",Q_ARG(QVariant,"thumbnails")));
+        QVERIFY(settleReaderViewport(view.window));
+        QQuickItem *first=nullptr,*second=nullptr,*third=nullptr;
+        QTRY_VERIFY((first=visualItem(view.window->contentItem(),"thumbnailSelection0"))
+            && (second=visualItem(view.window->contentItem(),"thumbnailSelection1"))
+            && (third=visualItem(view.window->contentItem(),"thumbnailSelection2")));
+        view.window->setProperty("selectedPages",QVariantList{0,2});
+        const auto center=second->mapToScene(QPointF(second->width()/2,second->height()/2)).toPoint();
+        QTest::mouseClick(view.window,Qt::LeftButton,Qt::NoModifier,center);
+        QTRY_COMPARE(view.window->property("currentPage").toInt(),1);
+        QCOMPARE(view.window->property("selectedPages").toList(),QVariantList{1});
+        QCOMPARE(QQmlProperty::read(first, "border.width").toInt(),0);
+        QCOMPARE(QQmlProperty::read(second, "border.width").toInt(),2);
+        QCOMPARE(QQmlProperty::read(third, "border.width").toInt(),0);
+        auto *thirdButton=third->parentItem();QVERIFY(thirdButton);thirdButton->forceActiveFocus(Qt::TabFocusReason);
+        QTest::keyClick(view.window,Qt::Key_Space);
+        QTRY_COMPARE(view.window->property("currentPage").toInt(),2);
+        QCOMPARE(view.window->property("selectedPages").toList(),QVariantList{2});
+        QCOMPARE(QQmlProperty::read(second, "border.width").toInt(),0);
+        QCOMPARE(QQmlProperty::read(third, "border.width").toInt(),2);
+        // Reading navigation alone keeps the explicit page-operation selection,
+        // like the Mac; it must not accidentally move a user's multi-page target.
+        QVERIFY(QMetaObject::invokeMethod(view.window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+        QCOMPARE(view.window->property("selectedPages").toList(),QVariantList{2});
+    }
+    void sidePanelsUseDocumentWheelUnits_data() {
+        QTest::addColumn<QString>("panel");
+        QTest::newRow("thumbnails")<<QString("thumbnails");
+        QTest::newRow("outline")<<QString("outline");
+        QTest::newRow("bookmarks")<<QString("bookmarks");
+        QTest::newRow("search")<<QString("search");
+    }
+    void sidePanelsUseDocumentWheelUnits() {
+        QFETCH(QString,panel);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        const int previous=QGuiApplication::styleHints()->wheelScrollLines();
+        const auto restore=qScopeGuard([&]{QGuiApplication::styleHints()->setWheelScrollLines(previous);});
+        QGuiApplication::styleHints()->setWheelScrollLines(3);
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));
+        auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==9 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(view.window));view.window->setProperty("fitting",false);
+        if(panel=="search")view.window->setProperty("searchVisible",true);
+        else QVERIFY(QMetaObject::invokeMethod(view.window,"showSidebar",Q_ARG(QVariant,panel)));
+        const QString name=panel=="thumbnails"?"pagesSidebar":panel=="outline"?"outlineSidebar":
+                           panel=="bookmarks"?"bookmarksSidebar":"searchResultList";
+        QQuickItem *viewport=nullptr;
+        QTRY_VERIFY((viewport=visualItem(view.window->contentItem(),name)) && viewport->isVisible() && viewport->height()>100);
+        if(panel!="thumbnails") {
+            QVariantList rows;
+            for(int i=0;i<40;++i)rows.append(QVariantMap{{"title",QString("Public synthetic row %1").arg(i)},
+                {"snippet","A public synthetic search result with text that can wrap."},{"page",i%9},{"depth",0}});
+            QVERIFY(QQmlProperty::write(viewport,"model",rows));
+        }
+        QTRY_VERIFY(viewport->property("contentHeight").toDouble()>viewport->height()+200);
+        QTest::qWait(80);
+        const auto position=[&]{return viewport->property("contentY").toDouble()-viewport->property("originY").toDouble();};
+        auto *document=visualItem(view.window->contentItem(),"pageList");QVERIFY(document);
+        const auto documentY=document->property("contentY"),zoom=view.window->property("zoom");
+        const auto point=viewport->mapToScene(QPointF(viewport->width()/2,viewport->height()/2));
+        const auto wheel=[&](QPoint pixel,QPoint angle) {
+            QWheelEvent event(point,view.window->mapToGlobal(point.toPoint()),pixel,angle,
+                              Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);
+            QGuiApplication::sendEvent(view.window,&event);
+        };
+        auto before=position();wheel({},QPoint(0,-120));
+        QTRY_VERIFY2(qAbs(position()-before-75)<1.01,qPrintable(QString("Panel %1 moved %2").arg(panel).arg(position()-before)));
+        before=position();wheel(QPoint(0,-17),QPoint(0,-120));
+        QTRY_VERIFY(qAbs(position()-before-17)<1.01);
+        const auto stopped=position();QTest::qWait(100);
+        QVERIFY(qAbs(position()-stopped)<1.01);QVERIFY(!viewport->property("moving").toBool());
+        QCOMPARE(view.window->property("zoom"),zoom);
+        QVERIFY(qAbs(document->property("contentY").toDouble()-documentY.toDouble())<1.01);
+        wheel({},QPoint(0,12000));
+        QTRY_VERIFY(qAbs(position()+viewport->property("topMargin").toDouble())<1.01);
+        wheel({},QPoint(0,-12000));
+        if(panel=="thumbnails") {
+            // Qt estimates unseen fractional-height rows. Check the visible final
+            // thumbnail and its margin rather than that approximate atYEnd flag.
+            auto *last=visualItem(viewport,"thumbnailContent8");QVERIFY(last);
+            const auto frame=last->mapRectToItem(viewport,last->boundingRect());
+            QVERIFY(frame.top()>=0 && frame.bottom()<=viewport->height());
+            const auto gap=viewport->height()-frame.bottom();
+            QVERIFY2(gap>=viewport->property("bottomMargin").toDouble()-1 && gap<=viewport->property("bottomMargin").toDouble()+8,
+                qPrintable(QString("Last thumbnail bottom gap %1, margin %2").arg(gap).arg(viewport->property("bottomMargin").toDouble())));
+        }else QTRY_VERIFY(viewport->property("atYEnd").toBool());
     }
     void thumbnailsReduceSupersampledHairlinesBeforePublishing() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-hairlines.pdf");
@@ -5312,7 +5477,7 @@ private slots:
         auto *flick=conversation->property("contentItem").value<QQuickItem *>();QVERIFY(flick);QTRY_VERIFY(flick->property("contentHeight").toDouble()>flick->height()+100);QTRY_VERIFY(flick->property("atYEnd").toBool());QVERIFY(conversation->property("followTail").toBool());
         QTRY_VERIFY(bar->isVisible());QCOMPARE(conversation->property("availableWidth").toDouble(),available);
         QVERIFY(bar->x()>=available);
-        const auto bottom=flick->property("contentY").toDouble();const auto point=conversation->mapToScene(QPointF(conversation->width()/2,conversation->height()/2));QWheelEvent wheel(point,view.window->mapToGlobal(point.toPoint()),QPoint(),QPoint(0,240),Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);QGuiApplication::sendEvent(view.window,&wheel);QTRY_VERIFY(!conversation->property("followTail").toBool());QTRY_VERIFY(flick->property("contentY").toDouble()<bottom);QTRY_VERIFY(!flick->property("moving").toBool());const auto y=flick->property("contentY").toDouble();QTRY_VERIFY(reader->aiState().value("output").toString().contains("Later streaming chunk"));QCOMPARE(flick->property("contentY").toDouble(),y);
+        const auto bottom=flick->property("contentY").toDouble();const auto point=conversation->mapToScene(QPointF(conversation->width()/2,conversation->height()/2));QWheelEvent wheel(point,view.window->mapToGlobal(point.toPoint()),QPoint(),QPoint(0,240),Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);QGuiApplication::sendEvent(view.window,&wheel);QTRY_VERIFY(!conversation->property("followTail").toBool());QTRY_VERIFY(qAbs(bottom-flick->property("contentY").toDouble()-QGuiApplication::styleHints()->wheelScrollLines()*50)<1.01);QTRY_VERIFY(!flick->property("moving").toBool());const auto y=flick->property("contentY").toDouble();QTRY_VERIFY(reader->aiState().value("output").toString().contains("Later streaming chunk"));QCOMPARE(flick->property("contentY").toDouble(),y);
         flick->setProperty("contentY",flick->property("contentHeight").toDouble()-flick->height());QTRY_VERIFY(conversation->property("followTail").toBool());reader->cancelAi();QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),1);
     }
     void aiDrawerLeavesOverviewWithoutForcingAToolRowOrLosingTheViewport() {
@@ -6459,11 +6624,11 @@ private slots:
         const auto caption=toolbarRegion->property("text").toString();
         QVERIFY(window->property("operationStatus").toString().contains("Drag an area of the page"));
         QVERIFY(QMetaObject::invokeMethod(window,"cancelRegionSelection"));
-        QVERIFY2(window->property("operationStatus").toString().isEmpty() && caption=="Select && Ask",
+        QVERIFY2(window->property("operationStatus").toString().isEmpty() && caption=="Interleaf",
                  qPrintable(caption+" / "+window->property("operationStatus").toString()));
         auto *accessibleRegion=QAccessible::queryAccessibleInterface(toolbarRegion);
         QVERIFY(accessibleRegion);
-        QCOMPARE(accessibleRegion->text(QAccessible::Name),QString("Select & Ask"));
+        QCOMPARE(accessibleRegion->text(QAccessible::Name),QString("Interleaf · Select & Ask"));
         window->setProperty("operationStatus",QStringLiteral("Other action status"));
         QVERIFY(QMetaObject::invokeMethod(window,"cancelRegionSelection"));
         QCOMPARE(window->property("operationStatus").toString(),QString("Other action status"));

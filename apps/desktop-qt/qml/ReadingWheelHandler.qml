@@ -3,6 +3,7 @@ import QtQuick
 WheelHandler {
     id: handler
     property bool scrollEnabled: true
+    property bool zoomEnabled: true
     signal scrollRequested(real dx, real dy)
     signal zoomRequested(real factor, real x, real y)
     target: null
@@ -10,6 +11,10 @@ WheelHandler {
     onWheel: function(event) {
         const precise = event.pixelDelta.x !== 0 || event.pixelDelta.y !== 0;
         if (event.modifiers & Qt.ControlModifier) {
+            if (!handler.zoomEnabled) {
+                event.accepted = false;
+                return;
+            }
             const delta = precise ? event.pixelDelta.y : event.angleDelta.y;
             handler.zoomRequested(Math.pow(1.0015, delta), event.x, event.y);
         } else if (handler.scrollEnabled) {

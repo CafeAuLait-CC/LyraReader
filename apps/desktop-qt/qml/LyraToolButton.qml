@@ -6,13 +6,15 @@ ToolButton {
     property string symbol: ""
     property bool selected: false
     property bool fitLabel: false
+    property bool mainLabel: false
     readonly property real labelledWidth: labelProbe.item ? Math.ceil(labelProbe.item.implicitWidth) + 1 : 34
     property var theme: ApplicationWindow.window ? ApplicationWindow.window.colors : null
     implicitWidth: display === AbstractButton.IconOnly ? (fitLabel ? 34 : 32) : fitLabel ? labelledWidth : implicitContentWidth + 18
     implicitHeight: 32
     padding: 7
     display: AbstractButton.IconOnly
-    Binding { target: control; property: "font.pixelSize"; value: 12; when: control.fitLabel }
+    Binding { target: control; property: "font.pixelSize"; value: control.mainLabel ? 14 : 12; when: control.fitLabel || control.mainLabel }
+    Binding { target: control; property: "font.weight"; value: control.mainLabel ? Font.Medium : Font.Normal; when: control.fitLabel || control.mainLabel }
     Binding { target: control; property: "spacing"; value: 5; when: control.fitLabel }
     Loader {
         id: labelProbe

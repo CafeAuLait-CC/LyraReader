@@ -107,6 +107,7 @@ Item {
             }
             ListView {
                 id: rows
+                PanelWheelHandler { viewport: rows }
                 objectName: "summaryCatalogRows"
                 Layout.fillWidth: true; Layout.fillHeight: true
                 clip: true; spacing: 8
