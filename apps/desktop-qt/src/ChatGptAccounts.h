@@ -50,6 +50,7 @@ public:
     Q_INVOKABLE void selectModel(const QString &id);
     Q_INVOKABLE void beginSignIn(bool addAccount);
     Q_INVOKABLE void cancelSignIn();
+    Q_INVOKABLE void reloadModels();
     Q_INVOKABLE void signOut();
     Q_INVOKABLE bool send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken);
 
@@ -65,8 +66,8 @@ signals:
 
 private:
     explicit ChatGptAccounts(QObject *parent);
-    enum class VaultIntent { None, Save, LoadForChat, SaveRefresh, LoadForRevoke, Remove };
-    enum class WorkerIntent { SignIn, Refresh, Revoke };
+    enum class VaultIntent { None, Save, LoadForChat, SaveRefresh, LoadForRevoke, Remove, LoadForModels, SaveModels };
+    enum class WorkerIntent { SignIn, Refresh, Revoke, Models };
 
     QVariantMap selected() const;
     void poll();

@@ -153,7 +153,12 @@ pub unsafe extern "C" fn lyra_reader_desktop_chatgpt_auth_begin(
                         Some("No eligible models were returned for this account.".into()),
                     ),
                     Ok(items) => (items, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
+                    Err(error) => (
+                        Vec::new(),
+                        Some(format!(
+                            "Signed in. Could not load the ChatGPT model catalog: {error}"
+                        )),
+                    ),
                 };
                 serde_json::to_vec(&SignInResult {
                     client_id: sign_in.client_id.as_str(),
@@ -179,6 +184,10 @@ pub unsafe extern "C" fn lyra_reader_desktop_chatgpt_auth_begin(
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum SessionOperation {
+    Models {
+        client_id: String,
+        credential: Credential,
+    },
     Refresh {
         client_id: String,
         credential: Credential,
@@ -189,7 +198,7 @@ enum SessionOperation {
     },
 }
 
-/// Start a user-authorized refresh or revocation with material from the system vault.
+/// Start a user-authorized catalog read, refresh or revocation using the system vault.
 /// # Safety
 /// Input has len readable bytes. Error is a distinct writable empty buffer. The
 /// caller frees the returned handle and every owned buffer once.
@@ -209,6 +218,35 @@ pub unsafe extern "C" fn lyra_reader_desktop_chatgpt_session_begin(
                 .map_err(|_| "Invalid ChatGPT session record.")?;
             let handle = start_worker(move |cancel| {
                 let result = match action {
+                    SessionOperation::Models {
+                        client_id,
+                        credential,
+                    } => {
+                        let client =
+                            ClientId::parse(&client_id).map_err(|error| error.to_string())?;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|_| "Could not read the session clock.".to_owned())?
+                            .as_secs();
+                        let renew_before = now
+                            .checked_add(45)
+                            .ok_or_else(|| "The session clock is out of range.".to_owned())?;
+                        let credential = if credential.expires_at_unix() <= renew_before {
+                            refresh(&client, credential, cancel)
+                                .map_err(|error| error.to_string())?
+                        } else {
+                            credential
+                        };
+                        let (catalog, warning) = match models(&credential, cancel) {
+                            Ok(items) => (Some(items), None),
+                            Err(error) => (None, Some(error.to_string())),
+                        };
+                        // Return a rotated credential even when the catalog fails. The
+                        // platform must save it before publishing the catalog or warning.
+                        serde_json::to_vec(&serde_json::json!({
+                            "credential":credential,"models":catalog,"warning":warning
+                        }))
+                    }
                     SessionOperation::Refresh {
                         client_id,
                         credential,

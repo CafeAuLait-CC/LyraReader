@@ -325,6 +325,9 @@ private slots:
         accounts->setUseForLayeredSummaries(true);
         QVERIFY(!accounts->useForLayeredSummaries());
         QVERIFY(accounts->accounts().isEmpty());
+        accounts->reloadModels();
+        QVERIFY(!accounts->busy());
+        QVERIFY(accounts->status().isEmpty());
         capturedChatGptUrl.clear();
         QDesktopServices::setUrlHandler("https", this, "captureChatGptUrl");
         const auto cleanup = qScopeGuard([&] {
@@ -338,6 +341,8 @@ private slots:
         QVERIFY(settings);
         QTRY_VERIFY(settings->isVisible());
         QVERIFY(capturedChatGptUrl.isEmpty());
+        auto *reload=settings->findChild<QQuickItem *>("reloadChatGptModels");
+        QVERIFY(reload && !reload->isVisible());
         auto *selectionPreference = settings->findChild<QObject *>("useChatGptForSelection");
         QVERIFY(selectionPreference);
         QVERIFY(!selectionPreference->property("checked").toBool());
@@ -347,6 +352,10 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
         QTRY_VERIFY(accounts->signingIn());
         QTRY_VERIFY(capturedChatGptUrl.isValid());
+        const auto pendingSignIn=capturedChatGptUrl;
+        accounts->reloadModels();
+        QVERIFY(accounts->signingIn());
+        QCOMPARE(capturedChatGptUrl,pendingSignIn);
         QCOMPARE(capturedChatGptUrl.scheme(), QString("https"));
         QCOMPARE(capturedChatGptUrl.host(), QString("auth.openai.com"));
         QCOMPARE(capturedChatGptUrl.path(), QString("/api/accounts/authorize"));
@@ -475,6 +484,58 @@ private slots:
                                .arg(metrics.horizontalAdvance(text)).arg(label()->width())), 1500);
         }
         QVERIFY(settings->close());
+    }
+    void chatGptModelReloadKeepsTheSavedConnectionWhenAnotherProcessOwnsIt() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        auto *accounts=view.workspace.chatGptAccounts();QVERIFY(accounts);
+        QSettings settings;
+        const QString roster="chatGptPlan/accounts",selected="chatGptPlan/selected";
+        const auto previousRoster=settings.value(roster),previousSelected=settings.value(selected);
+        const auto oldGeometry=view.workspace.preference("auxiliarySettingsGeometry",{});
+        const auto restore=qScopeGuard([&] {
+            if(previousRoster.isValid())settings.setValue(roster,previousRoster);else settings.remove(roster);
+            if(previousSelected.isValid())settings.setValue(selected,previousSelected);else settings.remove(selected);
+            settings.sync();accounts->selectAccount(previousSelected.toString());
+            view.workspace.setPreference("auxiliarySettingsGeometry",oldGeometry);
+        });
+        const QString id="synthetic-catalog-connection";
+        const QVariantList original{QVariantMap{
+            {"id",id},{"clientId","oaiapp_synthetic"},{"subject","synthetic-reader"},
+            {"label","Connection 1"},{"email","reader@example.invalid"},
+            {"connected",true},{"model",""},{"models",QVariantList{}},{"future_metadata","preserved"}
+        }};
+        settings.setValue(roster,original);settings.setValue(selected,id);settings.sync();
+        QCOMPARE(settings.status(),QSettings::NoError);
+        accounts->selectAccount(id);
+        QVERIFY(accounts->connected());QVERIFY(accounts->models().isEmpty());
+        view.workspace.setPreference("auxiliarySettingsGeometry",QVariantMap{{"width",360},{"height",580}});
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));
+        auto *window=view.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(window);
+        QTRY_VERIFY(window->isVisible());QTRY_COMPARE(window->width(),360);
+        auto *reload=visualItem(window->contentItem(),"reloadChatGptModels");
+        QVERIFY(reload && reload->isVisible() && reload->isEnabled());
+        auto *scroll=visualItem(window->contentItem(),"settingsScroll");QVERIFY(scroll);
+        auto *flickable=scroll->property("contentItem").value<QQuickItem *>();QVERIFY(flickable);
+        flickable->setProperty("contentY",std::max(0.,flickable->property("contentHeight").toDouble()-flickable->height()));
+        QTRY_VERIFY(reload->mapRectToItem(scroll,reload->boundingRect()).top()>=0
+            && reload->mapRectToItem(scroll,reload->boundingRect()).bottom()<=scroll->height());
+        QTest::qWait(80);
+        const auto bounds=reload->mapRectToScene(reload->boundingRect());
+        QVERIFY(bounds.left()>=0 && bounds.right()<=window->width());
+        const auto config=QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+        const auto folder=QDir(config).filePath("chatgpt-accounts");
+        QVERIFY(QDir().mkpath(folder));
+        const auto hash=QString::fromLatin1(QCryptographicHash::hash(id.toUtf8(),QCryptographicHash::Sha256).toHex());
+        QLockFile lock(QDir(folder).filePath("chatgpt-"+hash+".lock"));
+        QVERIFY(lock.tryLock(0));
+        QVERIFY(QMetaObject::invokeMethod(reload,"clicked"));
+        QVERIFY(accounts->status().contains("being updated"));
+        QVERIFY(!accounts->busy());QVERIFY(accounts->connected());QVERIFY(accounts->models().isEmpty());
+        QCOMPARE(accounts->accounts(),original);
+        settings.sync();QCOMPARE(settings.value(roster).toList(),original);
+        const auto snapshot=qEnvironmentVariable("LYRA_READER_CHATGPT_CATALOG_SNAPSHOT");
+        if(!snapshot.isEmpty())QVERIFY(window->grabWindow().save(snapshot));
+        QVERIFY(window->close());
     }
     void chatGptPreviewCannotFallBackToANonChatGptConnection() {
         QTemporaryDir scratch;

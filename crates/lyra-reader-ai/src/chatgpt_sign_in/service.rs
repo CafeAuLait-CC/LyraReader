@@ -15,6 +15,9 @@ const MODELS_URL: &str = "https://api.openai.com/v1/models";
 const AUTH_HOST: &str = "auth.openai.com";
 const RESOURCE: &str = "https://api.openai.com/v1";
 const MAX_RESPONSE_BYTES: usize = 128 * 1024;
+// The account catalog includes model metadata beyond the fields used by the picker.
+// Keep token/discovery limits small without imposing them on this larger response.
+const MAX_MODEL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 
 /// Kept in memory or in the platform vault. Do not place this record in preferences.
@@ -72,15 +75,23 @@ pub fn models(
     credential: &Credential,
     cancel: &CancellationToken,
 ) -> Result<Vec<CatalogModel>, SignInError> {
-    if !valid_token(credential.access_token()) || !credential.permission_still_granted() {
-        return Err(SignInError::PermissionMissing);
-    }
     let transport = UreqTransport::system(ClientConfig {
         max_time: Duration::from_secs(30),
         ..ClientConfig::default()
     });
+    models_with(&transport, credential, cancel)
+}
+
+fn models_with(
+    transport: &dyn Transport,
+    credential: &Credential,
+    cancel: &CancellationToken,
+) -> Result<Vec<CatalogModel>, SignInError> {
+    if !valid_token(credential.access_token()) || !credential.permission_still_granted() {
+        return Err(SignInError::PermissionMissing);
+    }
     let bytes = request(
-        &transport,
+        transport,
         "GET",
         MODELS_URL,
         Vec::new(),
@@ -92,7 +103,7 @@ pub fn models(
 
 fn listed_models(bytes: &[u8]) -> Result<Vec<CatalogModel>, SignInError> {
     let catalog: Catalog =
-        serde_json::from_slice(bytes).map_err(|_| SignInError::InvalidResponse)?;
+        serde_json::from_slice(bytes).map_err(|_| SignInError::InvalidModelCatalog)?;
     Ok(catalog
         .models
         .into_iter()
@@ -386,9 +397,18 @@ fn request(
         .map_err(|_| service_failure(cancel))?;
     let status = response.status();
     let mut bytes = Vec::new();
+    let limit = if address == MODELS_URL {
+        MAX_MODEL_CATALOG_BYTES
+    } else {
+        MAX_RESPONSE_BYTES
+    };
     while let Some(chunk) = response.next_chunk().map_err(|_| service_failure(cancel))? {
-        if chunk.len() > MAX_RESPONSE_BYTES - bytes.len() {
-            return Err(SignInError::InvalidResponse);
+        if chunk.len() > limit - bytes.len() {
+            return Err(if address == MODELS_URL {
+                SignInError::ModelCatalogTooLarge
+            } else {
+                SignInError::InvalidResponse
+            });
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -488,6 +508,14 @@ mod tests {
                 assert!(
                     body.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A43120%2Fauth%2Fcallback")
                 );
+            } else if spec.url == MODELS_URL {
+                assert!(spec.body.is_empty());
+                assert!(
+                    spec.headers
+                        .iter()
+                        .any(|(name, value)| name == "Authorization"
+                            && value == "Bearer synthetic-access")
+                );
             } else {
                 assert!(
                     spec.body.is_empty()
@@ -554,6 +582,97 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "retained-v1");
         assert_eq!(result[0].name, "Retained");
+    }
+
+    #[test]
+    fn account_catalog_has_its_own_bounded_response_budget() {
+        let (tokens, _) = token_fixture();
+        let credential = || {
+            serde_json::from_value::<TokenResponse>(tokens.clone())
+                .unwrap()
+                .credential(100)
+                .unwrap()
+        };
+        let mut model_reply = reply(
+            "GET",
+            MODELS_URL,
+            json!({
+                "models":[{"visibility":"list","slug":"synthetic-model","display_name":"Synthetic model"}],
+                "metadata":"x".repeat(MAX_RESPONSE_BYTES)
+            }),
+        );
+        assert!(model_reply.body.as_ref().unwrap().len() > MAX_RESPONSE_BYTES);
+        model_reply
+            .body
+            .as_mut()
+            .unwrap()
+            .resize(MAX_MODEL_CATALOG_BYTES, b' ');
+        let mock = Playback::new([model_reply]);
+        let models = models_with(&mock, &credential(), &CancellationToken::new()).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "synthetic-model");
+        assert!(mock.empty());
+
+        let mut oversized = reply("GET", MODELS_URL, json!({"models":[]}));
+        oversized
+            .body
+            .as_mut()
+            .unwrap()
+            .resize(MAX_MODEL_CATALOG_BYTES + 1, b' ');
+        let mock = Playback::new([oversized]);
+        assert_eq!(
+            models_with(&mock, &credential(), &CancellationToken::new()).err(),
+            Some(SignInError::ModelCatalogTooLarge)
+        );
+        assert!(mock.empty());
+
+        let mut oversized_token = reply("POST", TOKEN_URL, tokens);
+        oversized_token
+            .body
+            .as_mut()
+            .unwrap()
+            .resize(MAX_RESPONSE_BYTES + 1, b' ');
+        let mock = Playback::new([oversized_token]);
+        assert_eq!(
+            exchange_with(&mock, proof(), &CancellationToken::new(), || Ok(100)).err(),
+            Some(SignInError::InvalidResponse)
+        );
+        assert!(mock.empty());
+    }
+
+    #[test]
+    fn malformed_catalog_is_reported_after_sign_in_without_echoing_payload() {
+        let (tokens, _) = token_fixture();
+        let credential = serde_json::from_value::<TokenResponse>(tokens)
+            .unwrap()
+            .credential(100)
+            .unwrap();
+        for payload in [
+            json!({"models":null}),
+            json!({"unexpected":"SYNTHETIC_PRIVATE_RESPONSE"}),
+            json!({"models":[{"visibility":"list","slug":3,"display_name":"Synthetic"}]}),
+        ] {
+            let mock = Playback::new([reply("GET", MODELS_URL, payload)]);
+            let error = models_with(&mock, &credential, &CancellationToken::new())
+                .err()
+                .unwrap();
+            assert_eq!(error, SignInError::InvalidModelCatalog);
+            assert_eq!(
+                error.to_string(),
+                "ChatGPT returned an invalid model catalog."
+            );
+            assert!(mock.empty());
+        }
+        let unauthorized = Credential {
+            scopes: vec!["openid".into()],
+            ..credential
+        };
+        let mock = Playback::new([]);
+        assert_eq!(
+            models_with(&mock, &unauthorized, &CancellationToken::new()).err(),
+            Some(SignInError::PermissionMissing)
+        );
+        assert!(mock.empty());
     }
 
     #[test]

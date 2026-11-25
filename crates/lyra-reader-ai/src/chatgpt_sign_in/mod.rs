@@ -77,6 +77,8 @@ pub enum SignInError {
     Cancelled,
     TimedOut,
     InvalidResponse,
+    InvalidModelCatalog,
+    ModelCatalogTooLarge,
     PermissionMissing,
     InvalidGrant,
     ServiceUnavailable,
@@ -99,6 +101,10 @@ impl fmt::Display for SignInError {
             Self::Cancelled => "Sign-in cancelled.",
             Self::TimedOut => "ChatGPT sign-in timed out. Please try again.",
             Self::InvalidResponse => "ChatGPT returned an invalid sign-in response.",
+            Self::InvalidModelCatalog => "ChatGPT returned an invalid model catalog.",
+            Self::ModelCatalogTooLarge => {
+                "The ChatGPT model catalog exceeds the 4 MiB response limit."
+            }
             Self::PermissionMissing => {
                 "ChatGPT plan usage was not enabled. Sign in again and approve plan usage."
             }

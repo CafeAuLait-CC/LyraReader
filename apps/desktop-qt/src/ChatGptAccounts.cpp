@@ -228,6 +228,14 @@ void ChatGptAccounts::cancelSignIn() {
     setStatus(tr("Sign-in cancelled."));
 }
 
+void ChatGptAccounts::reloadModels() {
+    if(busy() || !reloadPreferences() || !connected() || !lockAccount(m_selected))return;
+    m_vault.clearSession();
+    m_intent=VaultIntent::LoadForModels;
+    m_vaultId=m_vault.read(vaultKey(m_selected));
+    setStatus(tr("Loading ChatGPT models…"));
+}
+
 void ChatGptAccounts::poll() {
     if(!m_auth)return;
     LyraReaderBuffer result{},error{};
@@ -237,6 +245,36 @@ void ChatGptAccounts::poll() {
     if(!state)return;
     m_pollTimer.stop();
     m_auth.reset();
+    if(m_worker==WorkerIntent::Models) {
+        const auto reply=QJsonDocument::fromJson(bytes).object();
+        const auto credential=reply.value(QStringLiteral("credential")).toObject();
+        if(state!=1 || credential.isEmpty()) {
+            m_accountLock.reset();
+            m_vault.clearSession();
+            setStatus(failure.isEmpty()?tr("Could not load the ChatGPT model catalog."):failure);
+            return;
+        }
+        m_candidate={{QStringLiteral("id"),m_selected}};
+        if(reply.value(QStringLiteral("models")).isArray()) {
+            const auto catalog=reply.value(QStringLiteral("models")).toArray().toVariantList();
+            const auto preferred=model();
+            const bool keepPreferred=std::any_of(catalog.cbegin(),catalog.cend(),[&](const auto &entry) {
+                return entry.toMap().value(QStringLiteral("id")).toString()==preferred;
+            });
+            m_candidate.insert(QStringLiteral("models"),catalog);
+            m_candidate.insert(QStringLiteral("model"),keepPreferred?preferred:
+                catalog.isEmpty()?QString{}:catalog.first().toMap().value(QStringLiteral("id")).toString());
+            m_status=catalog.isEmpty()?tr("No eligible models were returned for this account."):tr("ChatGPT models updated.");
+        } else {
+            m_status=tr("Signed in. Could not load the ChatGPT model catalog: %1")
+                .arg(reply.value(QStringLiteral("warning")).toString());
+        }
+        m_intent=VaultIntent::SaveModels;
+        m_vaultId=m_vault.write(vaultKey(m_selected),
+            QString::fromUtf8(QJsonDocument(credential).toJson(QJsonDocument::Compact)));
+        emit changed();
+        return;
+    }
     if(m_worker==WorkerIntent::Revoke) {
         const auto result=QJsonDocument::fromJson(bytes).object();
         removeFromVault(state==1 && result.value(QStringLiteral("revoked")).toBool());
@@ -409,7 +447,8 @@ bool ChatGptAccounts::lockAccount(const QString &id) {
 }
 
 bool ChatGptAccounts::startSessionWork(WorkerIntent intent,const QJsonObject &credential) {
-    const auto operation=intent==WorkerIntent::Refresh?QStringLiteral("refresh"):QStringLiteral("revoke");
+    const auto operation=intent==WorkerIntent::Models?QStringLiteral("models"):
+        intent==WorkerIntent::Refresh?QStringLiteral("refresh"):QStringLiteral("revoke");
     const QJsonObject data{
         {QStringLiteral("operation"),operation},
         {QStringLiteral("client_id"),selected().value(QStringLiteral("clientId")).toString()},
@@ -470,7 +509,20 @@ void ChatGptAccounts::vaultFinished(quint64 id,const QString &secret,const QStri
         }
         return;
     }
-    if(intent==VaultIntent::Save) {
+    if(intent==VaultIntent::SaveModels) {
+        m_vault.clearSession();
+        const auto candidate=std::exchange(m_candidate,{});
+        const bool saved=!candidate.contains(QStringLiteral("models")) || writeAccount(candidate,false);
+        m_accountLock.reset();
+        setStatus(saved?m_status:tr("Could not save the ChatGPT model preferences."));
+    } else if(intent==VaultIntent::LoadForModels) {
+        const auto session=QJsonDocument::fromJson(secret.toUtf8()).object();
+        if(session.isEmpty() || !startSessionWork(WorkerIntent::Models,session)) {
+            m_vault.clearSession();
+            m_accountLock.reset();
+            if(session.isEmpty())setStatus(tr("The saved ChatGPT session is unavailable. Sign in again in Settings."));
+        }
+    } else if(intent==VaultIntent::Save) {
         m_vault.clearSession();
         if(m_status.isEmpty())m_status=tr("ChatGPT plan usage is enabled for this connection.");
         const bool saved=writeAccount(std::exchange(m_candidate,{}),true);

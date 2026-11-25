@@ -110,6 +110,7 @@ ApplicationWindow {
         anchors.margins:16
         ScrollView {
             id: settingsScroll
+            objectName: "settingsScroll"
             Layout.fillWidth:true
             Layout.fillHeight:true
             contentWidth: availableWidth
@@ -347,6 +348,13 @@ ApplicationWindow {
                         onToggled: chatGptSettings.accounts.useForWholeDocument = checked
                     }
                     RowLayout {
+                        Button {
+                            objectName: "reloadChatGptModels"
+                            text: qsTr("Reload models")
+                            visible: !!chatGptSettings.accounts && chatGptSettings.accounts.connected
+                            enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                            onClicked: chatGptSettings.accounts.reloadModels()
+                        }
                         Button {
                             text: qsTr("Sign Out")
                             visible: !!chatGptSettings.accounts && chatGptSettings.accounts.connected
