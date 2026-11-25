@@ -8,8 +8,8 @@ use crate::provider::AiError;
 
 use super::{
     CancellationToken, RequestAudit, ResponseStream, RunEvent, SseDecoder, SseFrame,
-    StreamDiagnostics, Transport, assemble_request_spec, header_value, redact_error,
-    response_usage, run_audited_transport, validate_api_key,
+    StreamDiagnostics, Transport, assemble_request_spec, header_value, read_error_body,
+    redact_error, response_usage, run_audited_transport, validate_api_key,
 };
 
 pub const CHATGPT_RESPONSES_ENDPOINT: &str = "https://api.openai.com/v1/responses";
@@ -101,6 +101,16 @@ fn read_stream(
     emit: &mut dyn FnMut(RunEvent),
 ) -> Result<(), AiError> {
     let status = response.status();
+    if !(200..=299).contains(&status) && status != 401 && status != 429 {
+        let body = read_error_body(&mut *response, cancel)?;
+        if let Ok(value) = serde_json::from_str::<Value>(&body)
+            && let Some(error) = value["error"]["code"]
+                .as_str()
+                .and_then(subscription_failure)
+        {
+            return Err(error);
+        }
+    }
     match status {
         401 => return Err(AiError::Unauthorized),
         429 => return Err(AiError::RateLimited),
@@ -121,15 +131,10 @@ fn read_stream(
             )));
         }
     }
-    let content_type = header_value(response.headers(), "content-type").unwrap_or_default();
-    if !content_type
-        .to_ascii_lowercase()
-        .starts_with("text/event-stream")
-    {
-        return Err(AiError::Protocol(
-            "ChatGPT did not return a Responses event stream.".into(),
-        ));
-    }
+    // Validate the body framing as well as its label. Some direct-route replies
+    // carry a generic MIME type; a valid Responses SSE stream still has to reach
+    // response.completed. JSON, HTML and interrupted streams never mean success.
+    let first = stream_preamble(&mut *response, cancel)?;
 
     let mut decoder = SseDecoder::new();
     let mut stats = StreamDiagnostics {
@@ -137,7 +142,11 @@ fn read_stream(
         content_shape: "none".into(),
         ..Default::default()
     };
-    while let Some(chunk) = response.next_chunk()? {
+    let mut first = Some(first);
+    while let Some(chunk) = match first.take() {
+        Some(bytes) => Some(bytes),
+        None => response.next_chunk()?,
+    } {
         cancel.check()?;
         stats.bytes = stats.bytes.saturating_add(chunk.len() as u64);
         for frame in decoder.push(&chunk)? {
@@ -160,6 +169,105 @@ fn read_stream(
     Err(AiError::Protocol(
         "The ChatGPT stream ended before completion. The partial answer is kept.".into(),
     ))
+}
+
+fn subscription_failure(code: &str) -> Option<AiError> {
+    match code {
+        "subscription_sharing_usage_limit_exceeded" => Some(AiError::RateLimited),
+        "subscription_sharing_usage_unavailable" | "subscription_sharing_user_unavailable" => Some(AiError::Other(
+            "ChatGPT plan usage is temporarily unavailable. Your sign-in is kept. Retry later.".into())),
+        "subscription_sharing_user_not_eligible" => Some(AiError::Other(
+            "ChatGPT plan usage is unavailable for this account or workspace. Check the plan and workspace policy.".into())),
+        "subscription_sharing_unsupported_capability" => Some(AiError::Other(
+            "The selected ChatGPT model or input is unsupported for plan usage. Change the model or input and preview again.".into())),
+        "subscription_sharing_route_not_supported" | "chatpass_v2_scope_not_authorized" | "chatpass_v2_invalid_authorization_context" => Some(AiError::Other(
+            "ChatGPT did not authorize this integration or request route. Check the app’s plan-usage permission.".into())),
+        "subscription_sharing_invalid_user" => Some(AiError::Unauthorized),
+        _ => None,
+    }
+}
+
+fn stream_preamble(
+    response: &mut dyn ResponseStream,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, AiError> {
+    let mut prefix = Vec::new();
+    const FIELDS: [&[u8]; 5] = [b"data:", b"event:", b":", b"id:", b"retry:"];
+    loop {
+        cancel.check()?;
+        let Some(chunk) = response.next_chunk()? else {
+            break;
+        };
+        // Match the existing SSE decoder's allocation limit before buffering.
+        if prefix
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|len| len > 1024 * 1024)
+        {
+            return Err(AiError::Protocol(
+                "The ChatGPT response preamble exceeded 1 MiB.".into(),
+            ));
+        }
+        prefix.extend_from_slice(&chunk);
+        let body = prefix.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&prefix);
+        let start = body
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(body.len());
+        let body = &body[start..];
+        if FIELDS.iter().any(|field| body.starts_with(field)) {
+            return Ok(body.to_vec());
+        }
+        if prefix.len() <= 1024
+            && (body.is_empty()
+                || FIELDS.iter().any(|field| field.starts_with(body))
+                || b"\xef\xbb\xbf".starts_with(&prefix))
+        {
+            continue;
+        }
+        // Read only a bounded diagnostic body. Provider text can include private
+        // request content, so expose recognized codes and shape, never raw text.
+        const LIMIT: usize = 64 * 1024;
+        prefix.truncate(LIMIT);
+        while prefix.len() < LIMIT {
+            cancel.check()?;
+            let Some(chunk) = response.next_chunk()? else {
+                break;
+            };
+            let remaining = LIMIT - prefix.len();
+            prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(&prefix) {
+            if let Some(error) = value["error"]["code"]
+                .as_str()
+                .and_then(subscription_failure)
+            {
+                return Err(error);
+            }
+            return Err(AiError::Protocol(format!(
+                "ChatGPT returned JSON instead of a Responses event stream (HTTP {}). Preview again and retry. No completed answer was received.",
+                response.status()
+            )));
+        }
+        break;
+    }
+    let kind = match header_value(response.headers(), "content-type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+    {
+        "text/html" => "HTML",
+        "application/json" => "invalid JSON",
+        "text/plain" => "plain text",
+        "" => "an unlabelled body",
+        _ => "an unexpected body",
+    };
+    Err(AiError::Protocol(format!(
+        "ChatGPT returned {kind} instead of a Responses event stream (HTTP {}). No completed answer was received.",
+        response.status()
+    )))
 }
 
 fn handle_event(
@@ -208,13 +316,12 @@ fn handle_event(
                 .as_str()
                 .or_else(|| value["error"]["code"].as_str())
                 .or_else(|| value["code"].as_str());
-            let failure = match code {
-                Some("subscription_sharing_usage_limit_exceeded") => AiError::RateLimited,
-                Some("subscription_sharing_usage_unavailable") => AiError::Unauthorized,
-                _ if carrying_image && event_type != "response.incomplete" => AiError::Other(
+            let failure = match code.and_then(subscription_failure) {
+                Some(error) => error,
+                None if carrying_image && event_type != "response.incomplete" => AiError::Other(
                     "ChatGPT could not complete the request with the region image. Check whether the model accepts images and preview again. The partial answer is kept.".into(),
                 ),
-                _ => AiError::Other(
+                None => AiError::Other(
                     "ChatGPT returned an incomplete answer. The partial answer is kept.".into(),
                 ),
             };
@@ -310,6 +417,174 @@ mod tests {
         .unwrap();
         plan.endpoint = CHATGPT_RESPONSES_ENDPOINT.into();
         plan.rendered(ChatTransport::Responses)
+    }
+
+    #[test]
+    fn responses_validate_events_even_with_missing_or_generic_mime() {
+        let wire = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        for mime in [
+            None,
+            Some("application/json"),
+            Some("text/plain"),
+            Some(" Text/Event-Stream ; charset=utf-8"),
+        ] {
+            let reply = Reply {
+                status: 200,
+                bytes: Some(wire.as_bytes().to_vec()),
+                headers: mime
+                    .map(|mime| vec![("content-type".into(), mime.into())])
+                    .unwrap_or_default(),
+            };
+            let mut events = Vec::new();
+            read_stream(
+                Box::new(reply),
+                false,
+                &CancellationToken::new(),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+            assert!(events.contains(&RunEvent::Delta("answer".into())));
+        }
+    }
+
+    #[test]
+    fn responses_sniff_split_bom_and_fields_without_losing_first_event() {
+        struct Chunks(std::collections::VecDeque<Vec<u8>>);
+        impl ResponseStream for Chunks {
+            fn status(&self) -> u16 {
+                200
+            }
+            fn reason(&self) -> &str {
+                "OK"
+            }
+            fn headers(&self) -> &[(String, String)] {
+                &[]
+            }
+            fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, AiError> {
+                Ok(self.0.pop_front())
+            }
+        }
+        let wire = concat!(
+            "\u{feff}event: response.created\n",
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        for size in [1, 2, 3, 7, 8192] {
+            let reply = Chunks(
+                wire.as_bytes()
+                    .chunks(size)
+                    .map(|chunk| chunk.to_vec())
+                    .collect(),
+            );
+            let mut events = Vec::new();
+            read_stream(
+                Box::new(reply),
+                false,
+                &CancellationToken::new(),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,RunEvent::Delta(text) if text=="answer"))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn responses_never_accept_json_html_or_done_without_completed() {
+        for (mime, body) in [
+            (
+                "application/json",
+                "{\"status\":\"completed\",\"output_text\":\"PRIVATE_BODY\"}",
+            ),
+            ("text/html", "<html>PRIVATE_BODY</html>"),
+            ("text/event-stream", "data: [DONE]\n\n"),
+            (
+                "text/plain",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ),
+        ] {
+            let reply = Reply {
+                status: 200,
+                bytes: Some(body.as_bytes().to_vec()),
+                headers: vec![("content-type".into(), mime.into())],
+            };
+            let mut events = Vec::new();
+            let error = read_stream(
+                Box::new(reply),
+                false,
+                &CancellationToken::new(),
+                &mut |event| events.push(event),
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains("PRIVATE_BODY"));
+            assert!(!events.contains(&RunEvent::Done));
+        }
+    }
+
+    #[test]
+    fn responses_preserve_sign_in_on_temporarily_unavailable_usage() {
+        for status in [200, 503] {
+            let reply=Reply {status,bytes:Some(br#"{"error":{"code":"subscription_sharing_usage_unavailable","message":"PRIVATE_BODY"}}"#.to_vec()),headers:vec![("content-type".into(),"application/json".into())]};
+            let error = read_stream(
+                Box::new(reply),
+                false,
+                &CancellationToken::new(),
+                &mut |_| {},
+            )
+            .unwrap_err();
+            assert!(matches!(error, AiError::Other(_)));
+            assert!(error.to_string().contains("temporarily unavailable"));
+            assert!(!error.to_string().contains("PRIVATE_BODY"));
+        }
+        let reply=Reply {status:200,bytes:Some(b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"subscription_sharing_usage_unavailable\"}}}\n\n".to_vec()),headers:Vec::new()};
+        assert!(matches!(
+            read_stream(
+                Box::new(reply),
+                false,
+                &CancellationToken::new(),
+                &mut |_| {}
+            ),
+            Err(AiError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn responses_preamble_is_bounded_and_cancellable() {
+        let reply = Reply {
+            status: 200,
+            bytes: Some(vec![b' '; 1024 * 1024 + 1]),
+            headers: Vec::new(),
+        };
+        assert!(matches!(
+            read_stream(
+                Box::new(reply),
+                false,
+                &CancellationToken::new(),
+                &mut |_| {}
+            ),
+            Err(AiError::Protocol(_))
+        ));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let reply = Reply {
+            status: 200,
+            bytes: Some(b"data: [DONE]\n\n".to_vec()),
+            headers: Vec::new(),
+        };
+        assert!(matches!(
+            read_stream(Box::new(reply), false, &cancel, &mut |_| {}),
+            Err(AiError::Cancelled)
+        ));
     }
 
     #[test]
