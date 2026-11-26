@@ -82,39 +82,46 @@ ColumnLayout {
                             sourceComponent: modelData.kind === "code" ? literal : prose
                             Component {
                                 id: literal
-                                TextArea {
-                                    id: codeArea
-                                    objectName: "aiSummaryCode" + section.index + "_" + block.index
-                                    text: block.modelData.text
-                                    textFormat: TextEdit.PlainText; wrapMode: TextEdit.WrapAnywhere
-                                    readOnly: true; selectByMouse: true; selectByKeyboard: true
-                                    font.family: "monospace"; font.pixelSize: 12
-                                    color: app.colors.textPrimary
-                                    Keys.onPressed: function(event) { summary.renderer.cursorKey(codeArea, event); }
-                                    background: Rectangle { color: app.colors.fieldBg; radius: 5 }
+                                AiCodeBlock {
+                                    app: summary.app; renderer: summary.renderer
+                                    textName: "aiSummaryCode" + section.index + "_" + block.index
+                                    sourceText: block.modelData.text; language: block.modelData.language || ""
                                 }
                             }
                             Component {
                                 id: prose
                                 ColumnLayout {
                                 spacing: 4
-                                TextArea {
-                                    id: proseArea
+                                Loader {
+                                    id: formatted
                                     Layout.fillWidth: true; Layout.minimumWidth: 0
-                                    objectName: section.index === 0 && block.index === 0 ? summary.answerName : summary.answerName + "Section" + section.index + "_" + block.index
                                     readonly property var rendered: summary.renderer.renderFor(block.modelData.text)
-                                    text: rendered.text
-                                    textFormat: rendered.plain ? TextEdit.PlainText : TextEdit.RichText; wrapMode: TextEdit.Wrap
-                                    readOnly: true; selectByMouse: true; selectByKeyboard: true
-                                    padding: 0; background: null; font.pixelSize: 14; color: app.colors.textPrimary
-                                    Accessible.name: qsTr("AI response section")
-                                    Keys.onPressed: function(event) { summary.renderer.cursorKey(proseArea, event); }
-                                    onLinkActivated: function(link) {
-                                        summary.renderer.activateLink(link);
+                                    readonly property string textName: section.index === 0 && block.index === 0 ? summary.answerName : summary.answerName + "Section" + section.index + "_" + block.index
+                                    sourceComponent: (rendered.blocks || []).length ? structured : single
+                                    Component {
+                                        id: structured
+                                        AiMarkdownBlocks {
+                                            app: summary.app; renderer: summary.renderer
+                                            blocks: formatted.rendered.blocks; answerName: formatted.textName
+                                        }
+                                    }
+                                    Component {
+                                        id: single
+                                        TextArea {
+                                            id: proseArea
+                                            objectName: formatted.textName
+                                            text: formatted.rendered.text
+                                            textFormat: formatted.rendered.plain ? TextEdit.PlainText : TextEdit.RichText; wrapMode: TextEdit.Wrap
+                                            readOnly: true; selectByMouse: true; selectByKeyboard: true
+                                            padding: 0; background: null; font.pixelSize: 14; color: app.colors.textPrimary
+                                            Accessible.name: qsTr("AI response section")
+                                            Keys.onPressed: function(event) { summary.renderer.cursorKey(proseArea, event); }
+                                            onLinkActivated: function(link) { summary.renderer.activateLink(link); }
+                                        }
                                     }
                                 }
                                 Label {
-                                    text: proseArea.rendered.warning || ""
+                                    text: formatted.rendered.warning || ""
                                     visible: text.length > 0
                                     textFormat: Text.PlainText; wrapMode: Text.Wrap
                                     Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11

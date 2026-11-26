@@ -4,6 +4,8 @@ WheelHandler {
     id: handler
     property bool scrollEnabled: true
     property bool zoomEnabled: true
+    property bool horizontalOnly: false
+    orientation: horizontalOnly ? Qt.Horizontal : Qt.Vertical
     signal scrollRequested(real dx, real dy)
     signal zoomRequested(real factor, real x, real y)
     target: null
@@ -25,6 +27,10 @@ WheelHandler {
             let dy = precise ? event.pixelDelta.y : event.angleDelta.y * unit;
             if ((event.modifiers & Qt.ShiftModifier) && dx === 0) {
                 dx = dy;
+                dy = 0;
+            }
+            if (handler.horizontalOnly) {
+                if (dx === 0) { event.accepted = false; return; }
                 dy = 0;
             }
             handler.scrollRequested(dx, dy);

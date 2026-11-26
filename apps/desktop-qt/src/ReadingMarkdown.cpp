@@ -1,6 +1,7 @@
 #include "ReadingMarkdown.h"
 #include <QColor>
 #include <QSet>
+#include <QScopeGuard>
 #include <QUrl>
 #include <QUuid>
 #include <algorithm>
@@ -17,6 +18,7 @@ struct MathRun { QString marker, source, wrapped, rendered; };
 struct InlineRun { QString text, rendered; };
 struct InlineMath { qsizetype end; QString markup; };
 struct ListItem { int indent; QString number, text; };
+struct NativeBlock { QString kind, text, language; QVector<NativeBlock> children; };
 class Formatter {
 public:
     Formatter(ReaderController *reader, const QString &source, const QVariantList &pages,
@@ -37,10 +39,31 @@ public:
     QString document(const QString &source) {
         QString display = source; display.replace(QStringLiteral("\r\n"), QStringLiteral("\n")); display.replace(QLatin1Char('\r'), QLatin1Char('\n'));
         if (display.count(QLatin1Char('\n')) >= maximumLines) { m_limited = true; return {}; }
-        const auto html = blocks(display.split(QLatin1Char('\n')), 0);
+        const auto html = blocks(display.split(QLatin1Char('\n')), 0, m_blocks);
         if (m_limited) return {};
         formatInlines();
         formatMath();
+        return expand(html);
+    }
+    QVariantList nativeBlocks(int bodySize) {
+        if (!m_hasCode) return {};
+        return expandBlocks(m_blocks, bodySize);
+    }
+private:
+    QVariantList expandBlocks(const QVector<NativeBlock> &input, int bodySize) {
+        QVariantList result;
+        for (const auto &value : input) {
+            QVariantMap block{{"kind", value.kind}};
+            if (value.kind == "prose")
+                block["text"] = QStringLiteral("<div style=\"font-size:") + QString::number(bodySize)
+                    + QStringLiteral("px\">") + expand(value.text) + QStringLiteral("</div>");
+            else if (value.kind == "quote") block["children"] = expandBlocks(value.children, bodySize);
+            else { block["text"] = value.text; block["language"] = value.language; }
+            result.append(block);
+        }
+        return result;
+    }
+    QString expand(const QString &html) {
         const auto expanded = expandInlines(html);
         QString result; qsizetype position = 0;
         while (position < expanded.size()) {
@@ -55,7 +78,6 @@ public:
         }
         return result;
     }
-private:
     bool work(qsizetype units = 1) { m_work -= units; if (m_work < 0) m_limited = true; return !m_limited; }
     void append(QString &output, QStringView text) {
         if (text.size() > maximumOutput - output.size()) { m_limited = true; return; }
@@ -263,15 +285,33 @@ private:
         result += current.trimmed(); if (row.startsWith('|') && result.front().isEmpty()) result.removeFirst(); if (row.endsWith('|') && !result.isEmpty() && result.back().isEmpty()) result.removeLast(); return result;
     }
     bool separator(const QStringList &row) const { if (row.isEmpty()) return false; for (auto cell : row) { if (cell.startsWith(':')) cell.remove(0, 1); if (cell.endsWith(':')) cell.chop(1); if (cell.isEmpty() || cell != QString(cell.size(), QLatin1Char('-'))) return false; } return true; }
-    QString blocks(const QStringList &lines, int depth) {
+    void addBlock(QVector<NativeBlock> &blocks, NativeBlock block) {
+        if (block.kind == "prose" && !blocks.isEmpty() && blocks.last().kind == "prose") {
+            // Coalesce in owned storage, avoiding a QVariant copy/detach of the
+            // entire accumulated paragraph string on every small paragraph.
+            append(blocks.last().text, block.text);
+        } else {
+            if (++m_blockCount > 512) { m_limited = true; return; }
+            blocks.append(std::move(block));
+        }
+    }
+    QString blocks(const QStringList &lines, int depth, QVector<NativeBlock> &plan) {
         if (depth > maximumDepth) { m_limited = true; return {}; }
         QString output; QVector<int> indents;
         for (qsizetype index = 0; index < lines.size() && work();) {
+            const auto beginning = output.size(); NativeBlock native;
+            const auto capture = qScopeGuard([&] {
+                if (output.size() == beginning) return;
+                if (native.kind.isEmpty()) native = {"prose", output.mid(beginning), {}, {}};
+                addBlock(plan, std::move(native));
+            });
             const auto line = lines[index].trimmed(); if (line.isEmpty()) { ++index; indents.clear(); continue; }
             if (line.startsWith("```") || line.startsWith("~~~")) {
                 const auto marker = line.left(3), language = line.mid(3).trimmed(); QStringList code; ++index;
                 while (index < lines.size() && !lines[index].trimmed().startsWith(marker) && work()) code += lines[index++];
                 if (index < lines.size()) ++index;
+                native = {"code", code.join('\n'), language, {}};
+                m_hasCode = true;
                 if (!language.isEmpty()) append(output, QStringLiteral("<p style=\"margin:0;font-size:9px;color:") + colour("textSecondary") + QStringLiteral("\">") + escape(language) + QStringLiteral("</p>"));
                 append(output, QStringLiteral("<pre style=\"margin-top:0;margin-bottom:8px;padding:7px;white-space:pre-wrap;font-size:12px;background-color:") + colour("raisedBg") + QStringLiteral("\">") + code.join('\n').toHtmlEscaped() + QStringLiteral("</pre>")); continue;
             }
@@ -292,7 +332,16 @@ private:
                 for (qsizetype row = 0; row < rows.size(); ++row) { append(output, QStringLiteral("<tr>")); for (qsizetype column = 0; column < columns; ++column) { const auto align = column < alignment.size() ? alignment[column] : QString{}; const auto position = align.startsWith(':') && align.endsWith(':') ? QStringLiteral("center") : align.endsWith(':') ? QStringLiteral("right") : QStringLiteral("left"); const auto tag = row == 0 ? QStringLiteral("th") : QStringLiteral("td"); append(output, QLatin1Char('<') + tag + QStringLiteral(" align=\"") + position + QStringLiteral("\">") + (column < rows[row].size() ? inlineText(rows[row][column], 0) : QString{}) + QStringLiteral("</") + tag + QLatin1Char('>')); } append(output, QStringLiteral("</tr>")); }
                 append(output, QStringLiteral("</table>")); indents.clear(); continue;
             }
-            if (line.startsWith('>')) { QStringList quote; while (index < lines.size() && lines[index].trimmed().startsWith('>') && work()) { auto text = lines[index++].trimmed().mid(1); if (text.startsWith(' ')) text.remove(0, 1); quote += text; } append(output, QStringLiteral("<table border=\"0\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin-bottom:8px\"><tr><td width=\"2\" bgcolor=\"") + colour("separator") + QStringLiteral("\">&nbsp;</td><td width=\"10\">&nbsp;</td><td>") + blocks(quote, depth + 1) + QStringLiteral("</td></tr></table>")); indents.clear(); continue; }
+            if (line.startsWith('>')) {
+                QStringList quote;
+                while (index < lines.size() && lines[index].trimmed().startsWith('>') && work()) {
+                    auto text = lines[index++].trimmed().mid(1); if (text.startsWith(' ')) text.remove(0, 1); quote += text;
+                }
+                QVector<NativeBlock> children; const auto quoted = blocks(quote, depth + 1, children);
+                native = {"quote", {}, {}, std::move(children)};
+                append(output, QStringLiteral("<table border=\"0\" cellspacing=\"0\" cellpadding=\"0\" style=\"margin-bottom:8px\"><tr><td width=\"2\" bgcolor=\"") + colour("separator") + QStringLiteral("\">&nbsp;</td><td width=\"10\">&nbsp;</td><td>") + quoted + QStringLiteral("</td></tr></table>"));
+                indents.clear(); continue;
+            }
             if (const auto item = listItem(lines[index])) {
                 while (!indents.isEmpty() && indents.last() > item->indent) indents.removeLast();
                 if (indents.isEmpty() || indents.last() < item->indent) indents.append(item->indent);
@@ -316,6 +365,9 @@ private:
     QMap<qsizetype, InlineMath> m_inlineMath;
     QString m_inlinePrefix;
     bool m_renderingInline = false;
+    QVector<NativeBlock> m_blocks;
+    int m_blockCount = 0;
+    bool m_hasCode = false;
     qsizetype m_work = 2 * 1024 * 1024;
     bool m_limited = false;
 };
@@ -326,6 +378,7 @@ QVariantMap ReadingMarkdown::render(const QString &source, ReaderController *rea
     if (source.size() > maximumInput || source.toUtf8().size() > 128 * 1024 || bodySize < 8 || bodySize > 32 || pageCount < 0) return fallback();
     Formatter formatter(reader, source, pages, pageCount, colours);
     const auto html = formatter.document(source);
+    const auto blocks = formatter.nativeBlocks(bodySize);
     if (formatter.limited()) return fallback();
-    return {{"plain", false}, {"text", QStringLiteral("<div style=\"font-size:") + QString::number(bodySize) + QStringLiteral("px\">") + html + QStringLiteral("</div>")}};
+    return {{"plain", false}, {"text", QStringLiteral("<div style=\"font-size:") + QString::number(bodySize) + QStringLiteral("px\">") + html + QStringLiteral("</div>")}, {"blocks", blocks}};
 }

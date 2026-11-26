@@ -17,9 +17,23 @@ ColumnLayout {
     property bool showActions: true
     property bool plainText: sent.kind === "reading_translation"
     property var citationPages: undefined
-    readonly property var textControl: !collapsibleSummary ? answerLoader.item : null
+    readonly property var rendered: collapsibleSummary ? ({}) : renderFor(outputText)
+    readonly property var textControl: collapsibleSummary || !answerLoader.item ? null
+        : (rendered.blocks || []).length ? answerLoader.item.textControl : answerLoader.item
     property Flickable viewport: null
     signal keyboardNavigation(int key)
+    function scrollParent(dy) {
+        // A nested code Flickable must not swallow vertical input. Route it
+        // through the enclosing control's existing motion/intent path, so
+        // follow-tail and scroll memory see exactly the same real input.
+        let control = viewport;
+        for (let depth = 0; control && depth < 64; ++depth, control = control.parent) {
+            if (typeof control.applyReadingWheel === "function") {
+                control.applyReadingWheel(0, dy);
+                return;
+            }
+        }
+    }
     function revealCursor(area, owner, generation, target) {
         if (!area || !area.activeFocus || !target || target !== viewport
                 || app.currentReader !== owner || (owner && owner.documentGeneration !== generation)
@@ -78,7 +92,7 @@ ColumnLayout {
             source_pages: sent.source_pages || [], generation: value.generation});
     }
     function focusAnswer() {
-        if (!collapsibleSummary && answerLoader.item) answerLoader.item.forceActiveFocus(Qt.TabFocusReason);
+        if (textControl) textControl.forceActiveFocus(Qt.TabFocusReason);
     }
     Label {
         objectName: result.answerName + "UnitTitle"
@@ -99,7 +113,14 @@ ColumnLayout {
     Loader {
         id: answerLoader
         Layout.fillWidth: true; Layout.minimumWidth: 0
-        sourceComponent: result.collapsibleSummary ? sections : answer
+        sourceComponent: result.collapsibleSummary ? sections : (result.rendered.blocks || []).length ? blocks : answer
+    }
+    Component {
+        id: blocks
+        AiMarkdownBlocks {
+            app: result.app; renderer: result; blocks: result.rendered.blocks
+            answerName: result.answerName
+        }
     }
     Component {
         id: sections
@@ -115,8 +136,8 @@ ColumnLayout {
         id: answerArea
         objectName: result.answerName
         Layout.fillWidth: true
-        readonly property var rendered: result.renderFor(result.outputText)
-        text: rendered.text
+        readonly property var rendered: result.rendered
+        text: rendered.text || ""
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
         textFormat: rendered.plain ? TextEdit.PlainText : TextEdit.RichText
         Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
@@ -128,8 +149,7 @@ ColumnLayout {
     }
     Label {
         objectName: result.answerName + "FormatWarning"
-        text: !result.collapsibleSummary && answerLoader.item && answerLoader.item.rendered
-            ? answerLoader.item.rendered.warning || "" : ""
+        text: !result.collapsibleSummary ? result.rendered.warning || "" : ""
         visible: text.length > 0
         Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
         color: app.colors.textSecondary; font.pixelSize: 11

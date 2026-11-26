@@ -6328,6 +6328,39 @@ ListView {
         QCOMPARE(paragraphs.toPlainText().count("x2"), 128);
     }
 
+    void readingMarkdownPlansBoundedNativeCodeBlocks() {
+        ReadingMarkdown formatter; ReaderController reader;
+        const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
+            {"raisedBg", QColor("#FFFDFA")}, {"textSecondary", QColor("#635B50")}, {"warningFg", QColor("#88611B")}};
+        const QString source = "Before $x^2$ [p.1].\r\n\r\n```cpp\r\n  literal <img src=x> $5$\r\n```\r\n\r\n"
+            "> Quote\r\n> ~~~text\r\n> quoted_code\r\n> ~~~\r\n\r\nAfter.";
+        const auto render = [&](const QString &text) { return formatter.render(text, &reader, {1}, 1, 13, colours); };
+        const auto result = render(source); QVERIFY(!result.value("plain").toBool());
+        const auto blocks = result.value("blocks").toList(); QVERIFY(!blocks.isEmpty());
+        int codes = 0, quotes = 0; QString prose;
+        const std::function<void(const QVariantList &)> inspect = [&](const QVariantList &nodes) {
+            for (const auto &node : nodes) {
+                const auto item = node.toMap(); const auto kind = item.value("kind").toString();
+                if (kind == "code") {
+                    ++codes;
+                    if (item.value("language") == "cpp") QCOMPARE(item.value("text").toString(), QString("  literal <img src=x> $5$"));
+                    else QCOMPARE(item.value("text").toString(), QString("quoted_code"));
+                } else if (kind == "quote") { ++quotes; inspect(item.value("children").toList()); }
+                else { QCOMPARE(kind, QString("prose")); QVERIFY(!item.value("text").toString().contains("LYRA-MATH-")); prose += item.value("text").toString(); }
+            }
+        };
+        inspect(blocks); QCOMPARE(codes, 2); QCOMPARE(quotes, 1);
+        QTextDocument document; document.setHtml(prose); QVERIFY(document.toPlainText().contains("x2"));
+        QCOMPARE(document.find("[p.1]").charFormat().anchorHref(), QString("p.1"));
+        QVERIFY(render("Ordinary prose only.").value("blocks").toList().isEmpty());
+        QString many; for (int index = 0; index < 260; ++index) many += "Paragraph\n\n```\ncode\n```\n\n";
+        const auto limited = render(many); QVERIFY(limited.value("plain").toBool()); QCOMPARE(limited.value("text").toString(), many);
+        QElapsedTimer clock; clock.start();
+        const auto paragraphs = render(QString("text\n\n").repeated(5000) + "```\ncode\n```");
+        qInfo() << "native-code 5000 coalesced paragraphs format-ms" << clock.elapsed();
+        QVERIFY(!paragraphs.value("plain").toBool()); QCOMPARE(paragraphs.value("blocks").toList().size(), 2);
+    }
+
     void readingMathFallbackExplainsOnlyUnrenderedDisplayExpressions() {
         ReadingMarkdown formatter; ReaderController reader;
         const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
@@ -6367,11 +6400,12 @@ ListView {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
         MockChatServer server; QVERIFY(server.listen());
         const QString response = "# Native heading\r\n\r\n**Bold answer** with *emphasis* [p.1], untrusted [p.99].\r\n\r\n"
-            "- first idea\r\n  - nested idea\r\n\r\n> A quoted answer.\r\n\r\n"
-            "```cpp\r\nconst auto literal = \"<img src=never-requested>\";\r\n```\r\n\r\n"
+            "- first idea\r\n  - nested idea\r\n\r\n> A quoted answer.\r\n> ```text\r\n> quoted_code\r\n> ```\r\n\r\n"
+            "```cpp\r\nconst auto literal = \"<img src=never-requested-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>\";\r\n```\r\n\r\n"
             "| Name | Value |\r\n| --- | --- |\r\n| alpha row | 1 |\r\n\r\n"
             "$$\r\n\\unsupported{<img src=never-rendered>}\r\n$$\r\n\r\n"
-            "![remote image](http://127.0.0.1:1/never-requested) <b>literal HTML</b>\r\n";
+            "![remote image](http://127.0.0.1:1/never-requested) <b>literal HTML</b>\r\n"
+            + QString("\r\nA trailing synthetic paragraph for outer scrolling.\r\n").repeated(30);
         server.responses.append({{MockChatServer::delta({{"content", response.left(response.size()/2)}}),
             MockChatServer::delta({{"content", response.mid(response.size()/2)}}), QByteArray("data: [DONE]\n\n")}, 12, 200});
         QTemporaryDir scratch; QVERIFY(scratch.isValid()); const auto path = scratch.filePath("synthetic-markdown.pdf");
@@ -6391,7 +6425,7 @@ ListView {
         const auto plan = reader->aiState().value("plan").toMap(); QVERIFY(!plan.isEmpty());
         const auto wire = plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
         QVERIFY(reader->startAi("local", plan)); QTRY_VERIFY(!reader->aiState().value("running").toBool()); QTRY_COMPARE(reader->pendingCommands(), 0);
-        auto *area = window->findChild<QQuickItem *>("aiAnswerText"); QVERIFY(area);
+        QQuickItem *area = nullptr; QTRY_VERIFY((area = visualItem(window->contentItem(), "aiAnswerText")));
         const auto *quickDocument = area->property("textDocument").value<QQuickTextDocument *>(); QVERIFY(quickDocument);
         const auto *document = quickDocument->textDocument(); QVERIFY(document);
         QVERIFY(!document->toPlainText().contains("# Native heading"));
@@ -6400,14 +6434,55 @@ ListView {
         QVERIFY(document->find("emphasis").charFormat().fontItalic());
         QCOMPARE(document->find("[p.1]").charFormat().anchorHref(), QString("p.1"));
         QVERIFY(!document->find("[p.99]").charFormat().isAnchor());
-        const auto *table = document->find("alpha row").currentTable(); QVERIFY(table); QCOMPARE(table->rows(), 2);
+        QQuickItem *codeArea = nullptr; const QTextDocument *tableDocument = nullptr;
+        QList<QQuickItem *> nativeItems;
+        const std::function<void(QQuickItem *)> collect = [&](QQuickItem *item) {
+            nativeItems.append(item); for (auto *child : item->childItems()) collect(child);
+        };
+        collect(window->contentItem());
+        for (auto *candidate : nativeItems) {
+            if (!candidate->objectName().startsWith("aiAnswerText")) continue;
+            const auto *quick = candidate->property("textDocument").value<QQuickTextDocument *>();
+            if (!quick) continue;
+            if (quick->textDocument()->toPlainText().contains("alpha row")) tableDocument = quick->textDocument();
+            if (candidate->property("text").toString().startsWith("const auto literal")) codeArea = candidate;
+        }
+        QVERIFY(tableDocument); const auto *table = tableDocument->find("alpha row").currentTable(); QVERIFY(table); QCOMPARE(table->rows(), 2);
+        QVERIFY(codeArea); QVERIFY(codeArea->property("text").toString().contains("<img src=never-requested"));
+        QCOMPARE(codeArea->property("wrapMode").toInt(), 0);
         auto *palette = window->property("colors").value<QObject *>(); QVERIFY(palette);
-        const auto raised = palette->property("raisedBg").value<QColor>().name(QColor::HexRgb);
-        QVERIFY(area->property("text").toString().contains("background-color:" + raised));
-        const auto diagnostic = document->find("Could not render this expression."); QVERIFY(!diagnostic.isNull());
+        auto *surface = visualItem(window->contentItem(), codeArea->objectName() + "Surface"); QVERIFY(surface);
+        QCOMPARE(surface->property("color").value<QColor>(), palette->property("raisedBg").value<QColor>());
+        const auto diagnostic = tableDocument->find("Could not render this expression."); QVERIFY(!diagnostic.isNull());
         QCOMPARE(diagnostic.charFormat().foreground().color(), palette->property("warningFg").value<QColor>());
-        QVERIFY(document->toPlainText().contains("\\unsupported{<img src=never-rendered>}"));
+        QVERIFY(tableDocument->toPlainText().contains("\\unsupported{<img src=never-rendered>}"));
         QVERIFY(area->property("readOnly").toBool() && area->property("selectByKeyboard").toBool());
+        auto *horizontal = visualItem(window->contentItem(), codeArea->objectName() + "HorizontalViewport"); QVERIFY(horizontal);
+        QTRY_VERIFY(horizontal->property("contentWidth").toDouble() > horizontal->width());
+        auto *outer = visualItem(window->contentItem(), "aiResponseScroll"); QVERIFY(outer);
+        auto *viewport = qobject_cast<QQuickItem *>(outer->property("contentItem").value<QObject *>()); QVERIFY(viewport);
+        QTRY_VERIFY(viewport->property("contentHeight").toDouble() > viewport->height());
+        const auto wheel = [&](const QPoint &angle, Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+            const auto point = horizontal->mapToScene(QPointF(horizontal->width()/2, qMin(12.0, horizontal->height()/2)));
+            QTest::mouseMove(window, point.toPoint());
+            QWheelEvent event(point, window->mapToGlobal(point.toPoint()), QPoint(), angle, Qt::NoButton, modifiers, Qt::NoScrollPhase, false);
+            QCoreApplication::sendEvent(window, &event);
+        };
+        const auto outerBefore = viewport->property("contentY").toDouble();
+        wheel(QPoint(-120, 0)); QTRY_VERIFY(horizontal->property("contentX").toDouble() > 0);
+        QCOMPARE(viewport->property("contentY").toDouble(), outerBefore);
+        const auto firstHorizontal = horizontal->property("contentX").toDouble();
+        wheel(QPoint(0, -120), Qt::ShiftModifier); QTRY_VERIFY(horizontal->property("contentX").toDouble() > firstHorizontal);
+        QCOMPARE(viewport->property("contentY").toDouble(), outerBefore);
+        const auto horizontalBefore = horizontal->property("contentX").toDouble();
+        wheel(QPoint(0, -120)); QTRY_VERIFY(viewport->property("contentY").toDouble() > outerBefore);
+        QCOMPARE(horizontal->property("contentX").toDouble(), horizontalBefore);
+        viewport->setProperty("contentY", 0);
+        codeArea->forceActiveFocus(); QTest::keyClick(window, Qt::Key_End); QTRY_VERIFY(horizontal->property("contentX").toDouble() >= horizontalBefore);
+        QTest::keyClick(window, Qt::Key_Home); QTRY_COMPARE(horizontal->property("contentX").toDouble(), 0.0);
+        QTest::keyClick(window, Qt::Key_A, Qt::ControlModifier); QTest::keyClick(window, Qt::Key_C, Qt::ControlModifier);
+        QCOMPARE(QGuiApplication::clipboard()->text(), codeArea->property("text").toString());
+        QVERIFY(QMetaObject::invokeMethod(codeArea, "deselect"));
         const auto raw = reader->aiState().value("output").toString(); QVERIFY(raw.endsWith(response));
         auto *copy = window->findChild<QObject *>("aiAnswerTextCopy"); QVERIFY(copy);
         QVERIFY(QMetaObject::invokeMethod(copy, "clicked")); QCOMPARE(workspace.copied, raw);

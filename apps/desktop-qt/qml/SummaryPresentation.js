@@ -8,9 +8,9 @@ function sections(source) {
         if (!current) { current = {title: "", blocks: []}; groups.push(current); }
         return current;
     }
-    function put(kind, text) {
+    function put(kind, text, language = "") {
         if (!text.trim()) return;
-        group().blocks.push({kind: kind, text: text}); ++blocks;
+        group().blocks.push({kind: kind, text: text, language: language}); ++blocks;
     }
     function flush() { put("prose", prose.join("\n").trim()); prose = []; }
     for (let index = 0; index < lines.length; ++index) {
@@ -26,7 +26,7 @@ function sections(source) {
                 if (lines[index].trim().indexOf(marker) === 0) break;
                 code.push(lines[index]);
             }
-            put("code", code.join("\n")); continue;
+            put("code", code.join("\n"), line.slice(3).trim()); continue;
         }
         if (line.indexOf("$$") === 0 || line.indexOf("\\[") === 0) {
             const closer = line.indexOf("$$") === 0 ? "$$" : "\\]";

@@ -8,6 +8,7 @@ ScrollView {
     property string memoryKey: ""
     property bool memoryReady: true
     function rememberPosition() { scrollMemory.capturePosition(); }
+    function applyReadingWheel(dx, dy) { panelWheel.scrollRequested(dx, dy); }
     ReadingScrollMemory {
         id: scrollMemory
         reader: view.memoryReader; key: view.memoryKey
@@ -20,6 +21,7 @@ ScrollView {
     }
     signal scrollIntent(real dx, real dy)
     PanelWheelHandler {
+        id: panelWheel
         viewport: view.contentItem
         onScrollIntent: function(dx, dy) { view.scrollIntent(dx, dy); }
         onScrollApplied: scrollMemory.completeUserScroll()
