@@ -23,6 +23,7 @@ struct NativeBlock {
     QString kind, text, language;
     QVector<NativeBlock> children;
     std::optional<NativeTable> table = std::nullopt;
+    QString mathSource = {};
 };
 class Formatter {
 public:
@@ -62,6 +63,10 @@ private:
             if (value.kind == "prose")
                 block["text"] = QStringLiteral("<div style=\"font-size:") + QString::number(bodySize)
                     + QStringLiteral("px\">") + expand(value.text) + QStringLiteral("</div>");
+            else if (value.kind == "math") {
+                block["text"] = expand(value.text);
+                block["source"] = value.mathSource;
+            }
             else if (value.kind == "quote") block["children"] = expandBlocks(value.children, bodySize);
             else if (value.kind == "table" && value.table) {
                 QVariantList rows;
@@ -133,6 +138,14 @@ private:
             + QStringLiteral("</p><pre align=\"left\" style=\"margin-top:0;margin-bottom:8px;padding:7px;white-space:pre-wrap;font-size:12px;background-color:")
             + colour("raisedBg") + QStringLiteral("\">") + source.toHtmlEscaped() + QStringLiteral("</pre>");
     }
+    QString inlineMathFallback(const QString &source) const {
+        // A named anchor carries native character tooltips without creating a link.
+        // The source is escaped text; providers cannot supply markup or a destination.
+        return QStringLiteral("<a name=\"lyra-math-fallback\" title=\"")
+            + ReadingMarkdown::tr("Could not render this expression. The original source is shown.").toHtmlEscaped()
+            + QStringLiteral("\"><span style=\"font-family:monospace;font-size:12px;background-color:")
+            + colour("raisedBg") + QStringLiteral("\">") + escape(source) + QStringLiteral("</span></a>");
+    }
     void formatMath() {
         // One bounded Rust call per batch, never one FFI call per character/run.
         for (qsizetype first = 0; first < m_math.size();) {
@@ -200,11 +213,15 @@ private:
                 const auto span = value.toMap(); bool startOk = false, endOk = false;
                 const auto start = span.value("start").toLongLong(&startOk);
                 const auto end = span.value("end").toLongLong(&endOk);
-                const auto markup = span.value("markup").toString();
+                auto markup = span.value("markup").toString();
                 if (!startOk || !endOk || start < previous || end <= start
                     || end > run.text.size() || markup.isEmpty()
                     || span.value("rendered").metaType().id() != QMetaType::Bool
                     || span.value("display").metaType().id() != QMetaType::Bool) { m_limited = true; return; }
+                if (!span.value("rendered").toBool()) {
+                    if (span.value("source").metaType().id()!=QMetaType::QString) {m_limited=true;return;}
+                    markup=inlineMathFallback(span.value("source").toString());
+                }
                 m_inlineMath.insert(start, {end, markup}); previous = end;
             }
             run.rendered = inlineText(run.text, 0);
@@ -337,7 +354,10 @@ private:
                 QStringList body; auto rest = line.mid(2); auto end = rest.indexOf(closer); ++index;
                 if (end >= 0) body += rest.left(end);
                 else { if (!rest.isEmpty()) body += rest; while (index < lines.size() && work()) { auto next = lines[index++]; end = next.indexOf(closer); body += end < 0 ? next : next.left(end); if (end >= 0) break; } }
-                const auto source = body.join('\n').trimmed(); append(output, QStringLiteral("<div align=\"center\" style=\"margin-top:4px;margin-bottom:8px\">") + math(source, opener + source + closer) + QStringLiteral("</div>")); continue;
+                const auto source = body.join('\n').trimmed();
+                native.kind="math";native.mathSource=source;m_hasNativeBlocks=true;
+                append(output, QStringLiteral("<div align=\"center\" style=\"margin-top:4px;margin-bottom:8px\">") + math(source, opener + source + closer) + QStringLiteral("</div>"));
+                native.text=output.mid(beginning);continue;
             }
             if (const int level = heading(line)) { const auto size = level == 1 ? QStringLiteral("17") : level == 2 ? QStringLiteral("14.5") : QStringLiteral("13"); append(output, QStringLiteral("<p style=\"margin-top:4px;margin-bottom:8px;font-size:") + size + QStringLiteral("px;font-weight:") + (level <= 2 ? QStringLiteral("700") : QStringLiteral("600")) + QStringLiteral("\">") + inlineText(line.mid(level).trimmed(), 0) + QStringLiteral("</p>")); ++index; indents.clear(); continue; }
             if (divider(line)) { append(output, QStringLiteral("<hr/>")); ++index; indents.clear(); continue; }

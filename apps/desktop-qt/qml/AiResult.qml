@@ -21,6 +21,18 @@ ColumnLayout {
     function configureReadingMenu(control) {
         if (readingMenu && control) control.ContextMenu.menu = readingMenu;
     }
+    function readingShortcut(event) {
+        if (readingMenu && (event.key === Qt.Key_Menu
+                || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)))) event.accepted = true;
+    }
+    function readingMenuKey(area,event) {
+        if (!readingMenu || (event.key !== Qt.Key_Menu
+                && !(event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)))) return false;
+        readingMenu.parent = area;
+        readingMenu.popup(0, Math.max(0, Math.min(area.height, area.cursorRectangle.y + area.cursorRectangle.height)));
+        event.accepted = true;
+        return true;
+    }
     readonly property var rendered: collapsibleSummary ? ({}) : renderFor(outputText)
     readonly property var textControl: collapsibleSummary || !answerLoader.item ? null
         : (rendered.blocks || []).length ? answerLoader.item.textControl : answerLoader.item
@@ -53,6 +65,7 @@ ColumnLayout {
         target.contentY = Math.max(0, Math.min(Math.max(0, target.contentHeight - target.height), next));
     }
     function cursorKey(area, event) {
+        if (readingMenuKey(area,event)) return;
         if ([Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home,
              Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown].indexOf(event.key) >= 0) {
             const owner = app.currentReader;
@@ -150,8 +163,10 @@ ColumnLayout {
         Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
         Binding { target: answerArea; property: "font.pixelSize"; value: result.bodySize; when: result.inlineConversation }
         Accessible.name: result.answerAccessibleName
+        Keys.onShortcutOverride: function(event) {result.readingShortcut(event);}
         Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
         onLinkActivated: function(link) { result.activateLink(link); }
+        ReadingTextToolTip {app: result.app; area: parent}
     }
     }
     Label {

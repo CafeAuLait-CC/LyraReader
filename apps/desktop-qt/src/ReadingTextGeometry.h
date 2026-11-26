@@ -14,4 +14,5 @@ public:
     // Copy from the canonical passage only after verifying that projection.
     Q_INVOKABLE QVariantMap sourceSelection(QObject *document, const QString &source,
                                            int start, int end) const;
+    Q_INVOKABLE QString toolTip(QObject *document, int position) const;
 };

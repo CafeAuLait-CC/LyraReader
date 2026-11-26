@@ -69,7 +69,9 @@ AiHorizontalReadingView {
                     color: app.colors.textPrimary
                     Accessible.name: row.rowIndex === 0 ? qsTr("Table heading %1").arg(index + 1)
                         : qsTr("Table row %1, column %2").arg(row.rowIndex + 1).arg(index + 1)
+                    Keys.onShortcutOverride: function(event) {if(table.renderer && typeof table.renderer.readingShortcut === "function")table.renderer.readingShortcut(event);}
                     Keys.onPressed: function(event) {
+                        if (table.renderer && typeof table.renderer.readingMenuKey === "function" && table.renderer.readingMenuKey(cell,event)) return;
                         if (table.renderer) table.renderer.cursorKey(cell, event);
                         if ([Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home,
                              Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown].indexOf(event.key) >= 0) {
@@ -79,6 +81,7 @@ AiHorizontalReadingView {
                         event.accepted = false;
                     }
                     onLinkActivated: function(link) { if (table.renderer) table.renderer.activateLink(link); }
+                    ReadingTextToolTip {app: table.app; area: parent}
                     TextArea {
                         id: natural
                         objectName: "aiTableIntrinsicMeasure"

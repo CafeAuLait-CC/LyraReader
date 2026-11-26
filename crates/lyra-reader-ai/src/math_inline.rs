@@ -50,6 +50,8 @@ pub enum Alignment {
 pub struct Formula {
     /// UTF-8 byte offsets into the untouched response, including delimiters.
     pub range: Range<usize>,
+    /// UTF-8 byte offsets of the original body, excluding the recognized delimiters.
+    pub content_range: Range<usize>,
     pub display: bool,
     pub expression: Option<Node>,
 }
@@ -111,6 +113,7 @@ pub fn formulas(text: &str) -> Vec<Formula> {
                     .flatten();
                 output.push(Formula {
                     range: start..cursor,
+                    content_range: content..cursor - delimiter.end().len(),
                     display: delimiter.display(),
                     expression,
                 });
@@ -539,6 +542,27 @@ mod tests {
         );
         assert!(items.iter().all(|item| item.expression.is_some()));
         assert!(items[2].display);
+    }
+
+    #[test]
+    fn formula_body_ranges_keep_original_unicode_and_newline_bytes() {
+        let text = "🙂 \\[\r\n\\unsupported{é 中文}\r\n\\] \\(x\\) $$ y $$";
+        let items = formulas(text);
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| &text[item.content_range.clone()])
+                .collect::<Vec<_>>(),
+            ["\r\n\\unsupported{é 中文}\r\n", "x", " y "]
+        );
+        for item in items {
+            assert!(item.range.start < item.content_range.start);
+            assert!(item.content_range.start <= item.content_range.end);
+            assert!(item.content_range.end < item.range.end);
+            assert!(text.is_char_boundary(item.content_range.start));
+            assert!(text.is_char_boundary(item.content_range.end));
+        }
     }
 
     #[test]

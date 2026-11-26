@@ -5176,6 +5176,19 @@ TextArea { width: 230; font.family: "serif"; font.pixelSize: 18; padding: 0; wra
         QQmlExpression selectAll(QQmlEngine::contextForObject(menu),menu,QStringLiteral("itemAt(1)"));
         auto *selectAction=selectAll.evaluate().value<QObject *>();QVERIFY(selectAction && selectAction->property("enabled").toBool());
         QVERIFY(QMetaObject::invokeMethod(selectAction,"triggered"));QVERIFY(!original->property("selectedText").toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(menu,"close"));QTRY_VERIFY(!menu->property("visible").toBool());
+        int keyboardMenus=0;
+        for(auto *control:textControls){
+            const auto *quick=control->property("textDocument").value<QQuickTextDocument *>();QVERIFY(quick && quick->textDocument());
+            const auto plain=quick->textDocument()->toPlainText();
+            if(!plain.contains("Saved translation") && plain!="synthetic_code" && plain!="Heading")continue;
+            window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);control->forceActiveFocus();QTRY_VERIFY(control->hasActiveFocus());
+            QTest::keyClick(window,Qt::Key_F10,Qt::ShiftModifier);QTRY_VERIFY(menu->property("opened").toBool());
+            QCOMPARE(menu->property("parent").value<QQuickItem *>(),control);++keyboardMenus;
+            QVERIFY(QMetaObject::invokeMethod(menu,"close"));QTRY_VERIFY(!menu->property("visible").toBool());
+        }
+        QCOMPARE(keyboardMenus,3);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        original->forceActiveFocus();QTest::keyClick(window,Qt::Key_Menu);QTRY_VERIFY(menu->property("opened").toBool());
         QObject *explain=nullptr;QTRY_VERIFY((explain=menu->findChild<QObject *>("explainAiTranslationTerm0")));QVERIFY(explain->property("text").toString().contains("LyraReader"));
         QTRY_VERIFY(explain->property("enabled").toBool());
         reader->setAiInput("question","Unsent main draft stays unchanged");const auto main=reader->aiState();
@@ -6597,6 +6610,94 @@ ListView {
         QCOMPARE(paragraphs.toPlainText().count("x2"), 128);
     }
 
+    void readingMathKeepsBlockSourcesAndInlineFallbackMetadata() {
+        ReadingMarkdown formatter;ReaderController reader;
+        const QVariantMap colours{{"accent",QColor("#88611B")},{"separator",QColor("#C7BDAE")},
+            {"raisedBg",QColor("#FFFDFA")},{"textSecondary",QColor("#635B50")},{"warningFg",QColor("#88611B")}};
+        const QString source="Before \\(\\unsupported{é <img>}\\) after.\r\n\r\n$$\r\n  \\frac{\\alpha}{\\beta}  \r\n$$\r\n\r\n\\[\\unsupported{<img src=x>}\\]";
+        const auto result=formatter.render(source,&reader,{},0,13,colours);QVERIFY(!result.value("plain").toBool());
+        const auto blocks=result.value("blocks").toList();QCOMPARE(blocks.size(),3);
+        QCOMPARE(blocks[1].toMap().value("kind").toString(),QString("math"));
+        QCOMPARE(blocks[1].toMap().value("source").toString(),QString("\\frac{\\alpha}{\\beta}"));
+        QCOMPARE(blocks[2].toMap().value("source").toString(),QString("\\unsupported{<img src=x>}"));
+        QTextDocument document;document.setHtml(blocks.first().toMap().value("text").toString());
+        const auto bad=document.find("\\unsupported{é <img>}");QVERIFY(!bad.isNull());
+        const auto format=bad.charFormat();QVERIFY(!format.toolTip().isEmpty());QVERIFY(format.anchorHref().isEmpty());
+        QVERIFY(format.fontFamilies().toStringList().contains("monospace"));QCOMPARE(format.background().color(),QColor("#FFFDFA"));
+        QVERIFY(!document.toPlainText().contains("\\("));QVERIFY(!document.toPlainText().contains("Could not render"));
+        QVERIFY(document.toPlainText().contains(" after."));
+        QVERIFY(!result.value("text").toString().contains("<img"));
+        QTextDocument normal;normal.setHtml(blocks[1].toMap().value("text").toString());
+        QVERIFY(!normal.toPlainText().contains("Could not render"));QVERIFY(!normal.toPlainText().contains("\\frac"));
+        QTextDocument failed;failed.setHtml(blocks[2].toMap().value("text").toString());
+        QVERIFY(failed.toPlainText().contains("Could not render"));QVERIFY(failed.toPlainText().contains("\\unsupported{<img src=x>}"));
+    }
+
+    void readingMathSourceMenuAndInlineHintsUseNativeControls_data() {
+        QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("narrow-dark")<<true;
+    }
+    void readingMathSourceMenuAndInlineHintsUseNativeControls() {
+        QFETCH(bool,dark);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property).*"));
+        RecordingClipboardWorkspace workspace;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const auto close=qScopeGuard([&]{window->close();});const QSize size=dark?QSize(700,600):QSize(1200,820);window->setMaximumSize(size);window->resize(size);window->setProperty("appearance",dark?"dark":"light");
+        QString source="Before \\(\\unsupported{a<é 中文>}\\) after.\n\n$$\n  \\frac{\\alpha}{\\beta}  \n$$\n\nBetween.\n\n\\[\\unsupported{<img src=x>}\\]";
+        QQmlComponent component(&engine);component.setData(R"(import QtQuick
+import QtQuick.Controls
+import "qrc:/qml"
+Rectangle {
+    id: root
+    required property var app
+    property var resultValue
+    color: app.colors.panelBg
+    height: result.implicitHeight + 32
+    AiResult {
+        id: result
+        x: 16; y: 16; width: parent.width - 32
+        app: root.app; value: root.resultValue
+        answerName: "nativeMathFixture"
+        inlineConversation: true; showActions: false; showSources: false
+    }
+})",QUrl());
+        QScopedPointer<QObject> object(component.createWithInitialProperties({{"app",QVariant::fromValue(window)},{"resultValue",QVariantMap{{"output",source}}}}));
+        QVERIFY2(object,qPrintable(component.errorString()));auto *card=qobject_cast<QQuickItem *>(object.data());QVERIFY(card);
+        card->setParentItem(window->contentItem());card->setX(40);card->setY(140);card->setWidth(dark?360:500);card->setZ(100);
+        QQuickItem *inlineArea=nullptr,*formula=nullptr,*failed=nullptr;
+        QTRY_VERIFY((inlineArea=visualItem(card,"nativeMathFixture")));QTRY_VERIFY((formula=visualItem(card,"nativeMathFixtureBlock1")));QTRY_VERIFY((failed=visualItem(card,"nativeMathFixtureBlock3")));
+        auto *quick=inlineArea->property("textDocument").value<QQuickTextDocument *>();QVERIFY(quick && quick->textDocument());
+        auto cursor=quick->textDocument()->find("\\unsupported{a<é 中文>}");QVERIFY(!cursor.isNull());
+        ReadingTextGeometry geometry;QVERIFY(!geometry.toolTip(quick,cursor.selectionStart()).isEmpty());
+        QVERIFY(geometry.toolTip(quick,-1).isEmpty());QVERIFY(geometry.toolTip(quick,quick->textDocument()->characterCount()).isEmpty());QVERIFY(geometry.toolTip(nullptr,0).isEmpty());
+        QCOMPARE(formula->property("font").value<QFont>().pixelSize(),17);
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);inlineArea->forceActiveFocus();
+        QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QVERIFY(inlineArea->property("selectedText").toString().contains("\\unsupported"));
+        QRectF hover;QVERIFY(QMetaObject::invokeMethod(inlineArea,"positionToRectangle",Q_RETURN_ARG(QRectF,hover),Q_ARG(int,cursor.selectionStart()+4)));
+        QTest::mouseMove(window,QPoint(10,125),20);
+        QTest::mouseMove(window,inlineArea->mapToScene(hover.center()+QPointF(2,0)).toPoint(),20);
+        auto *tip=inlineArea->findChild<QObject *>("readingMathToolTip");QVERIFY(tip);QTRY_VERIFY_WITH_TIMEOUT(tip->property("visible").toBool(),2000);
+        QCOMPARE(tip->property("text").toString(),geometry.toolTip(quick,cursor.selectionStart()));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+(dark?"-math-hint-dark.png":"-math-hint-light.png")));
+        source.replace("\\(\\unsupported{a<é 中文>}\\)","Resolved inline expression");card->setProperty("resultValue",QVariantMap{{"output",source}});
+        QTRY_VERIFY(!tip->property("visible").toBool());
+        formula=visualItem(card,"nativeMathFixtureBlock1");QVERIFY(formula);formula->forceActiveFocus();QTRY_VERIFY(formula->hasActiveFocus());QTest::keyClick(window,Qt::Key_Menu);
+        auto *menu=formula->parentItem()->findChild<QObject *>("nativeMathFixtureBlock1MathMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("opened").toBool());
+        source.replace("\\frac{\\alpha}{\\beta}","\\sqrt{z}");card->setProperty("resultValue",QVariantMap{{"output",source}});
+        auto *copy=qobject_cast<QQuickItem *>(formula->parentItem()->findChild<QObject *>("nativeMathFixtureBlock1CopyMathSource"));QVERIFY(copy && copy->window());
+        auto *menuWindow=copy->window();menuWindow->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),menuWindow);copy->forceActiveFocus();QTest::keyClick(menuWindow,Qt::Key_Return);
+        QTRY_COMPARE(workspace.copies,1);QCOMPARE(workspace.copied,QString("\\frac{\\alpha}{\\beta}"));
+        QTRY_VERIFY(!menu->property("visible").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        formula->forceActiveFocus();QTest::keyClick(window,Qt::Key_Menu);QTRY_VERIFY(menu->property("opened").toBool());
+        QVERIFY(QMetaObject::invokeMethod(copy,"triggered"));QCOMPARE(workspace.copied,QString("\\sqrt{z}"));QVERIFY(QMetaObject::invokeMethod(menu,"close"));
+        failed=visualItem(card,"nativeMathFixtureBlock3");QVERIFY(failed);QTest::mouseClick(window,Qt::RightButton,Qt::NoModifier,failed->mapToScene(QPointF(8,8)).toPoint());
+        auto *failureMenu=failed->parentItem()->findChild<QObject *>("nativeMathFixtureBlock3MathMenu");QVERIFY(failureMenu);QTRY_VERIFY(failureMenu->property("opened").toBool());
+        auto *failureCopy=failed->parentItem()->findChild<QObject *>("nativeMathFixtureBlock3CopyMathSource");QVERIFY(failureCopy);QVERIFY(QMetaObject::invokeMethod(failureCopy,"triggered"));
+        QCOMPARE(workspace.copied,QString("\\unsupported{<img src=x>}"));QCOMPARE(workspace.copies,3);QVERIFY(QMetaObject::invokeMethod(failureMenu,"close"));
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+(dark?"-math-source-dark.png":"-math-source-light.png")));
+        QVERIFY(!workspace.activeReader()->hasUnsavedChanges());
+    }
+
     void readingMarkdownPlansBoundedNativeCodeBlocks() {
         ReadingMarkdown formatter; ReaderController reader;
         const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
@@ -6870,7 +6971,7 @@ ListView {
         QTRY_COMPARE(server.requests.size(),1);
         const auto request=server.requests.first();
         QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),expectedWire);
-        auto *answer=window->findChild<QObject *>("aiAnswerText");QVERIFY(answer);
+        auto *answer=visualItem(window->contentItem(),"aiAnswerText");QVERIFY(answer);
         const auto markup=[&]{return answer->property("text").toString();};
         const auto math=reader->aiMathMarkup(message);
         QVERIFY(!math.isEmpty());
@@ -6886,25 +6987,37 @@ ListView {
         QVERIFY(document->find(QStringLiteral("after")).charFormat().fontWeight()>=QFont::Bold);
         QVERIFY(document->toPlainText().contains("Money $5, then x2"));
         QVERIFY(document->toPlainText().contains("<img src=\"https://example.invalid/no\">") && !markup().contains("<img"));
-        const auto *table=document->find(QStringLiteral("θ")).currentTable();
+        const auto containing=[&](const QString &text)->const QTextDocument * {
+            const std::function<const QTextDocument *(QQuickItem *)> find=[&](QQuickItem *item)->const QTextDocument * {
+                if(item->objectName().startsWith("aiAnswerText") && item->objectName()!="aiAnswerTextReasoning") {
+                    const auto *quick=item->property("textDocument").value<QQuickTextDocument *>();
+                    if(quick && quick->textDocument() && quick->textDocument()->toPlainText().contains(text))return quick->textDocument();
+                }
+                for(auto *child:item->childItems())if(const auto *found=find(child))return found;
+                return nullptr;
+            };return find(window->contentItem());
+        };
+        const auto *matrixDocument=containing(QStringLiteral("θ"));QVERIFY(matrixDocument);
+        const auto *table=matrixDocument->find(QStringLiteral("θ")).currentTable();
         QVERIFY(table);
         QCOMPARE(table->rows(),2);
         QCOMPARE(table->columns(),5);
-        QCOMPARE(document->find(QStringLiteral("A=")).currentTable(),table);
+        QCOMPARE(matrixDocument->find(QStringLiteral("A=")).currentTable(),table);
         QCOMPARE(table->cellAt(0,1).rowSpan(),2);
         QCOMPARE(table->cellAt(0,4).rowSpan(),2);
-        QVERIFY(document->find(QStringLiteral("[")).charFormat().font().pixelSize()>=30);
-        QVERIFY(document->toPlainText().contains("<img src=matrix>"));
-        const auto numerator=document->find(QStringLiteral("numerator"));
-        const auto denominator=document->find(QStringLiteral("denominator"));
+        QVERIFY(matrixDocument->find(QStringLiteral("[")).charFormat().font().pixelSize()>=30);
+        QVERIFY(matrixDocument->toPlainText().contains("<img src=matrix>"));
+        const auto *fractionDocument=containing(QStringLiteral("numerator"));QVERIFY(fractionDocument);
+        const auto numerator=fractionDocument->find(QStringLiteral("numerator"));
+        const auto denominator=fractionDocument->find(QStringLiteral("denominator"));
         const auto *fraction=numerator.currentTable();
         QVERIFY(fraction && denominator.currentTable()==fraction);
         QCOMPARE(fraction->rows(),3);
         QCOMPARE(fraction->cellAt(numerator).row(),0);
         QCOMPARE(fraction->cellAt(denominator).row(),2);
-        QVERIFY(document->toPlainText().contains(QStringLiteral("\\begin{matrix}u\\end{matrix}")));
-        QCOMPARE(document->find(QStringLiteral("[p.1]")).charFormat().anchorHref(),QString("p.1"));
-        QVERIFY(!document->find(QStringLiteral("[p.99]")).charFormat().isAnchor());
+        const auto *lastDocument=containing(QStringLiteral("\\begin{matrix}u\\end{matrix}"));QVERIFY(lastDocument);
+        QCOMPARE(lastDocument->find(QStringLiteral("[p.1]")).charFormat().anchorHref(),QString("p.1"));
+        QVERIFY(!lastDocument->find(QStringLiteral("[p.99]")).charFormat().isAnchor());
         QVERIFY(reader->aiState().value("output").toString().endsWith(message));
         const auto capture=qEnvironmentVariable("LYRA_READER_MATH_SNAPSHOT");
         if(!capture.isEmpty()){

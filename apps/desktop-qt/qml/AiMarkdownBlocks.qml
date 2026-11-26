@@ -24,7 +24,14 @@ ColumnLayout {
             readonly property string textName: index === 0 ? document.answerName : document.answerName + "Block" + index
             Layout.fillWidth: true; Layout.minimumWidth: 0
             Layout.bottomMargin: block.kind === "code" || block.kind === "table" ? 8 : 0
-            sourceComponent: block.kind === "code" ? code : block.kind === "table" ? table : block.kind === "quote" ? quote : prose
+            sourceComponent: block.kind === "code" ? code : block.kind === "table" ? table : block.kind === "math" ? math : block.kind === "quote" ? quote : prose
+            Component {
+                id: math
+                AiMathBlock {
+                    app: document.app; renderer: document.renderer
+                    markup: row.block.text || ""; sourceText: row.block.source || ""; textName: row.textName
+                }
+            }
             Component {
                 id: table
                 AiTableBlock {
@@ -50,8 +57,10 @@ ColumnLayout {
                     wrapMode: TextEdit.Wrap; readOnly: true; selectByMouse: true; selectByKeyboard: true
                     padding: 0; background: null; color: app.colors.textPrimary
                     Accessible.name: qsTr("AI response section")
+                    Keys.onShortcutOverride: function(event) {if(typeof document.renderer.readingShortcut === "function")document.renderer.readingShortcut(event);}
                     Keys.onPressed: function(event) { document.renderer.cursorKey(area, event); }
                     onLinkActivated: function(link) { document.renderer.activateLink(link); }
+                    ReadingTextToolTip {app: document.app; area: parent}
                 }
             }
             Component {

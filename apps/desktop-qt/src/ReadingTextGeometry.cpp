@@ -10,6 +10,18 @@
 #include <QThread>
 #include <cmath>
 
+QString ReadingTextGeometry::toolTip(QObject *document,int position) const {
+    auto *quick=qobject_cast<QQuickTextDocument *>(document);
+    if(!quick || quick->thread()!=QThread::currentThread() || !quick->textDocument())return {};
+    auto *text=quick->textDocument();
+    if(position<0 || position>=text->characterCount()-1)return {};
+    QTextCursor cursor(text);cursor.setPosition(position);
+    cursor.movePosition(QTextCursor::NextCharacter,QTextCursor::KeepAnchor);
+    const auto hint=cursor.charFormat().toolTip();
+    // Hover is optional presentation; oversized or absent metadata has no hint.
+    return hint.size()<=4096?hint:QString{};
+}
+
 QVariantMap ReadingTextGeometry::sourceSelection(QObject *document, const QString &source,
                                                int start, int end) const {
     const auto changed = [this] {

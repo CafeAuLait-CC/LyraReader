@@ -15,6 +15,7 @@ struct MarkupSpan {
     // unchanged. Callers must not infer parse success from displayed text.
     rendered: bool,
     display: bool,
+    source: String,
 }
 
 fn spans(text: &str) -> Vec<MarkupSpan> {
@@ -28,6 +29,7 @@ fn spans(text: &str) -> Vec<MarkupSpan> {
                     .encode_utf16()
                     .count();
             let source = &text[formula.range.clone()];
+            let body = text[formula.content_range.clone()].to_owned();
             let end = start + source.encode_utf16().count();
             previous_byte = formula.range.end;
             previous_utf16 = end;
@@ -50,6 +52,7 @@ fn spans(text: &str) -> Vec<MarkupSpan> {
                 markup,
                 rendered,
                 display: formula.display,
+                source: body,
             }
         })
         .collect()
@@ -323,12 +326,26 @@ mod tests {
         assert_eq!(values[1]["display"], true);
         assert_eq!(values[2]["rendered"], false);
         assert_eq!(values[2]["display"], false);
+        assert_eq!(values[0]["source"], "x^2");
+        assert_eq!(values[1]["source"], r"\unsupported{<img src=x>}");
+        assert_eq!(values[2]["source"], r"\unsupported{a}");
         assert_eq!(values[1]["markup"], r"\[\unsupported{&lt;img src=x&gt;}\]");
         assert_eq!(values[1]["start"], 11);
         // Equal-looking text cannot serve as a success discriminator.
         let identity = serde_json::to_value(spans(r"\(x\)")).unwrap();
         assert_eq!(identity[0]["rendered"], true);
         assert_eq!(identity[0]["markup"], "x");
+    }
+
+    #[test]
+    fn source_metadata_retains_the_unmodified_body_without_using_it_as_markup() {
+        let text = "🙂 \\[\r\n\\unsupported{<b> é 中文}\r\n\\]";
+        let values = spans(text);
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].source, "\r\n\\unsupported{<b> é 中文}\r\n");
+        assert!(!values[0].rendered);
+        assert!(values[0].markup.contains("&lt;b&gt;"));
+        assert!(!values[0].markup.contains("<b>"));
     }
 
     #[test]

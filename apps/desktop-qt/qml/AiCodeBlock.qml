@@ -42,7 +42,9 @@ ColumnLayout {
             padding: 7; background: null
             font.family: "monospace"; font.pixelSize: 12; color: app.colors.textPrimary
             Accessible.name: qsTr("Code example")
+            Keys.onShortcutOverride: function(event) {if(block.renderer && typeof block.renderer.readingShortcut === "function")block.renderer.readingShortcut(event);}
             Keys.onPressed: function(event) {
+                if (block.renderer && typeof block.renderer.readingMenuKey === "function" && block.renderer.readingMenuKey(area,event)) return;
                 if (block.renderer) block.renderer.cursorKey(area, event);
                 if ([Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Home,
                      Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown].indexOf(event.key) >= 0) {

@@ -95,7 +95,15 @@ Item {
                     color: app.colors.textSecondary; font.pixelSize: 14
                     Accessible.name: qsTr("Original passage")
                     ContextMenu.menu: termsMenu
+                    Keys.onShortcutOverride: function(event) {
+                        if(event.key===Qt.Key_Menu || (event.key===Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier)))event.accepted=true;
+                    }
                     Keys.onPressed: function(event) {
+                        if(event.key===Qt.Key_Menu || (event.key===Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
+                            termsMenu.parent=originalText;
+                            termsMenu.popup(0,Math.max(0,Math.min(originalPreview.visibleHeight,originalText.cursorRectangle.y+originalText.cursorRectangle.height)));
+                            event.accepted=true;return;
+                        }
                         if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown].indexOf(event.key) >= 0 && !row.originalExpanded)
                             row.task.setOriginalOpen(row.originalKey, true);
                         event.accepted = false;
