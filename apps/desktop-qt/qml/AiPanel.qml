@@ -31,22 +31,28 @@ Pane {
     readonly property var preparedRange: plan && (selectedSummary || plan.kind === "reading_translation")
                                          ? viewState.previewSelection || null : null
     readonly property var selectedSources: preparedRange ? plan.sources || [] : []
+    function validateLocateContext() {
+        if (locateContext && locateContext.prepared && (!sameRange(locateContext.range, preparedRange)
+                || locateContext.text !== selectedSources.map(source => source.snippet).join(""))) cancelLocate();
+    }
+    onPreparedRangeChanged: validateLocateContext()
+    onSelectedSourcesChanged: validateLocateContext()
     readonly property var liveRange: visible && (selectedSummary || (workspace === "translation" && !translateDocument)) && app.selection
                                      ? sortedRange(app.selection) : null
     readonly property var currentExcerpt: liveExcerpt && liveExcerpt.owner === owner
                                           && liveExcerpt.generation === ownerGeneration
                                           && sameRange(liveExcerpt.range, liveRange) ? liveExcerpt : null
     property var liveExcerpt: null
-    property var pendingLocate: null
+    property var locateContext: null
+    function cancelLocate() { locateContext = null; app.cancelReadingSourceLookup(); }
     onLiveRangeChanged: {
         if (selectionSource && selectionSource.snapshot && !selectionSource.snapshot.prepared) selectionSource.close();
-        if (pendingLocate && !pendingLocate.prepared) pendingLocate = null;
+        if (locateContext && !locateContext.prepared && !sameRange(locateContext.range, liveRange)) cancelLocate();
         if (liveRange) refreshSelection.restart();
         else { refreshSelection.stop(); liveExcerpt = null; }
     }
     onPlanChanged: {
         if (selectionSource && selectionSource.snapshot && selectionSource.snapshot.prepared) selectionSource.close();
-        if (pendingLocate && pendingLocate.prepared) pendingLocate = null;
         if (!plan && payload && payload.visible) payload.close();
         if (reviewTicket) Qt.callLater(finishUiReview);
     }
@@ -56,7 +62,7 @@ Pane {
         if (translationHistory) translationHistory.close();
         if (chatHistory) chatHistory.close();
         if (readingNotes) readingNotes.close();
-        pendingLocate = null;
+        if (locateContext) cancelLocate();
     }
     readonly property var languageGeneration: batchMode ? batchState.generation : summaryUnit.generation
     readonly property var ownerGeneration: owner.documentGeneration
@@ -188,6 +194,7 @@ Pane {
         return !!a && !!b && a.page === b.page && a.start === b.start && a.end === b.end;
     }
     function resetSourceView() {
+        if (locateContext) cancelLocate();
         taskHistoryShown = false; reviewTicket = null; keepTicket = null; lastKeptNoteId = "";
         dismissNotice();
         if (payload && payload.visible) payload.close();
@@ -196,7 +203,6 @@ Pane {
         if (chatHistory && chatHistory.visible) chatHistory.close();
         if (readingNotes && readingNotes.visible) readingNotes.close();
         liveExcerpt = null;
-        pendingLocate = null;
         if (liveRange) refreshSelection.restart();
     }
     Timer {
@@ -215,25 +221,22 @@ Pane {
     }
     function locate(range, prepared) {
         if (!visible || !range) return;
-        const ticket = {owner: owner, generation: ownerGeneration, range: range, prepared: prepared};
-        if (owner.textPages[range.page.toString()]) {
-            if (!app.revealSelectionSource(owner, ownerGeneration, range))
-                app.operationStatus = qsTr("This selection could not be located.");
-            return;
+        let text = prepared ? selectedSources.map(source => source.snippet).join("")
+            : currentExcerpt ? currentExcerpt.text : "";
+        if (!prepared && currentExcerpt && currentExcerpt.partial) {
+            const full = app.selectedTextResult(range);
+            if (full.error !== undefined) { app.operationStatus = full.error; return; }
+            text = full.text;
         }
-        pendingLocate = ticket;
-        owner.requestText(range.page);
+        if (text) {
+            locateContext = {range: range, prepared: prepared, text: text};
+            if (!app.locateReadingSource(range.page, text)) locateContext = null;
+        }
     }
     Connections {
-        target: aiPanel.liveRange || aiPanel.pendingLocate ? aiPanel.owner : null
+        target: aiPanel.liveRange ? aiPanel.owner : null
         function onTextPagesChanged() {
             if (aiPanel.liveRange && !aiPanel.currentExcerpt) refreshSelection.restart();
-            const ticket = aiPanel.pendingLocate;
-            if (!ticket || !ticket.owner.textPages[ticket.range.page.toString()]) return;
-            aiPanel.pendingLocate = null;
-            if (aiPanel.visible && ticket.owner === aiPanel.owner && ticket.generation === aiPanel.ownerGeneration
-                    && aiPanel.sameRange(ticket.range, ticket.prepared ? aiPanel.preparedRange : aiPanel.liveRange))
-                aiPanel.locate(ticket.range, ticket.prepared);
         }
     }
 
@@ -334,8 +337,7 @@ Pane {
                 app.operationStatus = qsTr("This citation cannot be verified from the document passages sent.");
                 return;
             }
-            const region = (source.rects || [])[0];
-            app.navigate(page, region ? region.y_pt : 0);
+            app.revealReadingSource(page, source.rects || []);
             return;
         }
         followVerifiedPage(link, responsePlan.source_pages, responsePlan.generation);

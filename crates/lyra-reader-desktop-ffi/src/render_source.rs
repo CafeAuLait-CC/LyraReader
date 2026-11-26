@@ -11,6 +11,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// Bound geometry before serializing a native display response, independently of
+// the shared matcher's text budget. No source text or geometry is truncated.
+const MAX_READING_SOURCE_RECTS: usize = 16_384;
+
 /// An immutable revision, independent of the active tab and its later page edits.
 pub struct RenderSource {
     engine: Arc<LyraReaderDocument>,
@@ -270,6 +274,25 @@ impl RenderSource {
             "layout" => crate::document::layout_value(&self.layout, &request),
             "outline" => value(self.engine.outline()),
             "text" => value(self.engine.text_page(page()?)),
+            "ai_reading_source" => {
+                let text = request["text"].as_str().ok_or("Missing source text")?;
+                if text.len() > lyra_reader_ai::chat::MAX_READING_SOURCE_BYTES {
+                    return Err("The saved source exceeds the supported size.".into());
+                }
+                if text.lines().take(MAX_READING_SOURCE_RECTS + 1).count()
+                    > MAX_READING_SOURCE_RECTS
+                {
+                    return Err("The source geometry exceeds the display budget.".into());
+                }
+                let rects = self
+                    .engine
+                    .locate_ai_reading_source(page()?, text.to_owned())
+                    .map_err(|e| e.to_string())?;
+                if rects.len() > MAX_READING_SOURCE_RECTS {
+                    return Err("The source geometry exceeds the display budget.".into());
+                }
+                serde_json::to_value(rects).map_err(|e| e.to_string())
+            }
             "citations" => value(self.engine.citations(page()?)),
             "page_targets" => Ok(
                 json!({"links":self.engine.links(page()?).map_err(|e|e.to_string())?,"citations":self.engine.citations(page()?).map_err(|e|e.to_string())?,"mentions":self.engine.caption_mentions(page()?).map_err(|e|e.to_string())?}),

@@ -17,6 +17,10 @@ QtObject {
     readonly property color emptyBg: dark ? "#1B1A18" : "#EEEAE3"
     readonly property color statusbarBg: dark ? "#24221F" : "#F4F1EC"
     readonly property color documentInk: "#302B25"
+    // Match the Mac native source-flash textures, independently of paper colour.
+    readonly property color aiSourceFull: "#66FFB000"
+    readonly property color aiSourceSoft: "#3DFFB000"
+    readonly property color aiSourceFaint: "#1AFFB000"
     // Transparent artwork is previewed on original paper, independently of the UI theme.
     readonly property color documentPaper: "#FFFFFF"
     readonly property color textPrimary: dark ? "#F1ECE3" : "#302B25"

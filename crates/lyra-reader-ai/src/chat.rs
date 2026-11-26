@@ -29,6 +29,8 @@ pub const MAX_PAGE_CHARS: usize = 8_000;
 pub const MAX_SELECTION_CHARS: usize = 12_000;
 /// Retrieved context is deliberately small: it is a hint, not a second copy of the document.
 pub const MAX_RETRIEVED_CHARS: usize = 2_000;
+/// Largest UTF-8 excerpt resolved for an explicit local reading-source lookup.
+pub const MAX_READING_SOURCE_BYTES: usize = 1024 * 1024;
 /// Retrieved blocks considered for one request.
 pub const RETRIEVED_BLOCKS: usize = 4;
 /// Document chat is read-only retrieval over the whole document: more context than a page
@@ -3091,7 +3093,7 @@ fn snippet(text: &str) -> String {
 /// the page, but it never invents a region.
 /// Locate a saved reading paragraph using the same geometry matcher as retrieval backlinks.
 pub fn locate_reading_source(page: &PageText, text: &str) -> Result<Vec<SourceRect>, AiError> {
-    if text.len() > 1024 * 1024 {
+    if text.len() > MAX_READING_SOURCE_BYTES {
         return Err(empty_context(
             "The saved source exceeds the supported size.",
         ));

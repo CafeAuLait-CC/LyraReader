@@ -45,6 +45,17 @@ Item {
             border.color: app.colors.accentBorder
         }
     }
+    // Ephemeral source geometry shares paper clipping, but is never a saved mark.
+    PdfAnnotations {
+        objectName: "paperAiSourceHighlight"
+        anchors.fill: parent
+        readonly property var flash: app.aiSourceHighlight || ({})
+        visible: flash.page === annotationLayer.page && (flash.rects || []).length > 0
+        zoom: app.zoom; paperMap: annotationLayer.paperMap; paperAppearance: "original"
+        annotations: visible ? [{id:"ui-ai-source-highlight", kind:"highlight", blend:"normal",
+            color:flash.phase === "faint" ? app.colors.aiSourceFaint : flash.phase === "soft" ? app.colors.aiSourceSoft : app.colors.aiSourceFull,
+            quads:flash.rects}] : []
+    }
     // Reuse the committed markup renderer, including clipping around opened conversation paper.
     PdfAnnotations {
         objectName: "paperTextSelection"

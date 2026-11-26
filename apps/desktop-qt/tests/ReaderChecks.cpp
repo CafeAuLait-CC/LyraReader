@@ -1,6 +1,8 @@
 #include <QEventLoop>
 #include "DisplayCalibration.h"
 #include "ReadingTextGeometry.h"
+#include "ReadingSourceHighlight.h"
+#include <QFutureWatcher>
 #include "AuditController.h"
 #include "NavigationController.h"
 #include "FileDialogNavigation.h"
@@ -164,6 +166,7 @@ protected:
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
     qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
+    qmlRegisterType<ReadingSourceHighlight>("LyraReader",1,0,"ReadingSourceHighlight");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
@@ -4578,6 +4581,27 @@ private slots:
         QPointer<QQuickItem> live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
         const auto excerpt=reader->selectionText(0,0,int(qMin<qsizetype>(end,2047))).value("text").toString();
         QTRY_COMPARE(live->property("text").toString(),excerpt);QVERIFY(live->isVisible());
+        const QVariantMap fullRange{{"page",0},{"start",0},{"end",end}};
+        const auto prefix=exact.left(40);QString sourceError;
+        const auto fullGeometry=reader->renderSource()->query({{"op","ai_reading_source"},{"page",0},{"text",exact}},&sourceError).toList();QVERIFY(sourceError.isEmpty());
+        const auto prefixGeometry=reader->renderSource()->query({{"op","ai_reading_source"},{"page",0},{"text",prefix}},&sourceError).toList();QVERIFY(sourceError.isEmpty());
+        QVERIFY(fullGeometry.size()>prefixGeometry.size());
+        QVERIFY(panel->setProperty("liveExcerpt",QVariantMap{{"owner",QVariant::fromValue(reader)},{"generation",reader->documentGeneration()},{"range",fullRange},{"text",prefix},{"partial",true}}));
+        auto *liveLocate=visualItem(window->contentItem(),"aiLiveSelectionLocate");QVERIFY(liveLocate);QVERIFY(QMetaObject::invokeMethod(liveLocate,"clicked"));
+        QTRY_COMPARE(window->property("aiSourceHighlight").toMap().value("rects").toList().size(),fullGeometry.size());
+        QCOMPARE(window->property("selection").toMap(),fullRange);QCOMPARE(server.requests.size(),0);
+        auto *sourceController=window->findChild<ReadingSourceHighlight *>("readingSourceHighlight");QVERIFY(sourceController);sourceController->clear();
+        QSignalSpy sourceRevealed(sourceController,&ReadingSourceHighlight::revealed);
+        {
+            auto *pool=QThreadPool::globalInstance();const int maximum=pool->maxThreadCount();pool->setMaxThreadCount(1);
+            QSemaphore started,gate;auto blocker=QtConcurrent::run([&]{started.release();gate.acquire();});
+            const auto release=qScopeGuard([&]{gate.release();blocker.waitForFinished();pool->setMaxThreadCount(maximum);});QVERIFY(started.tryAcquire(1,1000));
+            QVERIFY(QMetaObject::invokeMethod(panel,"locate",Q_ARG(QVariant,fullRange),Q_ARG(QVariant,false)));
+            QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",0}}));
+            gate.release();QTRY_COMPARE(sourceController->findChildren<QFutureWatcherBase *>().size(),0);
+            QCOMPARE(sourceRevealed.size(),0);QVERIFY(sourceController->state().isEmpty());
+        }
+        QVERIFY(window->setProperty("selection",fullRange));
         // The other reading tools must not retain a live excerpt behind their UI.
         reader->setAiInput("view","chat");QTRY_VERIFY(!live || !live->isVisible());
         reader->setAiInput("view","translation");reader->setAiInput("translationScope","selection");QTRY_VERIFY((live=visualItem(window->contentItem(),"aiLiveSelection")) && live->isVisible());
@@ -4600,9 +4624,10 @@ private slots:
         auto *locate=visualItem(window->contentItem(),"aiSelectedSummarySourceLocate");QVERIFY(locate && locate->isVisible());
         QTRY_VERIFY(!window->property("positionRestoring").toBool());
         QVERIFY(QMetaObject::invokeMethod(locate,"clicked"));
-        QCOMPARE(window->property("selection").toMap().value("end").toInt(),int(end));
-        QTRY_VERIFY(live->isVisible()); // The top card remains the live candidate even when it agrees with the reviewed source.
-        QTRY_VERIFY(!locate->isVisible());
+        // Mac Locate flashes the frozen excerpt without replacing the live canvas candidate.
+        QCOMPARE(window->property("selection").toMap().value("end").toInt(),0);
+        QTRY_VERIFY(live->isVisible());QVERIFY(locate->isVisible());
+        QTRY_VERIFY(!window->property("aiSourceHighlight").toMap().value("rects").toList().isEmpty());
         QCOMPARE(server.requests.size(),0);
         QTRY_COMPARE(reader->pendingCommands(),0);
 
@@ -4613,7 +4638,12 @@ private slots:
         reader->setAiInput("summaryDetail","Detailed");QVERIFY(!reader->startAi("local",plan));
         auto *keep=window->findChild<QObject *>("keepAiSummaryNote"),*notes=window->findChild<QObject *>("aiReadingNotes");
         QVERIFY(keep && notes);
+        // Locate does not reselect a frozen passage. Selecting its range explicitly
+        // restores that scope's saved result, without another provider request.
+        QVERIFY(!keep->property("visible").toBool());
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",end}}));
         QTRY_VERIFY(keep->property("enabled").toBool() && keep->property("visible").toBool());
+        QCOMPARE(server.requests.size(),1);
         const auto sourceId=reader->aiState().value("summaryNoteSource").toString();QVERIFY(!sourceId.isEmpty());
         QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
         QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());QVERIFY(!notes->property("visible").toBool());
@@ -4853,6 +4883,103 @@ private slots:
         QVERIFY(!replay->property("enabled").toBool());QCOMPARE(server.requests.size(),1);
         QVERIFY(QMetaObject::invokeMethod(history,"close"));
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
+    }
+
+    void readingSourceHighlightUsesAbsoluteDeadlinesAndRejectsStaleWork() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-source-flash.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile pdf(path);QVERIFY(pdf.open(QIODevice::ReadOnly));const auto original=pdf.readAll();pdf.close();
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(reader.pageCount(),1);QTRY_COMPARE(reader.pendingCommands(),0);
+        const auto ai=reader.aiState();ReadingSourceHighlight highlight;highlight.setReader(&reader);
+        QSignalSpy revealed(&highlight,&ReadingSourceHighlight::revealed),failed(&highlight,&ReadingSourceHighlight::failed);
+        const QVariantList boxes{QVariantMap{{"x_pt",40.},{"y_pt",300.},{"width_pt",200.},{"height_pt",12.}}};
+        highlight.show(0,boxes);QCOMPARE(highlight.state().value("phase").toString(),QString("full"));QCOMPARE(revealed.size(),1);QCOMPARE(revealed.last().at(1).toDouble(),260.);
+        highlight.cancelLookup();QCOMPARE(highlight.state().value("phase").toString(),QString("full"));
+        QTest::qWait(500);QVERIFY(highlight.state().value("phase").toString()!=QString("full"));
+        highlight.show(0,boxes);QTest::qWait(100);highlight.show(0,boxes);QCOMPARE(highlight.state().value("phase").toString(),QString("full"));
+        // Blocking the GUI must not extend later phases into a new 1.4s sequence.
+        QThread::msleep(1000);QCoreApplication::processEvents();
+        QVERIFY(highlight.state().isEmpty() || highlight.state().value("phase").toString()==QString("faint"));
+        QTRY_VERIFY_WITH_TIMEOUT(highlight.state().isEmpty(),500);
+        highlight.locate(0,"Line 1: The quick brown fox jumps over the lazy dog.");
+        QTRY_VERIFY(!highlight.state().value("rects").toList().isEmpty());QCOMPARE(failed.size(),0);
+        highlight.clear();QVERIFY(highlight.state().isEmpty());
+        auto *pool=QThreadPool::globalInstance();const int maximum=pool->maxThreadCount();pool->setMaxThreadCount(1);
+        QSemaphore started,gate;auto blocker=QtConcurrent::run([&]{started.release();gate.acquire();});
+        const auto release=qScopeGuard([&]{gate.release();blocker.waitForFinished();pool->setMaxThreadCount(maximum);});QVERIFY(started.tryAcquire(1,1000));
+        highlight.show(0,boxes);const auto shown=revealed.size();
+        highlight.locate(0,"Line 1: The quick brown fox jumps over the lazy dog.");
+        QCOMPARE(highlight.state().value("phase").toString(),QString("full"));
+        QTRY_VERIFY_WITH_TIMEOUT(highlight.state().isEmpty(),1700);
+        gate.release();QTRY_COMPARE(revealed.size(),shown+1);QVERIFY(!highlight.state().isEmpty());highlight.clear();
+        QSemaphore replacementStarted,replacementGate;auto replacementBlocker=QtConcurrent::run([&]{replacementStarted.release();replacementGate.acquire();});
+        const auto releaseReplacement=qScopeGuard([&]{replacementGate.release();replacementBlocker.waitForFinished();});QVERIFY(replacementStarted.tryAcquire(1,1000));
+        const int beforeReplacement=revealed.size();
+        highlight.locate(0,"Line 1: The quick brown fox jumps over the lazy dog.");
+        highlight.locate(0,"ABSENT_SYNTHETIC_READING_SOURCE_ZZZ");
+        replacementGate.release();QTRY_COMPARE(revealed.size(),beforeReplacement+1);QVERIFY(highlight.state().isEmpty());
+        QCOMPARE(revealed.last().at(1).toDouble(),0.);QCOMPARE(failed.size(),0);
+        QSemaphore staleStarted,staleGate;auto staleBlocker=QtConcurrent::run([&]{staleStarted.release();staleGate.acquire();});
+        const auto releaseStale=qScopeGuard([&]{staleGate.release();staleBlocker.waitForFinished();});QVERIFY(staleStarted.tryAcquire(1,1000));
+        highlight.locate(0,"Line 1: The quick brown fox jumps over the lazy dog.");
+        const auto generation=reader.documentGeneration();reader.openFile(QUrl::fromLocalFile(path));
+        QTRY_VERIFY(reader.documentGeneration()!=generation);staleGate.release();QTRY_COMPARE(reader.pendingCommands(),0);
+        QTRY_COMPARE(highlight.findChildren<QFutureWatcherBase *>().size(),0);QCOMPARE(revealed.size(),beforeReplacement+1);QVERIFY(highlight.state().isEmpty());QCOMPARE(failed.size(),0);
+        highlight.show(0,{QVariantMap{{"x_pt",1e308},{"y_pt",30.},{"width_pt",100.},{"height_pt",10.}}});
+        QCOMPARE(failed.size(),1);QVERIFY(highlight.state().isEmpty());
+        QCOMPARE(reader.aiState(),ai);QVERIFY(!reader.hasUnsavedChanges());QVERIFY(pdf.open(QIODevice::ReadOnly));QCOMPARE(pdf.readAll(),original);
+        QPointer<ReadingSourceHighlight> transient=new ReadingSourceHighlight;transient->setReader(&reader);
+        connect(transient.data(),&ReadingSourceHighlight::stateChanged,this,[&]{delete transient.data();});
+        transient->show(0,boxes);QVERIFY(transient.isNull());
+        bool replaced=false;
+        connect(&highlight,&ReadingSourceHighlight::stateChanged,this,[&]{
+            if(!replaced && highlight.state().isEmpty()){replaced=true;highlight.show(0,{QVariantMap{{"x_pt",40.},{"y_pt",500.},{"width_pt",100.},{"height_pt",12.}}});}
+        });
+        highlight.show(0,boxes);highlight.show(0,boxes);QVERIFY(replaced);
+        QCOMPARE(highlight.state().value("rects").toList().first().toMap().value("y").toDouble(),500.);
+    }
+
+    void readingSourceHighlightPaintsNativeTransientQuads_data() {
+        QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("dark-narrow")<<true;
+    }
+    void readingSourceHighlightPaintsNativeTransientQuads() {
+        QFETCH(bool,dark);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-native-source-quad.pdf");
+        {
+            QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(595,842),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));
+            QPainter painter(&pdf);QVERIFY(painter.isActive());painter.fillRect(QRectF(250,400,80,14),Qt::black);
+        }
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(dark?700:1100,dark?600:820);
+        window->setProperty("appearance",dark?"dark":"light");window->setProperty("paperAppearance","original");
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(!window->property("positionRestoring").toBool());QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));
+        auto *flash=window->findChild<ReadingSourceHighlight *>("readingSourceHighlight");QVERIFY(flash);
+        auto *overlay=visualItem(window->contentItem(),"paperAiSourceHighlight");QVERIFY(overlay);
+        const auto ai=reader->aiState();
+        const QVariantList boxes{QVariantMap{{"x_pt",250.},{"y_pt",400.},{"width_pt",80.},{"height_pt",14.}}};
+        QVERIFY(window->setProperty("positionRestoring",true));
+        QVERIFY(QMetaObject::invokeMethod(window,"locateReadingSource",Q_ARG(QVariant,0),Q_ARG(QVariant,"Synthetic source")));
+        QVERIFY(window->property("operationStatus").toString().contains("still restoring"));QVERIFY(flash->state().isEmpty());
+        QVERIFY(window->setProperty("operationStatus",""));
+        QVERIFY(QMetaObject::invokeMethod(window,"revealReadingSource",Q_ARG(QVariant,0),Q_ARG(QVariant,boxes)));
+        QVERIFY(window->property("operationStatus").toString().contains("still restoring"));QVERIFY(flash->state().isEmpty());
+        QVERIFY(window->setProperty("positionRestoring",false));
+        QSignalSpy frames(window,&QQuickWindow::frameSwapped);const auto count=frames.size();
+        flash->show(0,boxes);window->requestUpdate();QTRY_VERIFY(frames.size()>count);
+        QTRY_VERIFY(overlay->isVisible());QCOMPARE(overlay->property("annotations").toList().first().toMap().value("blend").toString(),QString("normal"));
+        const auto colour=window->grabWindow();QVERIFY(!colour.isNull());
+        QCOMPARE(flash->state().value("phase").toString(),QString("full"));
+        const double zoom=window->property("zoom").toDouble();const auto point=overlay->mapToScene(QPointF(290*zoom,407*zoom));
+        const QPoint pixel(qRound(point.x()*colour.width()/window->width()),qRound(point.y()*colour.height()/window->height()));
+        QVERIFY(colour.rect().contains(pixel));const auto painted=colour.pixelColor(pixel);
+        const auto completed=reader->completedRasters();flash->clear();const auto beforeClear=frames.size();window->requestUpdate();QTRY_VERIFY(frames.size()>beforeClear);
+        const auto plain=window->grabWindow();QVERIFY(!plain.isNull());const auto base=plain.pixelColor(pixel);
+        qInfo()<<"Source flash native pixels:"<<painted<<"base:"<<base;
+        QVERIFY(base.red()<5 && base.green()<5 && base.blue()<5);
+        // Normal source flash tints black; a Multiply selection would leave it black.
+        QVERIFY(painted.red()>40 && painted.green()>20 && painted.blue()<20);
+        QVERIFY(!overlay->isVisible());QCOMPARE(reader->completedRasters(),completed);QCOMPARE(reader->aiState(),ai);QVERIFY(!reader->hasUnsavedChanges());
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if(!evidence.isEmpty()){const auto name=evidence+"-source-flash-"+(dark?QString("dark"):QString("light"));QVERIFY(colour.save(name+".png"));QVERIFY(plain.save(name+"-cleared.png"));}
     }
 
     void readingSourceCardsSelectAndCopyCanonicalNativeRanges_data() {

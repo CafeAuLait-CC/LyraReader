@@ -101,6 +101,37 @@ ApplicationWindow {
     function showReadingNotice(message, owner) {
         if (owner === currentReader) aiContent.showNotice(message);
     }
+    readonly property alias aiSourceHighlight: readingSourceHighlight.state
+    ReadingSourceHighlight {
+        id: readingSourceHighlight
+        objectName: "readingSourceHighlight"
+        reader: root.currentReader
+        onFailed: function(message) { aiContent.locateContext = null; root.showReadingNotice(message, root.currentReader); }
+        onRevealed: function(page, y) {
+            aiContent.locateContext = null;
+            if (root.positionRestoring) { clear(); root.readingSourceReady(); return; }
+            root.navigate(page, y);
+            const rects = state.rects || [];
+            if (!root.textViewVisible && rects.length) canvas.revealPageRegion(page, rects[0].x, rects[0].width);
+            root.operationStatus = rects.length
+                ? qsTr("Source highlighted on page %1; it fades and is not saved.").arg(page + 1)
+                : qsTr("Jumped to page %1. The source region has no text geometry.").arg(page + 1);
+        }
+    }
+    function readingSourceReady() {
+        if (!positionRestoring) return true;
+        operationStatus = qsTr("The reading position is still restoring. Try Locate again when it is ready.");
+        return false;
+    }
+    function locateReadingSource(page, text) {
+        if (!readingSourceReady()) return false;
+        readingSourceHighlight.locate(page, text);
+        return true;
+    }
+    function cancelReadingSourceLookup() { readingSourceHighlight.cancelLookup(); }
+    function revealReadingSource(page, rects) {
+        if (readingSourceReady()) readingSourceHighlight.show(page, rects);
+    }
     function openSavedReadingNote(id) {
         showAiPanel(true);
         if (aiPanelVisible && aiPanelMode === "assistant") aiContent.openSavedNote(id);
@@ -957,18 +988,6 @@ ApplicationWindow {
         const cached=currentReader.selectionText(range.page,range.start,range.end);
         if(cached.error!==undefined)return cached;
         return {text:cached.ready ? cached.text : Logic.selectedText(text.chars,range.start,range.end,text.selection_excluded_indices)};
-    }
-    function revealSelectionSource(owner, generation, range) {
-        if (owner !== currentReader || generation !== owner.documentGeneration || owner.loading
-                || positionRestoring || range.page < 0 || range.page >= owner.pageCount) return false;
-        const text = owner.textPages[range.page.toString()];
-        if (!text || range.start < 0 || range.end < range.start || range.end >= text.chars.length) return false;
-        const rect = Logic.firstSelectionRect(text.chars, range.start, range.end, text.selection_excluded_indices);
-        if (!rect) return false;
-        navigate(range.page, rect.y_pt);
-        if (!textViewVisible) canvas.revealPageRegion(range.page, rect.x_pt, rect.width_pt);
-        selection = range;
-        return true;
     }
     function selectedText() {
         const result=selectedTextResult();

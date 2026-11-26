@@ -1852,6 +1852,78 @@ mod tests {
     }
 
     #[test]
+    fn native_reading_source_lookup_uses_the_shared_matcher_and_pins_its_revision() {
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let source = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let passage = "Line 1: The quick brown fox jumps over the lazy dog.";
+        let expected = serde_json::to_value(
+            doc.active()
+                .unwrap()
+                .locate_ai_reading_source(0, passage.into())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!expected.as_array().unwrap().is_empty());
+        let query = json!({"op":"ai_reading_source","page":0,"text":passage});
+        assert_eq!(source.query(query.clone()).unwrap(), expected);
+        assert_eq!(source.query(json!({"op":"ai_reading_source","page":0,"text":"ABSENT_SYNTHETIC_READING_SOURCE_ZZZ"})).unwrap(), json!([]));
+        for page in [
+            json!(-1),
+            json!(u64::MAX),
+            Value::Null,
+            json!("one"),
+            json!(1),
+        ] {
+            assert!(
+                source
+                    .query(json!({"op":"ai_reading_source","page":page,"text":passage}))
+                    .is_err()
+            );
+        }
+        assert!(
+            source
+                .query(json!({"op":"ai_reading_source","page":0,"text":false}))
+                .is_err()
+        );
+        let repeated_lines = "L\n".repeat(16_385);
+        assert!(
+            source
+                .query(json!({"op":"ai_reading_source","page":0,"text":repeated_lines}))
+                .unwrap_err()
+                .contains("display budget")
+        );
+        let oversized = "x".repeat(lyra_reader_ai::chat::MAX_READING_SOURCE_BYTES + 1);
+        assert!(
+            source
+                .query(json!({"op":"ai_reading_source","page":0,"text":oversized}))
+                .unwrap_err()
+                .contains("supported size")
+        );
+        doc.command(
+            json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}}}),
+        )
+        .unwrap();
+        let current = crate::render_source::RenderSource::new(&doc, false).unwrap();
+        let rotated = serde_json::to_value(
+            doc.active()
+                .unwrap()
+                .locate_ai_reading_source(0, passage.into())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(rotated, expected);
+        assert_eq!(current.query(query.clone()).unwrap(), rotated);
+        assert_eq!(source.query(query.clone()).unwrap(), expected);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        drop(current);
+        drop(doc);
+        fs::remove_file(&fixture.path).unwrap();
+        assert_eq!(source.query(query).unwrap(), expected);
+    }
+
+    #[test]
     fn native_index_batches_reject_invalid_values_before_advancing() {
         let fixture = Fixture::new("narrative-citation.pdf");
         let doc = fixture.open();
