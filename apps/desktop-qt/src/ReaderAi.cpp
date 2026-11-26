@@ -677,7 +677,9 @@ bool ReaderController::startAiWithCredential(const QString &key,const QVariantMa
         m_aiState.insert(QStringLiteral("activeChatDraft"),chatDraft());
         args.insert(QStringLiteral("chat"),QVariantMap{{QStringLiteral("session_id"),ensureChatSession()},
             {QStringLiteral("expected_modified"),m_aiState.value(QStringLiteral("chatModified"))},
-            {QStringLiteral("draft_snapshot"),m_aiState.value(QStringLiteral("activeChatDraft"))},
+            // The accepted question is consumed; later composer edits are saved
+            // after this reply checkpoint using its returned workspace version.
+            {QStringLiteral("draft_snapshot"),QString{}},
             {QStringLiteral("question"),m_aiState.value(QStringLiteral("activeQuestion"))}});
         m_aiState.remove(QStringLiteral("chatHistoryWarning"));
     }
@@ -928,7 +930,17 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     }
     if(operation==QStringLiteral("ai_start") && id==m_aiStartId) {
         m_aiStartId=0;
-        if(error.isEmpty()){m_aiState.insert(QStringLiteral("status"),tr("Receiving response…"));m_aiTimer.start();}
+        if(error.isEmpty()) {
+            // A returned request handle consumes only its original composer draft.
+            // Late input and cancellation before acceptance remain in the editor.
+            // Its archive atomically saves an empty composer alongside the turn;
+            // the existing draft writer persists any later input after that checkpoint.
+            if(m_aiState.value(QStringLiteral("activeChat")).toBool()
+                && !m_aiState.value(QStringLiteral("cancelRequested")).toBool()
+                && chatDraft()==m_aiState.value(QStringLiteral("activeChatDraft")).toString())
+                setChatDraft({});
+            m_aiState.insert(QStringLiteral("status"),tr("Receiving response…"));m_aiTimer.start();
+        }
         else {m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))markRegionDirty();}
         emit aiStateChanged();return;
     }
@@ -951,7 +963,8 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     const auto chatCheckpoint=batch.value(QStringLiteral("chat_checkpoint")).toMap();
     if(!chatCheckpoint.isEmpty()) {
         m_aiState.insert(QStringLiteral("chatModified"),chatCheckpoint.value(QStringLiteral("modified")));
-        m_savedChatDraft=m_aiState.value(QStringLiteral("activeChatDraft")).toString();
+        // ai_start requested an empty archived composer, not its sent question.
+        m_savedChatDraft.clear();
         m_aiState.remove(QStringLiteral("chatDraftWarning"));
     }
     if(batch.contains(QStringLiteral("chat_history_warning")))m_aiState.insert(QStringLiteral("chatHistoryWarning"),batch.value(QStringLiteral("chat_history_warning")));

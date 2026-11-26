@@ -4903,7 +4903,12 @@ private slots:
         QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());QVERIFY(!window->findChild<QObject *>("aiReadingNotes")->property("visible").toBool());
         QTRY_COMPARE(composer->height(),qreal(96));QCOMPARE(server.requests.size(),1);
         if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-chat-answer-"+theme+".png"));
-        window->resize(700,600);QTRY_COMPARE(composer->height(),qreal(96));
+        auto *flick=history->property("contentItem").value<QQuickItem *>();QVERIFY(flick);
+        history->setProperty("followTail",false);flick->setProperty("contentY",0);
+        QTRY_VERIFY(bubble->mapRectToScene(bubble->boundingRect()).top()>=history->mapRectToScene(history->boundingRect()).top()-.5);
+        if(!evidence.isEmpty()){QTest::qWait(60);QVERIFY(window->grabWindow().save(evidence+"-chat-bubble-"+theme+".png"));}
+        history->setProperty("followTail",true);QVERIFY(QMetaObject::invokeMethod(history,"followAnswer"));
+        window->resize(700,600);QTRY_COMPARE(composer->height(),qreal(96));QTRY_VERIFY(flick->property("atYEnd").toBool());
         QTRY_VERIFY(prepare->mapRectToScene(prepare->boundingRect()).bottom()<=window->height());
         if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-chat-narrow-"+theme+".png"));
         reader->setAiInput("question","A new unsent draft");question->forceActiveFocus();QTest::keyClick(window,Qt::Key_Return);
@@ -4948,6 +4953,8 @@ private slots:
         const auto firstTurn=reader->aiState().value("chatTurns").toList().first().toMap().value("note_source").toString();QVERIFY(!firstTurn.isEmpty());
         auto *newChat=window->findChild<QObject *>("clearAiConversation");QVERIFY(newChat);
         QVERIFY(QMetaObject::invokeMethod(newChat,"clicked"));
+        // The consumed composer draft is saved before the conversation is replaced.
+        QTRY_VERIFY(reader->aiState().value("chatSession").toString().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);
         QVERIFY(reader->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());
         review("Where is the body text? CHAT_BETA");reply("Second synthetic BETA answer [p.1]",2);
         QVERIFY(reader->aiState().value("chatSession").toString()!=first);
@@ -5018,6 +5025,73 @@ private slots:
         QVERIFY2(error.contains("PDF changed outside LyraReader"),qPrintable(error));
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),savedWorkspace);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(plan().isEmpty());QCOMPARE(server.requests.size(),3);
+    }
+
+    void acceptedChatClearsOnlyTheSentDraftAndRestoresTheNextDraft_data() {
+        QTest::addColumn<int>("lateInput");
+        QTest::newRow("clear-after-acceptance")<<0;
+        QTest::newRow("typing-before-start-reply")<<1;
+        QTest::newRow("typing-during-stream")<<2;
+        QTest::newRow("cancel-before-acceptance")<<3;
+        QTest::newRow("rejected-before-dispatch")<<4;
+    }
+    void acceptedChatClearsOnlyTheSentDraftAndRestoresTheNextDraft() {
+        QFETCH(int,lateInput);
+        MockChatServer server;QVERIFY(server.listen());
+        server.responses.append({{MockChatServer::delta({{"content","Synthetic held answer [p.1]"}}),QByteArray("data: [DONE]\n\n")},10,200,true});
+        server.responses.append({{MockChatServer::delta({{"content","Synthetic retry answer [p.1]"}}),QByteArray("data: [DONE]\n\n")},10,200});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-chat-lifecycle.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-chat-lifecycle"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"chat")));
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const QString sentQuestion="Where is the body text? SENT_SYNTHETIC_QUESTION";
+        const QString lateDraft="NEXT_UNSENT_DRAFT\nPreserve exact text";
+        const auto draft=[&]{return reader->aiState().value("input").toMap().value("chatQuestion").toString();};
+        reader->setAiInput("question",sentQuestion);reader->flushAiChatDraft();QTRY_VERIFY(!reader->chatDraftPending());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto reviewed=reader->aiState().value("plan").toMap();QVERIFY(!reviewed.isEmpty());
+        const auto wire=reviewed.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        if(lateInput==4) {
+            bool invalidated=false;
+            const auto hook=connect(reader,&ReaderController::aiStateChanged,this,[&] {
+                if(!invalidated && reader->aiState().value("running").toBool()){invalidated=true;reader->invalidateAiPlan();}
+            });
+            QVERIFY(!reader->startAi("local",reviewed));disconnect(hook);QVERIFY(invalidated);
+            QCOMPARE(draft(),sentQuestion);QCOMPARE(server.requests.size(),0);return;
+        }
+        QVERIFY(reader->startAi("local",reviewed));QCOMPARE(draft(),sentQuestion); // No handle/result has been accepted yet.
+        if(lateInput==3) {
+            reader->cancelAi();QTRY_VERIFY(!reader->aiState().value("running").toBool());
+            QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!reader->chatDraftPending());QCOMPARE(draft(),sentQuestion);
+            QVERIFY(reader->aiState().value("cancelRequested").toBool());return;
+        }
+        if(lateInput==1)reader->setAiInput("question",lateDraft);
+        QTRY_VERIFY(reader->aiState().value("output").toString().contains("Synthetic held"));
+        if(lateInput==2){QCOMPARE(draft(),QString());reader->setAiInput("question",lateDraft);}
+        QTRY_COMPARE(draft(),lateInput ? lateDraft : QString());
+        QCOMPARE(reader->aiState().value("activeQuestion").toString(),sentQuestion);
+        QCOMPARE(server.requests.size(),1);QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),wire);
+        auto *stop=visualItem(window->contentItem(),"prepareAiRequest");QVERIFY(stop && stop->property("enabled").toBool());
+        QCOMPARE(stop->property("text").toString(),QString("Stop"));QVERIFY(QMetaObject::invokeMethod(stop,"clicked"));
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!reader->chatDraftPending());
+        QQuickItem *retry=nullptr;QTRY_VERIFY((retry=visualItem(window->contentItem(),"retryAiChatTurn0")));
+        QCOMPARE(retry->property("enabled").toBool(),lateInput==0);
+        if(lateInput==0) {
+            QVERIFY(QMetaObject::invokeMethod(retry,"clicked"));QTRY_COMPARE(server.requests.size(),2);
+            QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!reader->chatDraftPending());
+            QCOMPARE(server.requests.last().mid(server.requests.last().indexOf("\r\n\r\n")+4),wire);
+        }
+        const auto session=reader->aiState().value("chatSession").toString();QVERIFY(!session.isEmpty());
+        const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->documentGeneration()!=generation);QTRY_COMPARE(reader->pageCount(),1);QTRY_VERIFY(!reader->loading());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->reopenAiChat(session));QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(draft(),lateInput ? lateDraft : QString());
+        QVERIFY(!reader->aiState().value("chatTurns").toList().isEmpty());
+        QCOMPARE(reader->aiState().value("chatTurns").toList().first().toMap().value("question").toString(),sentQuestion);
+        QCOMPARE(server.requests.size(),lateInput ? 1 : 2);
     }
 
     void documentChatDraftsSurviveTabCloseAndProtectNewerWindowChanges() {
@@ -5906,8 +5980,8 @@ private slots:
         view.window->resize(700,600);QTest::qWait(100);auto *composer=visualItem(view.window->contentItem(),"aiQuestion"),*preview=visualItem(view.window->contentItem(),"prepareAiRequest");auto *panelItem=qobject_cast<QQuickItem *>(panel);QVERIFY(composer && preview && panelItem);QVERIFY(composer->isVisible());QVERIFY(preview->mapRectToItem(panelItem,preview->boundingRect()).bottom()<=panelItem->height());QVERIFY(composer->mapRectToItem(panelItem,composer->boundingRect()).bottom()<=panelItem->height());
         auto *conversation=visualItem(view.window->contentItem(),"aiConversationHistory");QVERIFY(conversation);auto *flick=conversation->property("contentItem").value<QObject *>();QVERIFY(flick);QTRY_VERIFY(flick->property("atYEnd").toBool());
         const auto capture=qEnvironmentVariable("LYRA_READER_AI_VIEWS_SNAPSHOT");if(!capture.isEmpty())QVERIFY(view.window->grabWindow().save(capture));
-        reader->clearAiChat();QVERIFY(reader->aiState().value("chatTurns").toList().isEmpty());QVERIFY(panel->property("result").toMap().value("output").toString().isEmpty());QCOMPARE(reader->aiState().value("results").toMap().value("summary").toMap(),saved);QVERIFY(reader->aiState().value("results").toMap().contains("translation"));QCOMPARE(server.requests.size(),4);
-        view.workspace.newTab();QVERIFY(view.workspace.activeReader()->aiState().isEmpty());view.workspace.selectTab(0);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Which page contains body text and caching?"));
+        reader->clearAiChat();QTRY_VERIFY(reader->aiState().value("chatTurns").toList().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(panel->property("result").toMap().value("output").toString().isEmpty());QCOMPARE(reader->aiState().value("results").toMap().value("summary").toMap(),saved);QVERIFY(reader->aiState().value("results").toMap().contains("translation"));QCOMPARE(server.requests.size(),4);
+        view.workspace.newTab();QVERIFY(view.workspace.activeReader()->aiState().isEmpty());view.workspace.selectTab(0);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString());
     }
     void documentChatStopsFollowingWhenTheReaderScrollsUp() {
         MockChatServer server;QVERIFY(server.listen());MockChatServer::Response stream;stream.holdLast=true;stream.delay=1800;QString longAnswer;for(int i=0;i<100;++i)longAnswer+=QString("Synthetic paragraph %1 with enough text to scroll.\n\n").arg(i);stream.chunks={MockChatServer::delta({{"content",longAnswer}}),MockChatServer::delta({{"content","Later streaming chunk"}}),QByteArray("data: [DONE]\n\n")};server.responses.append(stream);
