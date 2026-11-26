@@ -6,7 +6,7 @@ use lyra_reader_core::{DocumentBackend, PageIndex};
 use lyra_reader_pdfium::PdfiumBackend;
 use lyra_reader_text::{
     CitationStyle, find_citations_with, find_references, find_references_with_landings,
-    resolve_reference,
+    resolve_reference, resolve_references,
 };
 use std::collections::BTreeMap;
 
@@ -262,4 +262,54 @@ fn review_du_guo_narrative_citation_resolves_to_its_entry() {
             .contains("Generating diverse and natural 3d human motions from text")
     );
     assert!(entry.text.starts_with("Chuan Guo, Shihao Zou"));
+}
+
+#[test]
+#[ignore = "requires the local author-year PDF sample and a PDFium shared library"]
+fn single_and_two_author_citations_resolve_without_et_al() {
+    let path = common::samples_dir().join("2502.12465v1.pdf");
+    if !path.exists() {
+        eprintln!("not run: optional author-year regression sample is absent");
+        return;
+    }
+    let backend = PdfiumBackend::open(&path, None).expect("author-year sample");
+    let pages: Vec<_> = (0..backend.page_count())
+        .map(|page| {
+            (
+                page,
+                backend.raw_text_page(PageIndex(page)).expect("text page"),
+            )
+        })
+        .collect();
+    let entries = find_references(pages.iter().map(|(page, raw)| (*page, raw)), 2000);
+    let style = CitationStyle::for_document(&pages, &entries);
+    let citations = find_citations_with(&pages[0].1, &style);
+    for (labels, titles) in [
+        (
+            vec!["Shannon 1951"],
+            vec!["Prediction and entropy of printed english"],
+        ),
+        (
+            vec!["Pomerleau 1988"],
+            vec!["Alvinn: An autonomous land vehicle"],
+        ),
+        (
+            vec!["LeCun 2023", "Bachmann 2024"],
+            vec![
+                "Do large language models need sensory grounding",
+                "The pitfalls of next-token prediction",
+            ],
+        ),
+    ] {
+        let citation = citations
+            .iter()
+            .find(|citation| citation.labels == labels)
+            .expect("single/two-author citation on the opening page");
+        let resolved = resolve_references(&citation.labels, &entries);
+        assert_eq!(resolved.len(), labels.len(), "{:?}", citation.labels);
+        for ((entry, label), title) in resolved.iter().zip(labels).zip(titles) {
+            assert_eq!(entry.label, label);
+            assert!(entry.text.contains(title), "{entry:?}");
+        }
+    }
 }
