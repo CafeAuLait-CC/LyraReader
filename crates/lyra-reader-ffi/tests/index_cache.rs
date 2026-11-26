@@ -150,7 +150,11 @@ fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
         eprintln!("skipping: PDFium unavailable");
         return;
     }
-    for name in ["narrative-citation.pdf", "booktabs-bounds.pdf"] {
+    for name in [
+        "narrative-citation.pdf",
+        "booktabs-bounds.pdf",
+        "author-year-names.pdf",
+    ] {
         let (_directory, path) = copy_named_fixture("preview-upgrade", name);
         let (engine, first) = open(&path);
         let fresh = snapshot(&first);
@@ -171,6 +175,27 @@ fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
                     .text
                     .contains("Synthetic motion baseline")
             );
+        } else if name == "author-year-names.pdf" {
+            assert_eq!(fresh.references.len(), 5);
+            assert_eq!(fresh.citations[&0].len(), 4);
+            for (citation, labels) in fresh.citations[&0].iter().zip([
+                vec!["Hart 1951"],
+                vec!["Reed 1988"],
+                vec!["Quinn 2023", "Lane 2024"],
+                vec!["Vale 2010"],
+            ]) {
+                assert_eq!(citation.labels, labels);
+                assert!(citation.width_pt > 0.0 && citation.height_pt > 0.0);
+                let resolved = first
+                    .resolve_citations_on(0, citation.labels.clone())
+                    .unwrap();
+                assert_eq!(resolved.len(), labels.len());
+                for (entry, label) in resolved.iter().zip(labels) {
+                    assert_eq!(entry.reference.label, label);
+                    assert_eq!(entry.reference.page, 1);
+                    assert!(entry.reference.text.contains("Example"));
+                }
+            }
         } else {
             assert_eq!(fresh.figures.len(), 2);
             for table in &fresh.figures {
@@ -187,7 +212,12 @@ fn stale_preview_indexes_are_rebuilt_and_the_new_results_survive_a_warm_open() {
         let cache_file = cache_path(&path);
         let mut old: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache_file).unwrap()).unwrap();
-        old["format_version"] = 4.into();
+        old["format_version"] = if name == "author-year-names.pdf" {
+            6
+        } else {
+            4
+        }
+        .into();
         old["citations"] = serde_json::json!({"0": []});
         old["figures"] = serde_json::json!([]);
         fs::write(&cache_file, serde_json::to_vec(&old).unwrap()).unwrap();

@@ -103,7 +103,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Chapter/appendix captions, vector artwork, numbered equations, and longer numeric citation
 /// groups change the derived records. Rebuild older indexes so cached full-page fallbacks and
 /// missing groups do not hide the corrected previews.
-pub(crate) const FORMAT_VERSION: u32 = 6;
+///
+/// # 7
+///
+/// Full-name author lists ending before the title now retain single- and two-author
+/// entries whose publication year follows the title. Rebuild older indexes so missing
+/// or merged entries cannot keep author-year citation previews unresolved.
+pub(crate) const FORMAT_VERSION: u32 = 7;
 
 /// Tag that identifies our index cache (a JSON file at the right name is not enough).
 pub(crate) const KIND: &str = "lyra-reader-document-index";
