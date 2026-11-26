@@ -5939,7 +5939,40 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         dismiss->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Return);
         QTRY_VERIFY(!notice->isVisible());
         if(!evidence.isEmpty()){QTest::qWait(60);QVERIFY(window->grabWindow().save(evidence+"-notes-detail-"+QString::fromLatin1(QTest::currentDataTag())+".png"));}
-        auto *edit=visualItem(sidebar,"editAiReadingNote");QVERIFY(edit);QVERIFY(QMetaObject::invokeMethod(edit,"clicked"));
+        auto *detail=visualItem(sidebar,"aiReadingNoteDetailScroll");QVERIFY(detail);
+        auto *flow=visualItem(detail,"aiReadingNoteDetailFlow");QVERIFY(flow);
+        auto *title=visualItem(sidebar,"aiReadingNoteTitle"),*sourceLabel=visualItem(sidebar,"aiReadingNoteSourceLabel");
+        auto *ideas=visualItem(sidebar,"aiReadingNoteIdeasHeading"),*sourceActions=visualItem(sidebar,"aiReadingNoteSourceActions");
+        auto *edit=visualItem(sidebar,"editAiReadingNote"),*backToNotes=visualItem(sidebar,"backToReadingNotes");
+        QVERIFY(title && sourceLabel && ideas && sourceActions && edit && backToNotes);
+        QCOMPARE(sourceLabel->property("text").toString(),QString("Summary · Whole document"));
+        QVERIFY(title->property("readOnly").toBool() && title->property("selectByKeyboard").toBool());
+        const auto insideFlow=[&](QQuickItem *item) {for(auto *parent=item;parent;parent=parent->parentItem())if(parent==flow)return true;return false;};
+        for(auto *item:{title,sourceLabel,ideas,sourceActions,edit,backToNotes,rich})QVERIFY(insideFlow(item));
+        QVERIFY(title->y()<sourceLabel->y() && sourceLabel->y()<edit->y() && edit->y()<ideas->y());
+        QCOMPARE(qRound(flow->property("spacing").toDouble()),18);
+        // A long saved note scrolls its title/actions with its body, rather than
+        // shrinking the reading viewport below a fixed header and footer.
+        const auto savedNote=sidebar->property("note").toMap();auto longNote=savedNote;
+        QString longContent=completed;for(int i=0;i<18;++i)longContent+=QString("\n\nSaved paragraph %1 preserves the source without another request.").arg(i);
+        longNote["content"]=longContent;QVERIFY(sidebar->setProperty("note",longNote));
+        auto *flick=detail->property("contentItem").value<QQuickItem *>();QVERIFY(flick);
+        QTRY_VERIFY(flick->property("contentHeight").toDouble()>flick->height()+250);
+        const double beforeTitle=title->mapToScene(QPointF()).y();
+        QVERIFY(QMetaObject::invokeMethod(detail,"applyReadingWheel",Q_ARG(QVariant,0),Q_ARG(QVariant,-180)));
+        QTRY_VERIFY(flick->property("contentY").toDouble()>100);
+        QTRY_VERIFY(title->mapToScene(QPointF()).y()<beforeTitle-100);
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-notes-detail-scrolled-"+QString::fromLatin1(QTest::currentDataTag())+".png"));
+        const auto noteId=savedNote.value("id").toString();
+        QVERIFY(QMetaObject::invokeMethod(backToNotes,"clicked"));QTRY_VERIFY(!detail->isVisible());QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY((row=visualItem(sidebar,"aiReadingNoteRow0")));QVERIFY(QMetaObject::invokeMethod(row,"clicked"));
+        QTRY_COMPARE(sidebar->property("note").toMap().value("id").toString(),noteId);
+        QTRY_COMPARE(sidebar->property("note").toMap().value("content").toString(),completed);
+        // Restoring short data must clamp the saved offset, not move it below
+        // the new extent or leave the source controls outside the flow.
+        QTRY_VERIFY(flick->property("contentY").toDouble()<=qMax(0.0,flick->property("contentHeight").toDouble()-flick->height())+1);
+        QCOMPARE(server.requests.size(),1);QCOMPARE(reader->aiState().value("plan"),frozenPlan);
+        QVERIFY(QMetaObject::invokeMethod(edit,"clicked"));
         QVERIFY(QMetaObject::invokeMethod(sidebar,"change",Q_ARG(QVariant,"title"),Q_ARG(QVariant,"Retained local title")));QVERIFY(reader->hasUnsavedReadingNotes());
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,false)));QTRY_VERIFY(!sidebar->isVisible());
         QVERIFY(reader->hasUnsavedReadingNotes());QVERIFY(QMetaObject::invokeMethod(window,"openReadingNotes"));QTRY_VERIFY(sidebar->property("editing").toBool());
@@ -8431,6 +8464,36 @@ ListView {
         QCOMPARE(readBeforeSave.at(0).at(2).toMap().value("knowledgeNote").toString(),longNote);
     }
 
+    void regionPreviewWaitsForConcurrentLocalReadsWithoutSending() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("region-local-read.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
+        QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->regionPersistencePending() && !reader->pendingCommands());
+        const auto id=reader->aiRegion().value("history_id").toString();QVERIFY(!id.isEmpty());
+        bool injected=false;
+        const auto connection=connect(reader,&ReaderController::regionHistoryChanged,reader,[&] {
+            if(injected)return;
+            injected=true;
+            // A visible local history consumer can enqueue a read synchronously
+            // when the saved snapshot is published, before preview continuation.
+            QVERIFY(reader->submit("region_get",{{"id",id}}));
+        });
+        const QVariantMap settings{{"baseUrl","http://127.0.0.1:1/v1"},{"model","synthetic-no-send"}};
+        const QString question="Keep the explicitly requested preview after a local history read.";
+        reader->setAiRegionQuestion(question);reader->prepareAiRegion(settings);
+        QTRY_VERIFY(injected);QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),3000);
+        const auto plan=reader->aiState().value("plan").toMap();
+        QCOMPARE(plan.value("action").toString(),QString("RegionQuestion"));
+        const auto parts=plan.value("parts").toList();QCOMPARE(parts.size(),1);
+        QVERIFY(parts.first().toMap().value("wire_body").toString().contains(question));
+        QVERIFY(!reader->aiState().value("running").toBool() && !reader->aiState().value("planSent").toBool());
+        disconnect(connection);
+    }
+
     void readingNoteSuggestionsRequireExactPreviewAndExplicitReview() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());
@@ -8470,8 +8533,12 @@ ListView {
         close();
 
         const auto ask=[&](int number) {
+            // Preparing a region intentionally rejects an outstanding command.
+            // Closing the preceding dialog can still be draining its local read.
+            QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!reader->regionPersistencePending());
             reader->setAiRegionQuestion(QString("Synthetic discussion question %1?").arg(number));
-            reader->prepareAiRegion(settings);QTRY_VERIFY(plan().value("action").toString()=="RegionQuestion");
+            reader->prepareAiRegion(settings);QTRY_VERIFY2(plan().value("action").toString()=="RegionQuestion",
+                qPrintable(QString("pending=%1 persistence=%2 status=%3").arg(reader->pendingCommands()).arg(reader->regionPersistencePending()).arg(reader->aiState().value("status").toString())));
             QTRY_COMPARE(reader->pendingCommands(),0);respond(QString("Completed evidence %1.").arg(number));
             QVERIFY(reader->startAi("local",plan()));QTRY_VERIFY(!reader->aiState().value("running").toBool());
             reader->flushAiRegionNote(false);QTRY_VERIFY(!reader->regionPersistencePending());QTRY_COMPARE(reader->pendingCommands(),0);
@@ -8498,6 +8565,10 @@ ListView {
         };
         ask(1);if(QTest::currentTestFailed())return;
         generate("Candidate to dismiss.",1);if(QTest::currentTestFailed())return;
+        auto *expand=notes->findChild<QObject *>("expandAiReadingNoteSuggestion");QVERIFY(expand);
+        QVERIFY(!apply->property("visible").toBool() && !dismiss->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(expand,"clicked"));QTRY_VERIFY(apply->property("visible").toBool() && dismiss->property("visible").toBool());
+        QCOMPARE(server.requests.size(),2);
         QVERIFY(QMetaObject::invokeMethod(dismiss,"clicked"));QTRY_VERIFY(note().value("suggestion").toMap().isEmpty());
         QCOMPARE(note().value("content").toString(),original);QCOMPARE(server.requests.size(),2);close();
         ask(2);if(QTest::currentTestFailed())return;

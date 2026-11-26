@@ -18,6 +18,10 @@ Pane {
     property bool seeding: false
     property var editBaseline: ({})
     property string reviewId: ""
+    property bool suggestionExpanded: false
+    readonly property string selectedNoteId: note ? note.id : ""
+    readonly property var sourceEntry: note ? entries.find(entry => entry.id === note.id) || note : ({})
+    onSelectedNoteIdChanged: suggestionExpanded = false
     readonly property bool reviewing: reviewId.length > 0
     readonly property var reviewState: reader ? reader.aiState : ({})
     readonly property var reviewPlan: reviewing && reviewState.previewView === "note"
@@ -81,6 +85,13 @@ Pane {
         note = null;
         failure = "";
         command = reader.submit("ai_reading_note", {id: entries[index].id});
+    }
+    function backToList() {
+        if (!current() || editing || reviewing || command) return;
+        rememberPosition();
+        note = null;
+        preferred = "";
+        refresh();
     }
     function beginEditing() {
         if (!current() || !note || command || reader.documentRevisionPending) return;
@@ -237,19 +248,6 @@ Pane {
             Accessible.name: qsTr("Reading note order")
             onActivated: function(index) { currentIndex = index; notes.refresh(); }
         }
-        LyraToolButton {
-            objectName: "backToReadingNotes"
-            visible: notes.inlineMode && !!notes.note && !notes.editing && !notes.reviewing
-            symbol: "back"; text: qsTr("All notes"); display: AbstractButton.TextBesideIcon
-            onClicked: { notes.note = null; notes.preferred = ""; notes.refresh(); }
-        }
-        Label {
-            visible: notes.inlineMode && !!notes.note && !notes.editing && !notes.reviewing
-            text: notes.note ? notes.note.title : ""
-            textFormat: Text.PlainText; wrapMode: Text.Wrap
-            Layout.fillWidth: true; font.pixelSize: 16; font.weight: Font.DemiBold
-            color: app.colors.textPrimary
-        }
         ComboBox {
             id: picker
             visible: !notes.inlineMode
@@ -267,7 +265,7 @@ Pane {
             text: notes.failure || (notes.reviewing ? notes.reviewState.status || ""
                 : notes.command ? (notes.editing ? qsTr("Saving reading note…") : qsTr("Loading reading notes…"))
                 : !notes.entries.length ? qsTr("No matching notes.")
-                : notes.note && notes.note.status === "sourceChanged" ? qsTr("Note from an earlier PDF revision.") : "")
+                : "")
             wrapMode: Text.Wrap; textFormat: Text.PlainText; color: app.colors.textSecondary
         }
         ColumnLayout {
@@ -326,10 +324,112 @@ Pane {
             memoryReady: notes.current() && !notes.command
             Layout.fillWidth: true; Layout.fillHeight: true
             visible: !notes.editing && !notes.reviewing && !!notes.note
-            Column {
+            objectName: "aiReadingNoteDetailScroll"
+            ColumnLayout {
+                objectName: "aiReadingNoteDetailFlow"
                 width: contents.availableWidth
+                spacing: 18
+                RowLayout {
+                    Layout.fillWidth: true
+                    LyraToolButton {
+                        objectName: "backToReadingNotes"
+                        symbol: "back"; text: qsTr("All notes"); display: AbstractButton.TextBesideIcon
+                        enabled: !notes.command
+                        onClicked: notes.backToList()
+                    }
+                    Item { Layout.fillWidth: true }
+                    Label { text: qsTr("Saved"); font.pixelSize: 11; color: app.colors.textSecondary }
+                }
+                TextArea {
+                    objectName: "aiReadingNoteTitle"
+                    text: notes.note ? notes.note.title : ""
+                    textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                    readOnly: true; selectByMouse: true; selectByKeyboard: true
+                    Accessible.name: qsTr("Saved note title")
+                    Layout.fillWidth: true; font.pixelSize: 16; font.weight: Font.DemiBold
+                    padding: 0; color: app.colors.textPrimary
+                    background: null
+                }
+                Label {
+                    objectName: "aiReadingNoteSourceLabel"
+                    text: notes.sourceLabel(notes.sourceEntry)
+                    textFormat: Text.PlainText; wrapMode: Text.Wrap
+                    Layout.fillWidth: true; font.pixelSize: 11; color: app.colors.textSecondary
+                }
+                Button {
+                    objectName: "editAiReadingNote"
+                    text: qsTr("Edit note")
+                    enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending
+                    onClicked: notes.beginEditing()
+                }
+                Button {
+                    objectName: "previewAiReadingNoteUpdate"
+                    visible: !!(notes.note && notes.note.discussion_available && !notes.note.suggestion)
+                    text: qsTr("Preview update from discussion")
+                    enabled: notes.current() && !notes.command && !notes.reviewState.running
+                    onClicked: notes.beginUpdate()
+                }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    visible: !!(notes.note && notes.note.suggestion)
+                    spacing: 8
+                    Button {
+                        id: suggestionHeader
+                        Layout.fillWidth: true; Layout.minimumWidth: 0
+                        objectName: "expandAiReadingNoteSuggestion"
+                        padding: 0
+                        implicitHeight: Math.max(30, implicitContentHeight)
+                        Accessible.name: qsTr("Conversation updated · review new ideas")
+                        Accessible.description: notes.suggestionExpanded ? qsTr("Expanded") : qsTr("Collapsed")
+                        contentItem: RowLayout {
+                            spacing: 7
+                            Label { text: notes.suggestionExpanded ? "⌄" : "›"; font.pixelSize: 10; color: app.colors.textSecondary }
+                            Label {
+                                text: suggestionHeader.Accessible.name
+                                Layout.fillWidth: true; Layout.minimumWidth: 0
+                                textFormat: Text.PlainText; wrapMode: Text.Wrap
+                                font.pixelSize: 13; font.weight: Font.DemiBold; color: app.colors.textPrimary
+                            }
+                        }
+                        background: Rectangle { color: "transparent"; radius: 3; border.width: suggestionHeader.visualFocus ? 2 : 0; border.color: app.colors.focusRing }
+                        onClicked: notes.suggestionExpanded = !notes.suggestionExpanded
+                    }
+                    TextArea {
+                        objectName: "aiReadingNoteSuggestion"
+                        visible: notes.suggestionExpanded
+                        Layout.fillWidth: true
+                        text: notes.note && notes.note.suggestion ? notes.note.suggestion.content : ""
+                        readOnly: true; selectByMouse: true; selectByKeyboard: true
+                        textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                        Accessible.name: qsTr("Suggested key ideas")
+                        color: app.colors.textPrimary
+                        padding: 12
+                        background: Rectangle { radius: 8; color: app.colors.fieldBg }
+                    }
+                    Flow {
+                        visible: notes.suggestionExpanded
+                        Layout.fillWidth: true; spacing: 4
+                        Button {
+                            objectName: "applyAiReadingNoteSuggestion"
+                            text: qsTr("Apply suggestion")
+                            enabled: !notes.command
+                            onClicked: notes.resolveSuggestion(true)
+                        }
+                        Button {
+                            objectName: "dismissAiReadingNoteSuggestion"
+                            text: qsTr("Keep current note")
+                            enabled: !notes.command
+                            onClicked: notes.resolveSuggestion(false)
+                        }
+                    }
+                }
+                Label {
+                    objectName: "aiReadingNoteIdeasHeading"
+                    text: qsTr("Key ideas"); font.pixelSize: 13; font.weight: Font.DemiBold
+                    color: app.colors.textPrimary
+                }
                 AiResult {
-                    width: parent.width
+                    Layout.fillWidth: true
                     app: notes.app
                     answerName: "aiReadingNoteContent"
                     answerAccessibleName: qsTr("Saved reading note")
@@ -340,34 +440,50 @@ Pane {
                     onCitation: function(link, plan) { notes.followCitation(link, plan); }
                 }
                 Label {
-                    visible: notes.note && !!notes.note.suggestion
-                    text: qsTr("Suggested key ideas")
-                    font.bold: true
-                    color: app.colors.textSecondary
-                }
-                TextArea {
-                    objectName: "aiReadingNoteSuggestion"
-                    visible: !!text
-                    width: parent.width
-                    text: notes.note && notes.note.suggestion ? notes.note.suggestion.content : ""
-                    readOnly: true; selectByMouse: true; selectByKeyboard: true
-                    textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
-                    Accessible.name: qsTr("Suggested key ideas")
+                    text: qsTr("My thoughts"); font.pixelSize: 13; font.weight: Font.DemiBold
                     color: app.colors.textPrimary
                 }
-                Label {
-                    visible: notes.note && !!notes.note.thoughts
-                    text: qsTr("My thoughts")
-                    color: app.colors.textSecondary
-                }
                 TextArea {
-                    visible: !!text
-                    width: parent.width
+                    objectName: "aiReadingNoteSavedThoughts"
+                    Layout.fillWidth: true
                     text: notes.note ? notes.note.thoughts : ""
+                    placeholderText: qsTr("Add your own thoughts…")
                     readOnly: true; selectByMouse: true; selectByKeyboard: true
                     textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
                     Accessible.name: qsTr("My thoughts")
                     color: app.colors.textPrimary
+                    padding: 8
+                    background: Rectangle { radius: 8; color: app.colors.noteBg }
+                }
+                Label {
+                    visible: !!(notes.note && notes.note.status === "sourceChanged")
+                    Layout.fillWidth: true
+                    text: qsTr("The source document has changed. The saved knowledge and source snapshot are preserved.")
+                    textFormat: Text.PlainText; wrapMode: Text.Wrap
+                    font.pixelSize: 11; color: app.colors.warningFg
+                }
+                Flow {
+                    objectName: "aiReadingNoteSourceActions"
+                    Layout.fillWidth: true; spacing: 4
+                    ComboBox {
+                        id: sources
+                        objectName: "aiReadingNotePages"
+                        model: (notes.note ? notes.note.source_pages : []).map(page => qsTr("Page %1").arg(page))
+                        visible: count > 0
+                        Accessible.name: qsTr("Source page")
+                    }
+                    Button {
+                        text: qsTr("Go to source")
+                        visible: sources.count > 0
+                        enabled: notes.current() && sources.currentIndex >= 0
+                        onClicked: {
+                            const page = notes.note.source_pages[sources.currentIndex] - 1;
+                            if (notes.current() && page >= 0 && page < notes.reader.pageCount) {
+                                app.navigate(page);
+                                notes.close();
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -430,61 +546,6 @@ Pane {
                     wrapMode: Text.Wrap
                     onTextChanged: if (activeFocus) notes.change("thoughts", text)
                 }
-            }
-        }
-        RowLayout {
-            visible: !notes.editing && !notes.reviewing && !!notes.note
-            ComboBox {
-                id: sources
-                objectName: "aiReadingNotePages"
-                model: (notes.note ? notes.note.source_pages : []).map(page => qsTr("Page %1").arg(page))
-                visible: count > 0
-                Accessible.name: qsTr("Source page")
-            }
-            Button {
-                text: qsTr("Go to source")
-                visible: sources.count > 0
-                enabled: notes.current() && sources.currentIndex >= 0
-                onClicked: {
-                    const page = notes.note.source_pages[sources.currentIndex] - 1;
-                    if (notes.current() && page >= 0 && page < notes.reader.pageCount) {
-                        app.navigate(page);
-                        notes.close();
-                    }
-                }
-            }
-            Item { Layout.fillWidth: true }
-            Button {
-                objectName: "editAiReadingNote"
-                text: qsTr("Edit note")
-                enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending
-                onClicked: notes.beginEditing()
-            }
-        }
-        Flow {
-            Layout.fillWidth: true
-            visible: !notes.editing && !notes.reviewing && !!notes.note
-            spacing: 4
-            Button {
-                objectName: "previewAiReadingNoteUpdate"
-                visible: !!(notes.note && notes.note.discussion_available && !notes.note.suggestion)
-                text: qsTr("Preview update from discussion")
-                enabled: notes.current() && !notes.command && !notes.reviewState.running
-                onClicked: notes.beginUpdate()
-            }
-            Button {
-                objectName: "applyAiReadingNoteSuggestion"
-                visible: !!(notes.note && notes.note.suggestion)
-                text: qsTr("Use suggested key ideas")
-                enabled: !notes.command
-                onClicked: notes.resolveSuggestion(true)
-            }
-            Button {
-                objectName: "dismissAiReadingNoteSuggestion"
-                visible: !!(notes.note && notes.note.suggestion)
-                text: qsTr("Dismiss suggestion")
-                enabled: !notes.command
-                onClicked: notes.resolveSuggestion(false)
             }
         }
         RowLayout {

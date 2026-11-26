@@ -863,7 +863,8 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     if(operation==QStringLiteral("region_export_markdown") || operation==QStringLiteral("region_thumbnail"))return;
     if(operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get")) {
         if(error.isEmpty())m_regionHistory=result.toMap();else m_regionHistory.insert(QStringLiteral("error"),error);
-        emit regionHistoryChanged();
+        QPointer<ReaderController> alive(this);const auto generation=m_generation;
+        emit regionHistoryChanged();if(!alive || generation!=m_generation)return;
         if(id==m_regionNoteSaveId) {
             m_regionNoteSaveId=0;
             if(error.isEmpty() && m_regionNoteDraft==m_regionNoteSaveSnapshot)discardRegionNoteDraft();

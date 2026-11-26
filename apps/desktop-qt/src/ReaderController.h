@@ -318,6 +318,7 @@ private:
     void markRegionDirty(bool localInput=false);
     void scheduleRegionPersistence();
     void finishAiRegionSave(const QVariantMap &result,const QString &error);
+    void resumeAiRegionPreview();
     void finishDeferredRegionAction();
     bool regionNeedsSave()const;
     bool regionRequestRunning()const;

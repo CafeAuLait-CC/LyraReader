@@ -1,4 +1,5 @@
 #include "ReaderController.h"
+#include <QPointer>
 
 bool ReaderController::regionNeedsSave()const {
     return m_aiRegion.contains(QStringLiteral("image_png")) && !m_aiRegion.value(QStringLiteral("saved")).toBool();
@@ -10,6 +11,12 @@ bool ReaderController::regionPersistencePending()const {
     return m_readingNoteSaveId || m_aiRegionSaveId || (m_regionSaveError.isEmpty() && (m_regionSaveTimer.isActive() || m_regionFlushRequested));
 }
 void ReaderController::initRegionPersistence() {
+    // History consumers may enqueue local reads while a saved snapshot is
+    // published. Continue only after those commands drain, outside their signals.
+    connect(this,&ReaderController::commandsChanged,this,[this] {
+        if(m_regionContinuationPending && !m_pendingCommands)
+            QMetaObject::invokeMethod(this,&ReaderController::resumeAiRegionPreview,Qt::QueuedConnection);
+    });
     m_regionSaveTimer.setSingleShot(true);m_regionSaveTimer.setInterval(750);
     connect(&m_regionSaveTimer,&QTimer::timeout,this,[this]{
         if(!m_regionSaveError.isEmpty())return;
@@ -101,6 +108,7 @@ void ReaderController::finishDeferredRegionAction() {
     });
 }
 void ReaderController::finishAiRegionSave(const QVariantMap &result,const QString &error) {
+    QPointer<ReaderController> alive(this);const auto generation=m_generation;
     m_aiRegionSaveId=0;m_regionSaveError=error;
     if(error.isEmpty() && result.value(QStringLiteral("saved_id"))==m_aiRegion.value(QStringLiteral("history_id"))) {
         m_aiRegion.insert(QStringLiteral("persisted"),true);m_aiRegion.insert(QStringLiteral("saved"),m_regionRevision==m_regionSnapshotRevision);
@@ -108,14 +116,29 @@ void ReaderController::finishAiRegionSave(const QVariantMap &result,const QStrin
     }
     if(!error.isEmpty()){m_regionSaveTimer.stop();m_regionFlushRequested=false;m_pendingRegionCapture.clear();m_regionClearPending=false;}
     if(m_regionContinuationPending) {
-        const auto settings=m_regionContinuationSettings;const bool current=m_regionContinuationEpoch==m_aiRegionEpoch && m_regionContinuationQuestion==m_aiRegion.value(QStringLiteral("question")).toString();
-        m_regionContinuationPending=false;m_regionContinuationSettings.clear();
-        if(error.isEmpty() && current && m_aiRegion.value(QStringLiteral("saved")).toBool())prepareAiRegion(settings);
-        else {m_aiState.insert(QStringLiteral("status"),error.isEmpty()?tr("The question changed. Preview it again before sending."):error);emit aiStateChanged();}
+        const bool current=m_regionContinuationEpoch==m_aiRegionEpoch && m_regionContinuationQuestion==m_aiRegion.value(QStringLiteral("question")).toString();
+        if(error.isEmpty() && current && m_aiRegion.value(QStringLiteral("saved")).toBool())resumeAiRegionPreview();
+        else {
+            m_regionContinuationPending=false;m_regionContinuationSettings.clear();
+            m_aiState.insert(QStringLiteral("status"),error.isEmpty()?tr("The question changed. Preview it again before sending."):error);emit aiStateChanged();
+        }
     }
+    if(!alive || generation!=m_generation)return;
     if(error.isEmpty()) {
         scheduleRegionPersistence();
         if(!regionNeedsSave())finishDeferredRegionAction();
     }
-    emit aiRegionChanged();emit regionNoteDraftChanged();
+    emit aiRegionChanged();if(alive && generation==m_generation)emit regionNoteDraftChanged();
+}
+void ReaderController::resumeAiRegionPreview() {
+    if(!m_regionContinuationPending || !m_document || m_loading || m_pendingCommands || m_aiRegionSaveId
+       || regionNeedsSave() || !m_regionSaveError.isEmpty() || m_aiState.value(QStringLiteral("running")).toBool())return;
+    const bool current=m_regionContinuationEpoch==m_aiRegionEpoch
+        && m_regionContinuationQuestion==m_aiRegion.value(QStringLiteral("question")).toString();
+    const auto settings=m_regionContinuationSettings;
+    m_regionContinuationPending=false;m_regionContinuationSettings.clear();
+    if(!current) {
+        m_aiState.insert(QStringLiteral("status"),tr("The question changed. Preview it again before sending."));emit aiStateChanged();return;
+    }
+    prepareAiRegion(settings);
 }
