@@ -28,10 +28,7 @@ Item {
     readonly property string originalKey: recordId + ":" + paragraph
     readonly property bool originalExpanded: isActive || task.originalOpen[originalKey] === true
     readonly property bool collapsed: !isActive && !isExpanded
-    readonly property bool hasMore: blocks.length > 1 || answerView.implicitHeight > previewHeight + .5
-    readonly property real previewHeight: 3 * (Math.ceil(metrics.height) + 5)
-    FontMetrics { id: metrics; font.pixelSize: 14 }
-    function focusDisclosure() { if (disclosure.visible) disclosure.forceActiveFocus(Qt.TabFocusReason); }
+    function focusDisclosure() { answerPreview.focusAction(); }
     function focusAnswer() { answerView.focusAnswer(); }
     Component.onCompleted: if (!isActive) task.needEntry(recordId)
     onRecordIdChanged: if (!isActive) task.needEntry(recordId)
@@ -73,10 +70,15 @@ Item {
             visible: row.task.showOriginal && !!row.original
             Layout.fillWidth: true; Layout.minimumWidth: 0
             spacing: 2
-            Item {
+            TranslationInlinePreview {
+                id: originalPreview
+                app: row.app; textArea: originalText; naturalHeight: originalText.contentHeight
+                collapsed: !row.originalExpanded; maximumLines: 3
+                actionEnabled: !row.isActive
+                actionName: "aiTranslationOriginalMore" + row.index
+                fallback: originalDisclosure
                 Layout.fillWidth: true
-                implicitHeight: row.originalExpanded ? originalText.contentHeight : Math.min(originalText.contentHeight, row.previewHeight)
-                clip: true
+                onActivated: { const closing = row.originalExpanded; row.task.setOriginalOpen(row.originalKey, !closing); if (closing) row.task.revealRecord(row.recordId); }
                 TextArea {
                     id: originalText
                     objectName: "aiTranslationOriginal" + row.index
@@ -94,18 +96,23 @@ Item {
                 }
             }
             ToolButton {
-                objectName: "aiTranslationOriginalMore" + row.index
-                visible: !row.isActive && (row.originalExpanded || originalText.contentHeight > row.previewHeight + .5)
+                id: originalDisclosure
+                objectName: originalPreview.footerNeeded ? "aiTranslationOriginalMore" + row.index : ""
+                visible: originalPreview.footerNeeded
                 text: row.originalExpanded ? qsTr("Less") : qsTr("More")
                 palette.buttonText: app.colors.accent
                 onClicked: { const closing = row.originalExpanded; row.task.setOriginalOpen(row.originalKey, !closing); if (closing) row.task.revealRecord(row.recordId); }
             }
         }
-        Item {
+        TranslationInlinePreview {
+            id: answerPreview
+            app: row.app; textArea: answerView.textControl; naturalHeight: answerView.implicitHeight
+            collapsed: row.collapsed; additionalContent: row.blocks.length > 1
+            actionEnabled: !row.isActive && row.last
+            actionName: "aiTranslationMore" + row.index; fallback: disclosure
             Layout.fillWidth: true; Layout.minimumWidth: 0
-            implicitHeight: row.collapsed ? Math.min(answerView.implicitHeight, row.previewHeight) : answerView.implicitHeight
             visible: !!row.answer
-            clip: true
+            onActivated: row.task.expandRecord(row.recordId, !row.isExpanded)
             AiResult {
                 id: answerView
                 width: parent.width
@@ -134,8 +141,8 @@ Item {
             Item { Layout.fillWidth: true }
             ToolButton {
                 id: disclosure
-                objectName: "aiTranslationMore" + row.index
-                visible: !row.isActive && row.last && (row.isExpanded || row.hasMore)
+                objectName: answerPreview.footerNeeded ? "aiTranslationMore" + row.index : ""
+                visible: answerPreview.footerNeeded
                 text: row.isExpanded ? qsTr("Less") : qsTr("More")
                 palette.buttonText: app.colors.accent
                 onClicked: row.task.expandRecord(row.recordId, !row.isExpanded)

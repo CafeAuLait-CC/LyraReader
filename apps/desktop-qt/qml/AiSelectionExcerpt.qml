@@ -14,6 +14,14 @@ Pane {
     property bool partial: false
     property bool expanded: false
     property string fullText: ""
+    function toggleExcerpt() {
+        if (!expanded && partial && !prepared && range) {
+            const excerpt = app.selectedTextResult(range);
+            if (excerpt.error !== undefined) { app.operationStatus = excerpt.error; return; }
+            fullText = excerpt.text;
+        }
+        expanded = !expanded;
+    }
     onTextChanged: { expanded = false; fullText = ""; }
     onRangeChanged: { expanded = false; fullText = ""; }
     Layout.fillWidth: true; Layout.minimumWidth: 0
@@ -39,31 +47,45 @@ Pane {
             ColumnLayout {
                 Layout.fillWidth: true; Layout.minimumWidth: 0
                 spacing: 2
-                Label {
-                    id: excerptLabel
-                    objectName: card.labelName
+                TranslationInlinePreview {
+                    id: excerptPreview
+                    app: card.app; textArea: excerptDisplay; naturalHeight: excerptLabel.implicitHeight
+                    collapsed: !card.expanded; maximumLines: 3
+                    additionalContent: card.partial && !card.fullText
+                    actionName: card.labelName + "More"; fallback: footer
                     Layout.fillWidth: true; Layout.minimumWidth: 0
-                    textFormat: Text.PlainText; wrapMode: Text.Wrap
-                    maximumLineCount: card.expanded ? 2147483647 : 3
-                    elide: card.expanded ? Text.ElideNone : Text.ElideRight
-                    text: card.fullText || card.text || qsTr("Select a passage in the document.")
-                    color: app.colors.textSecondary; font.pixelSize: 13
-                    Accessible.name: card.title
+                    onActivated: card.toggleExcerpt()
+                    Control {
+                        id: excerptLabel
+                        objectName: card.labelName
+                        // Keep canonical source bytes outside TextEdit's display-only
+                        // newline normalization, as the former static label did.
+                        readonly property string text: card.fullText || card.text || qsTr("Select a passage in the document.")
+                        width: parent.width
+                        padding: 0; background: null; focusPolicy: Qt.NoFocus
+                        font.pixelSize: 13
+                        Accessible.role: Accessible.StaticText
+                        Accessible.name: card.title; Accessible.description: text
+                        contentItem: TextArea {
+                            id: excerptDisplay
+                            text: excerptLabel.text; font: excerptLabel.font
+                            padding: 0; background: null
+                            readOnly: true; selectByMouse: false; selectByKeyboard: false
+                            focusPolicy: Qt.NoFocus
+                            textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
+                            color: app.colors.textSecondary
+                            Accessible.ignored: true
+                        }
+                    }
                 }
                 ToolButton {
-                    objectName: card.labelName + "More"
-                    visible: card.expanded || excerptLabel.truncated || card.partial
+                    id: footer
+                    objectName: excerptPreview.footerNeeded ? card.labelName + "More" : ""
+                    visible: excerptPreview.footerNeeded
                     text: card.expanded ? qsTr("Less") : qsTr("More")
                     palette.buttonText: app.colors.accent
                     Accessible.name: card.expanded ? qsTr("Collapse selected passage") : qsTr("Expand selected passage")
-                    onClicked: {
-                        if (!card.expanded && card.partial && !card.prepared && card.range) {
-                            const excerpt = app.selectedTextResult(card.range);
-                            if (excerpt.error !== undefined) { app.operationStatus = excerpt.error; return; }
-                            card.fullText = excerpt.text;
-                        }
-                        card.expanded = !card.expanded;
-                    }
+                    onClicked: card.toggleExcerpt()
                 }
             }
         }

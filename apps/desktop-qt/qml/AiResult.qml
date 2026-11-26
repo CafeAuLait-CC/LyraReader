@@ -16,6 +16,7 @@ ColumnLayout {
     property bool showActions: true
     property bool plainText: sent.kind === "reading_translation"
     property var citationPages: undefined
+    readonly property var textControl: !collapsibleSummary ? answerLoader.item : null
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function revealCursor(area, owner, generation, target) {

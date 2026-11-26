@@ -1,5 +1,6 @@
 #include <QEventLoop>
 #include "DisplayCalibration.h"
+#include "ReadingTextGeometry.h"
 #include "AuditController.h"
 #include "NavigationController.h"
 #include "FileDialogNavigation.h"
@@ -62,6 +63,7 @@
 #include <QQuickItemGrabResult>
 #include <QQuickTextDocument>
 #include <QTextCursor>
+#include <QTextBoundaryFinder>
 #include <QTextDocument>
 #include <QTextTable>
 #include <QRegularExpression>
@@ -161,6 +163,7 @@ protected:
 
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
+    qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
@@ -4852,6 +4855,38 @@ private slots:
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
     }
 
+    void inlineReadingDisclosuresUseNativeGlyphBoundariesAndLeaveAttachmentsIntact() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->resize(700,600);
+        QQmlComponent component(&view.engine);component.setData(R"QML(import QtQuick
+import QtQuick.Controls
+TextArea { width: 230; font.family: "serif"; font.pixelSize: 18; padding: 0; wrapMode: TextEdit.Wrap; textFormat: TextEdit.RichText; readOnly: true; selectByMouse: true; selectByKeyboard: true }
+)QML",QUrl("qrc:/checks/InlineGeometry.qml"));
+        QScopedPointer<QObject> object(component.create());QVERIFY2(object,qPrintable(component.errorString()));auto *area=qobject_cast<QQuickItem *>(object.data());QVERIFY(area);area->setParentItem(view.window->contentItem());
+        ReadingTextGeometry geometry;
+        const QStringList passages{QStringLiteral("Office affinity efficient ligatures remain whole. ").repeated(20),QString::fromUtf8("组合字 é 👩‍💻 与 emoji 必须保持完整。 ").repeated(20),QString::fromUtf8("تظل الحروف العربية متصلة وتبقى حدود النص صحيحة. ").repeated(20)};
+        for(const auto &text:passages){
+            area->setProperty("text",text);QTRY_VERIFY(area->property("contentHeight").toDouble()>200);
+            auto *document=area->property("textDocument").value<QQuickTextDocument *>();QVERIFY(document && document->textDocument());
+            const auto beforePlain=document->textDocument()->toPlainText(),beforeHtml=document->textDocument()->toHtml();
+            const auto left=area->property("leftPadding").toDouble(),right=area->property("rightPadding").toDouble();
+            const auto metrics=geometry.tail(document,180,3,60,area->width()-left-right);QVERIFY(metrics.value("measured").toBool());QVERIFY(metrics.value("hidden").toBool());QVERIFY(metrics.value("inline").toBool());
+            const auto x=metrics.value("x").toDouble();QVERIFY(x>=0 && x+60<=area->width());QVERIFY(metrics.value("bottom").toDouble()<=180.5);
+            const auto plain=document->textDocument()->toPlainText();const auto cut=metrics.value("cut_position").toInt();QVERIFY(cut>=0 && cut<plain.size());QTextBoundaryFinder boundary(QTextBoundaryFinder::Grapheme,plain);boundary.setPosition(cut);QVERIFY(boundary.isAtBoundary());
+            QRectF cursor;QVERIFY(QMetaObject::invokeMethod(area,"positionToRectangle",Q_RETURN_ARG(QRectF,cursor),Q_ARG(int,cut)));
+            // Document geometry excludes the style's actual padding. Compare in control coordinates.
+            const auto edge=left+(metrics.value("rtl").toBool()?x+63:x-3);QVERIFY2(std::abs(cursor.x()-edge)<1.01,qPrintable(QString("Native cursor edge %1, suffix prefix %2").arg(cursor.x()).arg(edge)));
+            QCOMPARE(document->textDocument()->toPlainText(),beforePlain);QCOMPARE(document->textDocument()->toHtml(),beforeHtml);
+        }
+        area->setProperty("text",QStringLiteral("x")+QString(QChar(0x0301)).repeated(8192));
+        auto *combining=area->property("textDocument").value<QQuickTextDocument *>();QVERIFY(combining);QTRY_VERIFY(combining->textDocument()->toPlainText().size()>8000);
+        const auto bounded=geometry.tail(combining,area->property("contentHeight").toDouble()+1,0,60,area->width());QVERIFY(bounded.value("measured").toBool());QVERIFY(!bounded.value("inline").toBool());
+        area->setProperty("text",QStringLiteral("<p>Keep this figure visible.</p><p><img src='qrc:/icons/document.svg' width='100' height='50'/></p>"));
+        QTRY_VERIFY(area->property("contentHeight").toDouble()>50);auto *document=area->property("textDocument").value<QQuickTextDocument *>();QVERIFY(document);
+        const auto attachment=geometry.tail(document,area->property("contentHeight").toDouble()+1,0,60,area->width());QVERIFY(attachment.value("measured").toBool());QVERIFY(!attachment.value("inline").toBool());
+        QVERIFY(!geometry.tail(nullptr,180,3,60,230).value("measured").toBool());QVERIFY(!geometry.tail(document,-1,3,60,230).value("measured").toBool());QVERIFY(!geometry.tail(document,180,3,60,std::numeric_limits<double>::quiet_NaN()).value("measured").toBool());
+    }
+
     void translationTimelineScrollsLazilyAndReplaysOnlyTheReviewedSource_data() {
         QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
@@ -4901,7 +4936,12 @@ private slots:
         auto *originalText=visualItem(window->contentItem(),"aiTranslationOriginal0");QVERIFY(originalText);QVERIFY(std::abs(originalText->mapToScene(QPointF{}).x()-primary->mapToScene(QPointF{}).x())<1);
         auto *indicator=visualItem(window->contentItem(),"aiTranslationOriginalIndicator");QVERIFY(indicator);QCOMPARE(indicator->width(),qreal(14));QCOMPARE(indicator->height(),qreal(14));
         const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");QVERIFY(settleReaderViewport(window));if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-translation-collapsed-"+theme+".png"));
-        auto *more=visualItem(window->contentItem(),"aiTranslationMore0");QVERIFY(more && more->isVisible());more->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_COMPARE(timeline->property("count").toInt(),sources.size());
+        auto *more=visualItem(window->contentItem(),"aiTranslationMore0");QVERIFY(more && more->isVisible());
+        auto *inlinePreview=visualItem(window->contentItem(),"aiTranslationMore0Preview");QVERIFY(inlinePreview);QTRY_VERIFY(inlinePreview->property("inlineAction").toBool());QVERIFY(more->mapRectToItem(inlinePreview,more->boundingRect()).bottom()<=inlinePreview->height()+1);
+        const auto measuredValue=inlinePreview->property("metrics");const auto lineMetrics=measuredValue.metaType()==QMetaType::fromType<QJSValue>()?measuredValue.value<QJSValue>().toVariant().toMap():measuredValue.toMap();QVERIFY(lineMetrics.contains("baseline"));
+        const auto actionBaseline=more->mapToItem(inlinePreview,QPointF(0,more->baselineOffset())).y();QVERIFY2(std::abs(actionBaseline-lineMetrics.value("baseline").toDouble())<=1,qPrintable(QString("Action baseline %1, text baseline %2").arg(actionBaseline).arg(lineMetrics.value("baseline").toDouble())));
+        auto *sourcePreview=visualItem(window->contentItem(),"aiTranslationOriginalMore0Preview");QVERIFY(sourcePreview);QTRY_VERIFY(sourcePreview->property("inlineAction").toBool());
+        more->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_COMPARE(timeline->property("count").toInt(),sources.size());
         const auto materialized=[&]{int count=0;auto *content=timeline->property("contentItem").value<QQuickItem *>();if(content)for(auto *item:content->childItems())if(item->objectName().startsWith("aiSavedTranslationRow"))++count;return count;};
         QTRY_VERIFY(materialized()>0);QVERIFY(materialized()<30);QVERIFY(materialized()<sources.size()/2);
         QVERIFY(QMetaObject::invokeMethod(timeline,"positionViewAtIndex",Q_ARG(int,int(sources.size()-1)),Q_ARG(int,0)));

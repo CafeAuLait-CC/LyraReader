@@ -1,4 +1,5 @@
 #include "DisplayCalibration.h"
+#include "ReadingTextGeometry.h"
 #include "AuditController.h"
 #include "NavigationController.h"
 #include "FileDialogNavigation.h"
@@ -73,6 +74,7 @@ int main(int argc, char **argv) {
 #endif
     }
     qmlRegisterUncreatableType<ReaderController>("LyraReader", 1, 0, "ReaderController", QStringLiteral("Created by the application"));
+    qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
