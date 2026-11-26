@@ -651,6 +651,7 @@ Pane {
                 AiResult {
                     Layout.fillWidth: true
                     app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
+                    collapsibleSummary: (aiPanel.wholeSummary || aiPanel.selectedSummary) && !aiPanel.running && !!aiPanel.result.output
                     onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
                 }
                 ToolButton {

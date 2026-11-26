@@ -4845,6 +4845,62 @@ private slots:
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
     }
 
+    void summarySectionsFollowMacHeadingAndLiteralBoundaries_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void summarySectionsFollowMacHeadingAndLiteralBoundaries() {
+        QFETCH(QString,theme);
+        const auto plainMap=[](const QVariant &value){return value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toVariant().toMap():value.toMap();};
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        const QString markdown="## Overview\n\n**Synthetic overview** [p.1] untrusted [p.99].\n\n## Key ideas\n\n~~~md\n## Literal heading\n[p.99] <img src=\"https://not-requested.invalid/image\">\n~~~\n\n## By section\n\nA collapsed synthetic section [p.1].\n\n## Math\n\n$$\n## Not a section\n$$\n";
+        server.responses.append({{MockChatServer::delta({{"content",markdown}}),QByteArray("data: [DONE]\n\n")},10,200});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-summary-sections.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        RecordingClipboardWorkspace workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);const auto close=qScopeGuard([&]{window->close();});window->resize(1000,800);window->setProperty("appearance",theme);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-sections"}});QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        reader->setAiInput("action",5);window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",20}});
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());const auto wire=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QQuickItem *sections=nullptr;QTRY_VERIFY((sections=visualItem(window->contentItem(),"aiSummarySections")));
+        const auto groups=plainMap(sections->property("parsed")).value("groups").toList();QVERIFY(groups.size()>=4);
+        int bySection=-1,overview=-1,keyIdeas=-1,math=-1;
+        for(int i=0;i<groups.size();++i){const auto title=groups[i].toMap().value("title").toString();if(title=="Overview")overview=i;else if(title=="Key ideas")keyIdeas=i;else if(title=="By section")bySection=i;else if(title=="Math")math=i;QVERIFY(title!="Literal heading" && title!="Not a section");}
+        QVERIFY(overview>=0 && keyIdeas>=0 && bySection>=0 && math>=0);
+        const auto heading=[&](int index){return visualItem(window->contentItem(),QString("aiSummaryHeading%1").arg(index));};
+        QVERIFY(heading(overview) && heading(keyIdeas) && heading(bySection));
+        QVERIFY(heading(overview)->parentItem()->property("open").toBool());QVERIFY(heading(keyIdeas)->parentItem()->property("open").toBool());QVERIFY(!heading(bySection)->parentItem()->property("open").toBool());
+        auto *literal=visualItem(window->contentItem(),QString("aiSummaryCode%1_0").arg(keyIdeas));QVERIFY(literal);
+        QVERIFY(literal->property("text").toString().contains("## Literal heading"));QCOMPARE(literal->property("textFormat").toInt(),0);
+        const auto edge=qobject_cast<QQuickItem *>(panel)->mapRectToScene(qobject_cast<QQuickItem *>(panel)->boundingRect()).right();
+        QTRY_VERIFY(sections->mapRectToScene(sections->boundingRect()).right()<=edge+.5);
+        auto *copy=visualItem(window->contentItem(),"aiAnswerTextCopy");QVERIFY(copy);QVERIFY(QMetaObject::invokeMethod(copy,"clicked"));
+        QCOMPARE(workspace.copied,reader->aiState().value("output").toString());QVERIFY(workspace.copied.contains(markdown));
+        QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-summary-folded-"+theme+".png"));
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);heading(bySection)->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);
+        QTRY_VERIFY(heading(bySection)->parentItem()->property("open").toBool());
+        QQuickItem *body=nullptr;QTRY_VERIFY((body=visualItem(window->contentItem(),QString("aiAnswerTextSection%1_0").arg(bySection))));
+        QVERIFY(body->property("text").toString().contains("href=\"p.1\""));QVERIFY(!body->property("text").toString().contains("href=\"p.99\""));
+        QVERIFY(QMetaObject::invokeMethod(body,"linkActivated",Q_ARG(QString,QString("p.1"))));QTRY_COMPARE(window->property("currentPage").toInt(),0);
+        QVERIFY(!window->property("operationStatus").toString().contains("citation"));
+        heading(bySection)->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(!heading(bySection)->parentItem()->property("open").toBool());
+        QCOMPARE(server.requests.size(),1);QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),wire);
+        QCOMPARE(reader->aiState().value("output").toString().contains(markdown),true);
+        QCOMPARE(panel->property("result").toMap().value("output").toString(),reader->aiState().value("output").toString());
+        QQmlComponent grammar(&engine);grammar.setData("import QtQuick\nimport \"qrc:/qml/SummaryPresentation.js\" as P\nQtObject { property var groups: P.sections(\"## Real\\n```md\\n## Not a heading\") }",QUrl("qrc:/summary-grammar-check.qml"));QScopedPointer<QObject> model(grammar.create());QVERIFY2(model,qPrintable(grammar.errorString()));
+        const auto incomplete=plainMap(model->property("groups")).value("groups").toList();QCOMPARE(incomplete.size(),1);QCOMPARE(incomplete.first().toMap().value("blocks").toList().first().toMap().value("kind").toString(),QString("code"));
+        QQmlComponent bounded(&engine);
+        bounded.setData(R"QML(import QtQuick
+import "qrc:/qml/SummaryPresentation.js" as P
+QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").join("\n")) }
+)QML",QUrl("qrc:/summary-bounded-check.qml"));
+        QScopedPointer<QObject> limited(bounded.create());QVERIFY2(limited,qPrintable(bounded.errorString()));
+        const auto overflow=plainMap(limited->property("value"));QVERIFY(overflow.value("limited").toBool());const auto retained=overflow.value("groups").toList();QVERIFY(retained.size()<=256);QVERIFY(retained.last().toMap().value("blocks").toList().last().toMap().value("text").toString().endsWith("text"));
+    }
+
     void documentChatReferenceControlsReviewBeforeSending_data() {
         QTest::addColumn<QString>("theme");
         QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
@@ -5974,7 +6030,7 @@ private slots:
         QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),2);QCOMPARE(server.requests[1].mid(server.requests[1].indexOf("\r\n\r\n")+4),body);QVERIFY(panel->property("result").toMap().value("output").toString().contains("Synthetic translation"));auto *translationAnswer=view.window->findChild<QObject *>("aiAnswerText");QVERIFY(translationAnswer);QVERIFY(!translationAnswer->property("text").toString().contains("href="));
         reader->setAiInput("view","summary");QCOMPARE(reader->aiState().value("results").toMap().value("summary").toMap(),saved);QVERIFY(panel->property("result").toMap().value("output").toString().contains("Synthetic summary"));
         // Selected-text summary is a real shared action, not a shell-side prompt.
-        reader->setAiInput("action",5);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().contains("plan"));QCOMPARE(reader->aiState().value("plan").toMap().value("action").toString(),QString("SummarizeSelection"));QCOMPARE(server.requests.size(),2);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("source_pages").toList(),QVariantList{1});QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),3);auto *selectedAnswer=view.window->findChild<QObject *>("aiAnswerText");QVERIFY(selectedAnswer);QTRY_VERIFY(selectedAnswer->property("text").toString().contains("Synthetic selected text"));QVERIFY(!selectedAnswer->property("text").toString().contains("href=\"p.2"));const auto oldPage=view.window->property("currentPage").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,"p.2")));QCOMPARE(view.window->property("currentPage").toInt(),oldPage);QVERIFY(view.window->property("operationStatus").toString().contains("cannot be verified"));saved=reader->aiState().value("results").toMap().value("summary").toMap();
+        reader->setAiInput("action",5);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().contains("plan"));QCOMPARE(reader->aiState().value("plan").toMap().value("action").toString(),QString("SummarizeSelection"));QCOMPARE(server.requests.size(),2);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("source_pages").toList(),QVariantList{1});QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),3);QQuickItem *selectedAnswer=nullptr;QTRY_VERIFY((selectedAnswer=visualItem(view.window->contentItem(),"aiAnswerText")));QTRY_VERIFY(selectedAnswer->property("text").toString().contains("Synthetic selected text"));QVERIFY(!selectedAnswer->property("text").toString().contains("href=\"p.2"));const auto oldPage=view.window->property("currentPage").toInt();QVERIFY(QMetaObject::invokeMethod(panel,"followLink",Q_ARG(QVariant,"p.2")));QCOMPARE(view.window->property("currentPage").toInt(),oldPage);QVERIFY(view.window->property("operationStatus").toString().contains("cannot be verified"));saved=reader->aiState().value("results").toMap().value("summary").toMap();
         reader->setAiInput("view","chat");QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().value("plan").toMap().value("action").toString()=="DocumentChat");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);plan=reader->aiState().value("plan").toMap();QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),4);
         QQuickItem *sources=nullptr;QTRY_VERIFY((sources=visualItem(view.window->contentItem(),"aiHistoryAnswer0Sources")));QVERIFY(!sources->property("checked").toBool());QVERIFY(sources->property("visible").toBool());
         view.window->resize(700,600);QTest::qWait(100);auto *composer=visualItem(view.window->contentItem(),"aiQuestion"),*preview=visualItem(view.window->contentItem(),"prepareAiRequest");auto *panelItem=qobject_cast<QQuickItem *>(panel);QVERIFY(composer && preview && panelItem);QVERIFY(composer->isVisible());QVERIFY(preview->mapRectToItem(panelItem,preview->boundingRect()).bottom()<=panelItem->height());QVERIFY(composer->mapRectToItem(panelItem,composer->boundingRect()).bottom()<=panelItem->height());

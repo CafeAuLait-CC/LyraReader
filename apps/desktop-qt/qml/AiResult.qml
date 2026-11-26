@@ -5,12 +5,14 @@ import "ReaderLogic.js" as Logic
 
 ColumnLayout {
     id: result
+    Layout.minimumWidth: 0
     required property var app
     required property var value
     property string answerName: "aiAnswerText"
     property bool showSources: false
     property bool inlineConversation: false
     property int bodySize: 13
+    property bool collapsibleSummary: false
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function revealCursor(area, owner, generation, target) {
@@ -42,8 +44,13 @@ ColumnLayout {
     spacing: 4
     readonly property var sent: value.responsePlan || ({})
     readonly property string outputText: value.output || ""
-    readonly property var formulaMarkup: sent.kind === "reading_translation" || !app.currentReader
-        ? [] : app.currentReader.aiMathMarkup(outputText)
+    function markupFor(text) {
+        if (sent.kind === "reading_translation") return text;
+        const formulas = app.currentReader ? app.currentReader.aiMathMarkup(text) : [];
+        return Logic.answerMarkup(text, sent.action === "TranslateSelection" ? false
+            : sent.action === "DocumentChat" ? (sent.sources || []).map(source => source.page) : sent.source_pages || [],
+            formulas, String(app.colors.accent));
+    }
     Label {
         objectName: result.answerName + "UnitTitle"
         visible: !!result.value.unitTitle
@@ -60,15 +67,25 @@ ColumnLayout {
         Accessible.description: text
         Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
     }
+    Loader {
+        Layout.fillWidth: true; Layout.minimumWidth: 0
+        sourceComponent: result.collapsibleSummary ? sections : answer
+    }
+    Component {
+        id: sections
+        AiSummarySections {
+            app: result.app; value: result.value; renderer: result
+            answerName: result.answerName; viewport: result.viewport
+            onCitation: function(link, plan) { result.citation(link, plan); }
+        }
+    }
+    Component {
+        id: answer
     TextArea {
         id: answerArea
         objectName: result.answerName
         Layout.fillWidth: true
-        text: result.sent.kind === "reading_translation" ? result.outputText
-              : Logic.answerMarkup(result.outputText,
-                  result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat"
-                      ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []),
-                  result.formulaMarkup, String(app.colors.accent))
+        text: result.markupFor(result.outputText)
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
         textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
         Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
@@ -76,6 +93,7 @@ ColumnLayout {
         Accessible.name: qsTr("AI response")
         Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
         onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }
+    }
     }
     ToolButton {
         id: sources
@@ -140,7 +158,7 @@ ColumnLayout {
     }
     RowLayout {
         visible: !!result.value.output
-        Button { visible: !result.inlineConversation; text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
+        Button { objectName: result.answerName + "Copy"; visible: !result.inlineConversation; text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
         Label {
             objectName: result.answerName + "Usage"
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
