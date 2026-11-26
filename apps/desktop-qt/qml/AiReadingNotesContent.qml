@@ -48,6 +48,13 @@ Pane {
     readonly property bool noteWriteReady: current() && !command && !reader.pendingCommands && !reader.hasUnsavedReadingNotes
     background: Rectangle { color: app.colors.panelBg }
     property bool inlineMode: false
+    component NoteAction: LyraToolButton {
+        theme: notes.app.colors
+        display: AbstractButton.TextOnly
+        implicitHeight: 24
+        padding: 4
+        font.pixelSize: 13; font.weight: Font.Normal
+    }
     signal closeRequested()
     function close() { closeRequested(); }
     function copyAll() {
@@ -576,17 +583,18 @@ Pane {
                     textFormat: Text.PlainText; wrapMode: Text.Wrap
                     Layout.fillWidth: true; font.pixelSize: 11; color: app.colors.textSecondary
                 }
-                Button {
+                NoteAction {
                     objectName: "editAiReadingNote"
                     text: qsTr("Edit note")
                     enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending && !notes.reader.readingNoteSaving
                         && (!notes.reader.readingNoteDraft.id || notes.reader.readingNoteDraft.id === notes.selectedNoteId)
                     onClicked: notes.beginEditing()
                 }
-                Button {
+                NoteAction {
                     objectName: "previewAiReadingNoteUpdate"
                     visible: !!(notes.note && notes.canUpdateDiscussion && !notes.note.suggestion)
-                    text: qsTr("Preview update from discussion")
+                    text: qsTr("Update from conversation")
+                    Accessible.description: qsTr("Review the exact request before sending.")
                     enabled: notes.noteWriteReady && !notes.reviewState.running
                     onClicked: notes.beginUpdate()
                 }
@@ -630,13 +638,13 @@ Pane {
                     Flow {
                         visible: notes.suggestionExpanded
                         Layout.fillWidth: true; spacing: 4
-                        Button {
+                        NoteAction {
                             objectName: "applyAiReadingNoteSuggestion"
                             text: qsTr("Apply suggestion")
                             enabled: notes.noteWriteReady
                             onClicked: notes.resolveSuggestion(true)
                         }
-                        Button {
+                        NoteAction {
                             objectName: "dismissAiReadingNoteSuggestion"
                             text: qsTr("Keep current note")
                             enabled: notes.noteWriteReady
@@ -689,13 +697,13 @@ Pane {
                         if (visible) notes.revealThoughtsFailure();
                         else notes.thoughtsFailureTicket = null;
                     }
-                    Button {
+                    NoteAction {
                         objectName: "retryAiReadingThoughts"
                         text: qsTr("Save thoughts again")
                         enabled: notes.current() && !notes.reader.readingNoteSaving && !notes.reader.documentRevisionPending
                         onClicked: { notes.finishInput(); notes.reader.saveReadingNoteDraft(); }
                     }
-                    Button {
+                    NoteAction {
                         objectName: "discardAiReadingThoughts"
                         text: qsTr("Discard unsaved thoughts")
                         enabled: notes.current() && !notes.reader.readingNoteSaving
@@ -746,7 +754,7 @@ Pane {
                     RowLayout {
                         id: sourceButtons
                         spacing: 4
-                        Button {
+                        NoteAction {
                             id: locateWholeDocument
                             objectName: "locateAiReadingWholeDocument"
                             visible: !!notes.sourceContext.whole_document
@@ -757,7 +765,7 @@ Pane {
                         }
                         Repeater {
                             model: notes.sourceContext.whole_document ? [] : notes.note ? notes.note.source_pages || [] : []
-                            LyraToolButton {
+                            NoteAction {
                                 id: sourcePage
                                 required property int modelData
                                 objectName: "aiReadingNoteSourcePage" + modelData
@@ -815,7 +823,7 @@ Pane {
                         }
                     }
                 }
-                Button {
+                NoteAction {
                     id: continueNote
                     objectName: "continueAiReadingNoteConversation"
                     visible: !!notes.regionEntry || !!notes.sourceContext.chat_id
@@ -905,11 +913,14 @@ Pane {
                         onActiveFocusChanged: if (activeFocus) notes.revealEditInput(thoughts, editThoughts)
                     }
                 }
-                Flow {
+                RowLayout {
                     id: editActions
                     objectName: "aiReadingNoteEditActions"
                     Layout.fillWidth: true; spacing: 4
-                    Button {
+                    ReadingPrimaryButton {
+                        app: notes.app
+                        Layout.fillWidth: true
+                        font.pixelSize: 12; font.weight: Font.Medium
                         id: saveEditNote
                         objectName: "saveAiReadingNote"
                         text: qsTr("Save changes")
@@ -917,9 +928,10 @@ Pane {
                         onClicked: { notes.finishInput(); notes.save(); }
                         onActiveFocusChanged: if (activeFocus) notes.revealEditInput(editActions, saveEditNote)
                     }
-                    Button {
+                    NoteAction {
                         id: cancelEditNote
-                        text: qsTr("Cancel editing")
+                        text: qsTr("Cancel")
+                        Accessible.name: qsTr("Cancel editing note")
                         enabled: !notes.command
                         onClicked: notes.cancelEditing()
                         onActiveFocusChanged: if (activeFocus) notes.revealEditInput(editActions, cancelEditNote)
