@@ -83,6 +83,19 @@ ColumnLayout {
             ListView {
                 id: tabStrip
                 objectName:"tabStrip"
+                footer: Item {
+                    width: 36
+                    height: tabStrip.height
+                    LyraToolButton {
+                        objectName: "openPdfTabButton"
+                        x: 4
+                        anchors.verticalCenter: parent.verticalCenter
+                        symbol: "plus"
+                        text: qsTr("Open PDF in a new tab (Ctrl+O)")
+                        onActiveFocusChanged: if (activeFocus) tabStrip.positionViewAtEnd()
+                        onClicked: app.openDialog()
+                    }
+                }
                 property var tabDrag:null
                 readonly property real tabWidth: Math.max(120, Math.min(230, (width - 30) / Math.max(1, count) - 4))
                 function dropGap(x) {
@@ -298,11 +311,7 @@ ColumnLayout {
                 width:2;height:36;y:6;color:app.colors.accent
                 Accessible.ignored:true
             }
-            LyraToolButton {
-                symbol: "plus"
-                text: qsTr("Open PDF in a new tab (Ctrl+O)")
-                onClicked: app.openDialog()
-            }
+
         }
         Rectangle {
             anchors.bottom: parent.bottom

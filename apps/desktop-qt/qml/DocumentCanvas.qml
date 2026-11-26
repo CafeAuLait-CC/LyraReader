@@ -207,9 +207,17 @@ Item {
         pendingHeightChange=pendingHeightChange || heightChanged;
         resizeReader=app.currentReader;resizeEpoch=app.positionRestoreEpoch;
         resizeRevision=app.currentReader.data.document_revision;
-        viewportSettle.restart();
+        if (app.sidePanelMotionActive) viewportSettle.stop();
+        else viewportSettle.restart();
+    }
+    Connections {
+        target: canvas.app
+        function onSidePanelMotionActiveChanged() {
+            if (!canvas.app.sidePanelMotionActive) canvas.viewportChanged();
+        }
     }
     function settleViewport() {
+        if (app.sidePanelMotionActive) return;
         const changed=pendingHeightChange;pendingHeightChange=false;
         if(resizeReader!==app.currentReader || resizeEpoch!==app.positionRestoreEpoch || app.positionRestoring
                 || resizeRevision!==app.currentReader.data.document_revision || app.currentReader.loading
@@ -495,7 +503,7 @@ Item {
                         pageIndex: sheet.modelData.index
                         rasterScale: app.zoom
                         tilesEnabled: true
-                        rasterDemandPaused:canvas.paperMotionActive
+                        rasterDemandPaused:canvas.paperMotionActive || app.sidePanelMotionActive
                         revisionContinuityAllowed:!canvas.paperActive
                         visibleRegion:sheet.sourceViewport()
                         Accessible.role: Accessible.Graphic

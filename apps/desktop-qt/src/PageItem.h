@@ -112,7 +112,8 @@ private:
     QVector<QMetaObject::Connection> m_connections;
     QVector<QMetaObject::Connection> m_windowConnections;
     int m_page=-1,m_level=-1000;
-    double m_scale=1,m_lastDeviceScale=0,m_imageScale=0;
+    double m_scale=1,m_lastDeviceScale=0;
+    QRectF m_imageSource{0,0,1,1};
     ResidentImage m_image;
     QList<TileSpec> m_tiles,m_previousTiles;
     QHash<QString,ResidentImage> m_tileImages,m_previousImages;
@@ -129,7 +130,7 @@ private:
     quint64 m_textureEpoch=0;
     struct RevisionFrame {
         ResidentImage image;
-        double imageScale=0;
+        QRectF imageSource{0,0,1,1};
         QList<TileSpec> tiles;
         QHash<QString,ResidentImage> images;
         quint64 sourceEpoch=0;

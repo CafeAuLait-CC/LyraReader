@@ -308,26 +308,26 @@ QColor PageItem::translationInkColor(const QColor &paper)const {
 void PageItem::refresh() {
     syncBudget();if(!demandVisible())return;
     const bool wasLoaded=loaded();
-    const auto fallback=m_controller->cachedPage(m_page,fallbackScale(),m_embedded);
+    const double scale=fallbackScale();
+    const auto fallback=m_controller->cachedPage(m_page,scale,m_embedded);
     bool blocked=false;
     if(!fallback.isNull() && fallback.cacheKey()!=m_image.pixels.cacheKey()) {
         auto retained=ResidentImage::retain(fallback);
-        if(!retained.isNull()) {
-            m_image=std::move(retained);
-            const auto dimensions=m_controller->pages().at(m_page).toMap();
-            const double scale=fallbackScale();
-            // A budget-clamped bitmap can have a lower density. Keep that coarse
-            // fallback usable without inventing precise padding coordinates.
-            m_imageScale=m_image.pixels.width()==qCeil(dimensions.value("width").toDouble()*scale)
-                && m_image.pixels.height()==qCeil(dimensions.value("height").toDouble()*scale)?scale:0;
-        }else blocked=true;
+        if(!retained.isNull())m_image=std::move(retained);else blocked=true;
     }
     const bool fallbackReady=!fallback.isNull() && m_image.pixels.cacheKey()==fallback.cacheKey();
     m_traceBaseCurrent=fallbackReady;
-    if(fallbackReady)m_usingBackdrop=false;
-    else if(m_image.isNull()) {
+    if(fallbackReady) {
+        m_usingBackdrop=false;
+        const auto dimensions=m_controller->pages().at(m_page).toMap();
+        const double w=dimensions.value("width").toDouble()*scale,h=dimensions.value("height").toDouble()*scale;
+        // Padding belongs to the source page, independently of an inset display
+        // rectangle. A budget-clamped coarse fallback keeps its full-image UVs.
+        m_imageSource=m_image.pixels.width()==std::ceil(w) && m_image.pixels.height()==std::ceil(h)
+            ? QRectF(0,0,w/m_image.pixels.width(),h/m_image.pixels.height()) : QRectF(0,0,1,1);
+    } else if(m_image.isNull()) {
         auto retained=ResidentImage::retain(m_controller->cachedBackdrop(m_page,m_embedded));
-        if(!retained.isNull()){m_image=std::move(retained);m_imageScale=0;m_usingBackdrop=true;}
+        if(!retained.isNull()){m_image=std::move(retained);m_imageSource=QRectF(0,0,1,1);m_usingBackdrop=true;}
     }
     QSet<QString> wanted;bool complete=true;
     for(const auto &tile:m_tiles) {
@@ -420,11 +420,9 @@ QSGNode *PageItem::paintFrame(QSGNode *old,bool previous,bool &blocked) {
     };
     const QRectF paper= m_paperLayout ? QRectF(0,0,width()/m_scale,m_paperLayout->height) : QRectF(0,0,width()/m_scale,height()/m_scale);
     const auto baseRole=!traceEnabled?QString{}:previous?QStringLiteral("previous-raster"):m_usingBackdrop?QStringLiteral("history"):m_traceBaseCurrent?(!needsTiles() && m_demandCurrent && m_refined?QStringLiteral("page-raster"):QStringLiteral("preview")):QStringLiteral("previous-raster");
-    const double imageScale=previous?m_revisionFrame->imageScale:m_imageScale;
-    // PDFium ceil-allocates the crop; its matrix still uses the exact scale.
-    // Exclude that fractional trailing pixel instead of stretching it into the page.
-    const QRectF baseSource=image.isNull() || imageScale<=0 ? QRectF(0,0,1,1)
-        : QRectF(0,0,paper.width()*imageScale/image.pixels.width(),paper.height()*imageScale/image.pixels.height());
+    // Retain the original page's UV extent even when a consumer has an inset
+    // frame, or when an accepted revision is temporarily fitted into a new frame.
+    const auto baseSource=previous?m_revisionFrame->imageSource:m_imageSource;
     collect(QStringLiteral("base"),image,paper,baseSource,baseRole);
     const auto tiles=[&](const QList<TileSpec> &specs,const QHash<QString,ResidentImage> &images,const QString &role) {
         for(const auto &tile:specs) {
@@ -492,7 +490,7 @@ QSGNode *PageItem::updatePaintNode(QSGNode *old,UpdatePaintNodeData *) {
     if(ready) {
         std::lock_guard lock(m_frameMutex);
         if(!m_acceptedFrame || root->acceptedDemandEpoch!=m_textureEpoch) {
-            auto frame=std::make_shared<RevisionFrame>();frame->image=m_image;frame->imageScale=m_imageScale;frame->tiles=m_tiles;frame->images=m_tileImages;frame->sourceEpoch=m_sourceEpoch;
+            auto frame=std::make_shared<RevisionFrame>();frame->image=m_image;frame->imageSource=m_imageSource;frame->tiles=m_tiles;frame->images=m_tileImages;frame->sourceEpoch=m_sourceEpoch;
             m_acceptedFrame=std::move(frame);root->acceptedDemandEpoch=m_textureEpoch;
         }
     }

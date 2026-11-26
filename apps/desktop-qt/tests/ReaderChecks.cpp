@@ -261,7 +261,8 @@ static bool settleReaderViewport(QQuickWindow *window) {
     while(timer.elapsed()<5000) {
         QTest::qWait(40);auto *list=visualItem(window->contentItem(),"pageList");if(!list)return false;
         const QVariantList current{window->width(),window->height(),window->effectiveDevicePixelRatio(),window->property("calibrationFactor"),window->property("zoom"),list->width(),list->height(),list->property("contentWidth"),list->property("contentHeight"),list->property("contentX"),list->property("contentY")};
-        if(current==previous && !window->property("positionRestoring").toBool())++stable;else stable=0;
+        if(current==previous && !window->property("positionRestoring").toBool()
+                && !window->property("sidePanelMotionActive").toBool())++stable;else stable=0;
         if(stable>=3)return true;previous=current;
     }
     return false;
@@ -3089,6 +3090,163 @@ private slots:
             QVERIFY(bundled.open(QIODevice::ReadOnly));QVERIFY(mac.open(QIODevice::ReadOnly));QCOMPARE(bundled.readAll(),mac.readAll());
         }
     }
+    void thumbnailInsetsPreservePageEdgesAspectAndScreenDensity() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("thumbnail-edge-bands.pdf");
+        {QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QSizeF(400,500),QPageSize::Point));pdf.setPageMargins(QMarginsF(0,0,0,0));
+            QPainter painter(&pdf);QVERIFY(painter.isActive());painter.fillRect(QRectF(0,0,400,500),Qt::white);
+            painter.fillRect(QRectF(0,50,5,150),Qt::red);painter.fillRect(QRectF(395,50,5,150),Qt::blue);
+            painter.fillRect(QRectF(50,495,150,5),Qt::green);}
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->setProperty("reduceMotion",true);view.window->setProperty("paperAppearance","original");
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QQuickItem *raster=nullptr;
+        QTRY_VERIFY((raster=visualItem(view.window->contentItem(),"thumbnailRaster0")) && raster->property("refined").toBool() && raster->property("texturesReady").toBool());
+        QTest::qWait(80);const auto frame=view.window->grabWindow();QVERIFY(!frame.isNull());
+        const auto rect=raster->mapRectToScene(raster->boundingRect());const double sx=double(frame.width())/view.window->width(),sy=double(frame.height())/view.window->height();
+        const auto crop=frame.copy(QRect(qFloor(rect.x()*sx),qFloor(rect.y()*sy),qCeil(rect.width()*sx),qCeil(rect.height()*sy)));
+        int red=0,blue=0,green=0;
+        for(int y=0;y<crop.height();++y)for(int x=0;x<crop.width();++x) {
+            const auto c=crop.pixelColor(x,y);
+            if(c.red()>c.green()+60 && c.red()>c.blue()+60)++red;
+            if(c.blue()>c.green()+60 && c.blue()>c.red()+60)++blue;
+            if(c.green()>c.blue()+60 && c.green()>c.red()+60)++green;
+        }
+        qInfo()<<"Thumbnail edge bands"<<red<<blue<<green;
+        QVERIFY(red>10);QVERIFY2(blue>10,"The right page edge was cropped by the thumbnail inset");
+        QVERIFY2(green>10,"The bottom page edge was cropped by the thumbnail inset");
+        QVERIFY(qAbs(raster->width()/400-raster->height()/500)<.000001);
+        const double density=raster->width()/400*view.window->effectiveDevicePixelRatio();
+        QTRY_VERIFY(!reader->cachedPage(0,density,true).isNull());
+        QVERIFY(!reader->hasUnsavedChanges());
+    }
+    void tabAddButtonFollowsTheLastTabInScrollableContent() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        auto *strip=visualItem(view.window->contentItem(),"tabStrip");QVERIFY(strip);
+        for(int count:{1,2,8}) {
+            while(view.workspace.tabs().size()<count)view.workspace.newTab();
+            for(int width:{1600,700}) {
+                view.window->setWidth(width);QTest::qWait(70);
+                QVERIFY(QMetaObject::invokeMethod(strip,"positionViewAtEnd"));
+                QQuickItem *surface=nullptr,*add=nullptr;
+                QTRY_VERIFY((surface=visualItem(strip,"tabSurface"+QString::number(count-1)))
+                    && (add=visualItem(strip,"openPdfTabButton")));
+                const auto last=surface->parentItem()->mapRectToItem(strip,surface->parentItem()->boundingRect());
+                const auto button=add->mapRectToItem(strip,add->boundingRect());
+                QVERIFY2(qAbs(button.left()-last.right()-4)<1.01,
+                    qPrintable(QString("Plus gap %1 at %2 tabs, width %3").arg(button.left()-last.right()).arg(count).arg(width)));
+                QVERIFY(button.left()>=0 && button.right()<=strip->width()+1);
+                if(count==1)QVERIFY(button.right()<400);
+                const auto evidence=qEnvironmentVariable("LYRA_READER_RASTER_EVIDENCE");
+                if(!evidence.isEmpty() && width==700 && count!=2)
+                    QVERIFY(view.window->grabWindow().save(evidence+QString("-tabs-%1.png").arg(count)));
+                if(count==8) {
+                    add->setFocus(false);
+                    strip->setProperty("contentX",strip->property("originX"));
+                    add->forceActiveFocus(Qt::TabFocusReason);
+                    QTRY_VERIFY(add->mapRectToItem(strip,add->boundingRect()).right()<=strip->width()+1);
+                }
+                auto *accessible=QAccessible::queryAccessibleInterface(add);QVERIFY(accessible);
+                QVERIFY(accessible->text(QAccessible::Name).contains("Open PDF"));
+            }
+        }
+    }
+    void sidePanelDrawersKeepFixedContentAndPauseRasterDemand_data() {
+        QTest::addColumn<bool>("left");QTest::newRow("left")<<true;QTest::newRow("right-ai")<<false;
+    }
+    void sidePanelDrawersKeepFixedContentAndPauseRasterDemand() {
+        QFETCH(bool,left);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->setWidth(1600);view.window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(QCoreApplication::applicationDirPath()+"/fixtures/qt-nine-pages.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==9 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(view.window));
+        if(!left)QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));
+        QTRY_VERIFY(!view.window->property("sidePanelMotionActive").toBool());
+        auto *drawer=visualItem(view.window->contentItem(),left?"leftSidebarDrawer":"aiSidebarDrawer");
+        auto *pane=visualItem(view.window->contentItem(),left?"readerSidebar":"aiDock");
+        auto *canvas=visualItem(view.window->contentItem(),"documentCanvas");QVERIFY(drawer && pane && canvas);
+        QTRY_VERIFY(drawer->width()>200);
+        auto *host=drawer->property("contentHost").value<QQuickItem *>();QVERIFY(host);
+        const auto full=drawer->property("panelWidth").toDouble(),contentWidth=pane->width();
+        QQuickItem *page=nullptr;QTRY_VERIFY((page=visualItem(view.window->contentItem(),"pdfPage0")) && page->property("texturesReady").toBool());
+        QTRY_COMPARE(reader->pendingRasters(),0);QTest::qWait(100);QTRY_COMPARE(reader->pendingRasters(),0);
+        const auto completed=reader->completedRasters();const auto pageNumber=view.window->property("currentPage");
+        for(double progress:{.25,.5,.75}) {
+            QVERIFY(QQmlProperty::write(drawer,"progressOverride",progress));QTest::qWait(35);
+            QVERIFY(qAbs(drawer->width()-full*progress)<1.01);QCOMPARE(pane->width(),contentWidth);
+            QVERIFY(qAbs(host->x()-(left?drawer->width()-full:0))<1.01);
+            QVERIFY(page->property("rasterDemandPaused").toBool());
+            QCOMPARE(reader->completedRasters(),completed);QCOMPARE(reader->pendingRasters(),0);
+            QCOMPARE(view.window->property("currentPage"),pageNumber);
+            const auto evidence=qEnvironmentVariable("LYRA_READER_RASTER_EVIDENCE");
+            if(!evidence.isEmpty())QVERIFY(view.window->grabWindow().save(evidence
+                +QString("-drawer-%1-%2.png").arg(left?"left":"right").arg(qRound(progress*100))));
+        }
+        QVERIFY(QQmlProperty::write(drawer,"progressOverride",-1));QTRY_VERIFY(!view.window->property("sidePanelMotionActive").toBool());
+        QTRY_VERIFY(!page->property("rasterDemandPaused").toBool());
+        view.window->setProperty("reduceMotion",false);
+        if(left)view.window->setProperty("sidebarVisible",false);
+        else QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,false)));
+        QVERIFY(drawer->property("moving").toBool());QVERIFY(!host->isEnabled());
+        QTRY_VERIFY_WITH_TIMEOUT(!drawer->property("moving").toBool() && !drawer->isVisible(),1500);
+        if(left)view.window->setProperty("sidebarVisible",true);
+        else QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));
+        QVERIFY(drawer->property("moving").toBool());
+        // Reduce Motion changed during a slide must stop it and expose its target
+        // immediately, rather than waiting for another frame or animation timer.
+        view.window->setProperty("reduceMotion",true);QCoreApplication::processEvents();
+        QVERIFY(!drawer->property("moving").toBool());QCOMPARE(drawer->property("progress").toDouble(),1.0);
+        QTRY_VERIFY(qAbs(drawer->width()-full)<1.01);
+        QCOMPARE(pane->width(),contentWidth);
+    }
+    void lyraWorkspaceButtonsToggleTheDockWithoutClosingTheirRow() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->setWidth(1600);view.window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(view.window));
+        reader->setAiInput("view","chat");reader->setAiInput("question","Retained chat question");
+        reader->setAiInput("view","summary");reader->setAiInput("question","Retained selection question");
+        QVERIFY(QMetaObject::invokeMethod(view.window,"setSecondaryRow",Q_ARG(QVariant,"lyra"),Q_ARG(QVariant,false)));
+        for(const auto &name:{"lyraWorkspacesummary","lyraWorkspacetranslation","lyraWorkspacechat","lyraReadingNotes"}) {
+            auto *button=visualItem(view.window->contentItem(),name);QVERIFY(button);
+            QVERIFY(QMetaObject::invokeMethod(button,"clicked"));QTRY_VERIFY(view.window->property("aiPanelVisible").toBool());
+            QCOMPARE(view.window->property("secondaryRow").toString(),QString("lyra"));QTRY_VERIFY(button->property("selected").toBool());
+            QVERIFY(QMetaObject::invokeMethod(button,"clicked"));QTRY_VERIFY(!view.window->property("aiPanelVisible").toBool());
+            QCOMPARE(view.window->property("secondaryRow").toString(),QString("lyra"));QVERIFY(!button->property("selected").toBool());
+            const auto input=reader->aiState().value("input").toMap();
+            QCOMPARE(input.value("selectionQuestion").toString(),QString("Retained selection question"));
+            QCOMPARE(input.value("chatQuestion").toString(),QString("Retained chat question"));
+        }
+        auto *summary=visualItem(view.window->contentItem(),"lyraWorkspacesummary"),*chat=visualItem(view.window->contentItem(),"lyraWorkspacechat");QVERIFY(summary && chat);
+        QVERIFY(QMetaObject::invokeMethod(summary,"clicked"));QTRY_VERIFY(view.window->property("aiPanelVisible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(chat,"clicked"));QTRY_VERIFY(view.window->property("aiPanelVisible").toBool());QTRY_VERIFY(chat->property("selected").toBool());
+        QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+        auto *question=visualItem(view.window->contentItem(),"aiQuestion");QVERIFY(question);
+        question->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(question->hasActiveFocus());
+        QVERIFY(QMetaObject::invokeMethod(chat,"clicked"));QTRY_VERIFY(!view.window->property("aiPanelVisible").toBool());
+        auto *reading=visualItem(view.window->contentItem(),"readingArea");QVERIFY(reading);
+        const auto inReading=[&] {auto *item=view.window->activeFocusItem();while(item){if(item==reading)return true;item=item->parentItem();}return false;};
+        QTRY_VERIFY(inReading());
+    }
+    void initialFitWaitsForSettledSidePanelGeometry() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("drawer-initial-fit.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.window->setWidth(1200);view.window->setProperty("reduceMotion",false);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(view.window));QTRY_VERIFY(!view.window->property("positionRestoring").toBool());
+        auto *area=visualItem(view.window->contentItem(),"readingArea"),*page=visualItem(view.window->contentItem(),"pdfPage0");QVERIFY(area && page);
+        QTRY_VERIFY(page->property("texturesReady").toBool());
+        QVERIFY2(page->width()<=area->width()-48+1,qPrintable(QString("Initial page %1, settled viewport %2").arg(page->width()).arg(area->width())));
+        QVERIFY(!view.window->property("sidePanelMotionActive").toBool());
+        // A restoration or explicit fit can arrive before the next layout polish.
+        view.window->setProperty("reduceMotion",true);
+        view.window->setProperty("sidebarVisible",false);QVERIFY(settleReaderViewport(view.window));
+        view.window->setProperty("sidebarVisible",true);
+        QVERIFY(QMetaObject::invokeMethod(view.window,"fitWidth"));
+        QVERIFY(settleReaderViewport(view.window));
+        QVERIFY2(page->width()<=area->width()-48+1,qPrintable(QString("Fit before polish: page %1, viewport %2").arg(page->width()).arg(area->width())));
+    }
     void thumbnailActivationMovesThePageSelectionBorder_data() {
         QTest::addColumn<QString>("appearance");
         QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
@@ -4038,12 +4196,13 @@ private slots:
         QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QStringLiteral("Draft kept while reading"));
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));QTRY_VERIFY(dock->isVisible());QCOMPARE(window->findChild<QObject *>("aiPanel"),panel);
         QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));auto *handle=visualItem(window->contentItem(),"aiPanelResizeHandle");QVERIFY(handle);
+        QTRY_VERIFY(!window->property("sidePanelMotionActive").toBool());QTRY_COMPARE(dock->width(),360.0);
         const auto grip=handle->mapToScene(QPointF(3,40)).toPoint();
         QTest::mousePress(window,Qt::LeftButton,Qt::NoModifier,grip);QTest::mouseMove(window,grip-QPoint(40,0),30);QTest::mouseRelease(window,Qt::LeftButton,Qt::NoModifier,grip-QPoint(40,0));
         QTRY_COMPARE(window->property("aiPanelWidth").toInt(),400);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),400);
         QVERIFY(QMetaObject::invokeMethod(window,"resizeAiPanel",Q_ARG(QVariant,360),Q_ARG(QVariant,true)));
         handle->forceActiveFocus();QTest::keyClick(window,Qt::Key_Right);QTRY_COMPARE(window->property("aiPanelWidth").toInt(),340);QCOMPARE(workspace.preference("aiPanelWidth").toInt(),340);
-        window->resize(700,820);QTest::qWait(50);if(window->width()<1100){QVERIFY(!left->isVisible());QTRY_VERIFY_WITH_TIMEOUT(view->width()>=350,5000);}
+        window->resize(700,820);QTest::qWait(50);if(window->width()<1100){QTRY_VERIFY(!left->isVisible());QTRY_VERIFY_WITH_TIMEOUT(view->width()>=350,5000);}
         if(!evidence.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(evidence+"/ai-dock-narrow.png"));}
         window->setProperty("searchVisible",true);if(window->width()<1200)QTRY_VERIFY(!dock->isVisible());
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));if(window->width()<1200)QVERIFY(!window->property("searchVisible").toBool());
@@ -4212,6 +4371,10 @@ private slots:
         const auto rect=[&](QQuickItem *item){return item->mapRectToItem(picker,item->boundingRect());};
         const auto buttonRects=[&]{QList<QRectF> result;for(auto *button:buttons)result.append(rect(button));return result;};
         QTRY_VERIFY(picker->isVisible() && picker->width()>200);QTRY_COMPARE(rect(indicator),rect(buttons[0]));
+        auto *dock=visualItem(window->contentItem(),"aiDock");QVERIFY(dock);
+        QTRY_VERIFY(!window->property("sidePanelMotionActive").toBool());QTRY_COMPARE(dock->width(),280.0);
+        QTRY_COMPARE(picker->width(),dock->width()-20);
+        QTRY_COMPARE(rect(buttons[0]).width(),(picker->width()-4)/4);
         const auto original=buttonRects();const auto generation=reader->documentGeneration();
         buttons[0]->forceActiveFocus(Qt::TabFocusReason);
         for (int i=1;i<=4;++i) {
@@ -6386,9 +6549,22 @@ private slots:
             });
             QVERIFY(sticky != records.cend());
             badgeName = "foldedNoteBadge_" + sticky->toMap().value("id").toString();
+            // This is a hover check, independent of a previously restored offset.
+            QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,sticky->toMap().value("page")),
+                    Q_ARG(QVariant,sticky->toMap().value("rect").toMap().value("y"))));
+            QVERIFY(settleReaderViewport(window));
         }
         QQuickItem *badge = nullptr;
-        QTRY_VERIFY((badge = visualItem(window->contentItem(), badgeName)) && badge->isVisible());
+        // The sidebar can contain the same owned note in a hidden thumbnail.
+        // Hover input belongs to the full-size reader, never that duplicate.
+        auto *canvas=visualItem(window->contentItem(),"documentCanvas");QVERIFY(canvas);
+        const auto visibleBadge=[&](auto &&find,QQuickItem *item)->QQuickItem * {
+            if(item->objectName()==badgeName && item->isVisible())return item;
+            for(auto *child:item->childItems())if(auto *found=find(find,child))return found;
+            return nullptr;
+        };
+        QTRY_VERIFY2((badge=visibleBadge(visibleBadge,canvas)),qPrintable(QString("Missing visible reader badge %1, zoom %2, page %3")
+            .arg(badgeName).arg(window->property("zoom").toDouble()).arg(window->property("currentPage").toInt())));
         const auto center = badge->mapToScene(QPointF(badge->width() / 2, badge->height() / 2)).toPoint();
         QVERIFY(QRect(QPoint(), window->size()).contains(center));
         QTest::mouseMove(window, QPoint(5, 5));

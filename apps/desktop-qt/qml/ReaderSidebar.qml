@@ -187,22 +187,30 @@ Pane {
                             color: app.currentReader.paperBackground(app.paperAppearance)
                             border.width: 1
                             border.color: app.colors.pageEdge
-                            PdfPage {
-                                resourceActive: thumbnail.y + thumbnail.height > thumbnails.contentY && thumbnail.y < thumbnails.contentY + thumbnails.height
-                                anchors.fill: parent
-                                anchors.margins: parent.border.width
-                                embeddedAnnotations: true
-                                paperAppearance: app.paperAppearance
-                                controller: app.currentReader
-                                pageIndex: thumbnail.index
-                                rasterScale: miniature.thumbnailScale
-                            }
-                            AnnotationsLayer {
-                                anchors.fill: parent
-                                app: sidebarPanel.app
-                                page: thumbnail.index
-                                zoom: parent.thumbnailScale
-                                ownOnly: true
+                            Item {
+                                id: thumbnailPage
+                                anchors.centerIn: parent
+                                readonly property real pageScale: Math.min((miniature.width - 2 * miniature.border.width) / thumbnail.modelData.width,
+                                    (miniature.height - 2 * miniature.border.width) / thumbnail.modelData.height)
+                                width: thumbnail.modelData.width * pageScale
+                                height: thumbnail.modelData.height * pageScale
+                                PdfPage {
+                                    objectName: "thumbnailRaster" + thumbnail.index
+                                    resourceActive: thumbnail.y + thumbnail.height > thumbnails.contentY && thumbnail.y < thumbnails.contentY + thumbnails.height
+                                    anchors.fill: parent
+                                    embeddedAnnotations: true
+                                    paperAppearance: app.paperAppearance
+                                    controller: app.currentReader
+                                    pageIndex: thumbnail.index
+                                    rasterScale: thumbnailPage.pageScale
+                                }
+                                AnnotationsLayer {
+                                    anchors.fill: parent
+                                    app: sidebarPanel.app
+                                    page: thumbnail.index
+                                    zoom: thumbnailPage.pageScale
+                                    ownOnly: true
+                                }
                             }
                         }
                         Label {

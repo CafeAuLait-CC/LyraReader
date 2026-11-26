@@ -119,6 +119,18 @@ ApplicationWindow {
         }
     }
     onAiPanelVisibleChanged: if (!aiPanelVisible) returnFocusFromAiPanel()
+    // Restore and the first fit use settled chrome geometry, independently of
+    // animation frames. User-initiated panel toggles animate after restoration.
+    readonly property bool immediatePanelLayout: reduceMotion || positionRestoring
+    readonly property bool sidePanelMotionActive: leftDrawer.moving || editDrawer.moving || fillDrawer.moving || searchDrawer.moving || aiDrawer.moving
+    function toggleAiWorkspace(value) {
+        const notes = value === "notes";
+        const selected = aiPanelVisible && (notes ? aiPanelMode === "notes" : aiPanelMode === "assistant"
+            && ((currentReader.aiState.input || {}).view || "summary") === value);
+        if (selected) showAiPanelMode(false, notes ? "notes" : "assistant");
+        else if (notes) openRegionNotes();
+        else openAiWorkspace(value);
+    }
     property real aiPanelWidth: session ? Number(session.preference("aiPanelWidth", 360)) : 360
     function openAiWorkspace(value) {
         currentReader.setAiInput("view",value);
@@ -831,6 +843,10 @@ ApplicationWindow {
     }
     function applyFit(preset, targetPage) {
         if (currentReader.pageCount === 0) return false;
+        // A layout response can arrive before Qt polishes the newly revealed
+        // panels. Fit against their current geometry, without waiting for vsync.
+        readerBody.ensurePolished();
+        readerColumns.ensurePolished();
         const page = targetPage===undefined ? currentPage : targetPage;
         const row = canvas.rows[canvas.pageRows[page]];
         if (!row || !row.pages.length) return false;
@@ -2365,6 +2381,7 @@ ApplicationWindow {
     }
 
     ColumnLayout {
+        id: readerBody
         anchors.fill: parent
         spacing: 0
         Frame {
@@ -2399,22 +2416,24 @@ ApplicationWindow {
             Layout.fillWidth: true
         }
         RowLayout {
+            id: readerColumns
             Layout.fillWidth: true
             Layout.fillHeight: true
             spacing: 0
-            ReaderSidebar {
-                objectName: "readerSidebar"
-                app: root
-                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !((root.aiPanelVisible || root.editInspectorVisible || root.fillInspectorVisible) && root.width < 1100)
-                Layout.preferredWidth: root.width < 850 ? 210 : 250
-                Layout.fillHeight: true
-            }
-
-            Rectangle {
-                visible: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !((root.aiPanelVisible || root.editInspectorVisible || root.fillInspectorVisible) && root.width < 1100)
-                Layout.preferredWidth: 1
-                Layout.fillHeight: true
-                color: theme.separator
+            SlidingPanel {
+                id: leftDrawer
+                objectName: "leftSidebarDrawer"
+                leading: true
+                reduceMotion: root.immediatePanelLayout
+                expanded: root.sidebarVisible && currentReader.pageCount > 0 && !(root.searchVisible && root.width < 950) && !((root.aiPanelVisible || root.editInspectorVisible || root.fillInspectorVisible) && root.width < 1100)
+                panelWidth: root.width < 850 ? 211 : 251
+                ReaderSidebar {
+                    objectName: "readerSidebar"
+                    app: root
+                    anchors.fill: parent
+                    anchors.rightMargin: 1
+                }
+                Rectangle { x: parent.width - 1; width: 1; height: parent.height; color: theme.separator }
             }
             Item {
                 id: readingArea
@@ -2469,85 +2488,96 @@ ApplicationWindow {
                     width:parent.width
                 }
             }
-            ContentInspector {
-                objectName:"contentInspector";app:root;visible:root.editInspectorVisible
-                Layout.preferredWidth:Math.min(310,root.width*.4);Layout.fillHeight:true
+            SlidingPanel {
+                id: editDrawer
+                objectName: "editSidebarDrawer"
+                reduceMotion: root.immediatePanelLayout
+                expanded: root.editInspectorVisible
+                panelWidth: Math.min(310, root.width * .4)
+                ContentInspector { objectName: "contentInspector"; app: root; anchors.fill: parent }
             }
-            FillSignInspector {
-                objectName:"fillSignInspector";app:root;visible:root.fillInspectorVisible
-                Layout.preferredWidth:Math.min(310,root.width*.4);Layout.fillHeight:true
+            SlidingPanel {
+                id: fillDrawer
+                objectName: "fillSidebarDrawer"
+                reduceMotion: root.immediatePanelLayout
+                expanded: root.fillInspectorVisible
+                panelWidth: Math.min(310, root.width * .4)
+                FillSignInspector { objectName: "fillSignInspector"; app: root; anchors.fill: parent }
             }
-            SearchPanel {
-                id:searchPane
-                objectName: "searchPanel"
-                app: root
-                visible: root.searchVisible && currentReader.pageCount > 0 && !root.editInspectorVisible && !root.fillInspectorVisible
-                Layout.preferredWidth: Math.min(280, root.width / 3)
-                Layout.fillHeight: true
+            SlidingPanel {
+                id: searchDrawer
+                objectName: "searchSidebarDrawer"
+                reduceMotion: root.immediatePanelLayout
+                expanded: root.searchVisible && currentReader.pageCount > 0 && !root.editInspectorVisible && !root.fillInspectorVisible
+                panelWidth: Math.min(280, root.width / 3)
+                SearchPanel { id: searchPane; objectName: "searchPanel"; app: root; anchors.fill: parent }
             }
-            Pane {
-                id: aiDock
-                objectName: "aiDock"
-                visible: root.aiPanelVisible && currentReader.pageCount > 0
-                onVisibleChanged: if (!visible) root.returnFocusFromAiPanel()
-                padding: 0
-                Layout.minimumWidth: 280
-                Layout.maximumWidth: Math.min(520, Math.max(280, root.width - 360))
-                Layout.preferredWidth: Math.min(root.aiPanelWidth, Layout.maximumWidth)
-                Layout.fillHeight: true
-                background: Rectangle { color: theme.sidebarBg }
-                ColumnLayout {
+            SlidingPanel {
+                id: aiDrawer
+                objectName: "aiSidebarDrawer"
+                reduceMotion: root.immediatePanelLayout
+                expanded: root.aiPanelVisible && currentReader.pageCount > 0
+                panelWidth: Math.min(root.aiPanelWidth, Math.min(520, Math.max(280, root.width - 360)))
+                Pane {
+                    id: aiDock
+                    objectName: "aiDock"
                     anchors.fill: parent
-                    spacing: 0
-                    RowLayout {
-                        Layout.fillWidth: true
-                        Layout.leftMargin: 14
-                        Layout.rightMargin: 8
-                        Label { text: root.aiPanelMode==="notes" ? qsTr("Reading notes") : aiContent.workspaceTitle; color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                        LyraToolButton { symbol: "settings"; text: qsTr("AI settings"); onClicked: root.showSettings() }
-                        LyraToolButton {
-                            objectName: "closeAiPanel"
-                            symbol: "close"
-                            text: root.aiPanelMode==="notes" ? qsTr("Close reading notes") : qsTr("Close AI panel (Ctrl+Shift+A)")
-                            onClicked: root.showAiPanel(false)
+                    onVisibleChanged: if (!visible) root.returnFocusFromAiPanel()
+                    padding: 0
+                    background: Rectangle { color: theme.sidebarBg }
+                    ColumnLayout {
+                        anchors.fill: parent
+                        spacing: 0
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Layout.leftMargin: 14
+                            Layout.rightMargin: 8
+                            Label { text: root.aiPanelMode==="notes" ? qsTr("Reading notes") : aiContent.workspaceTitle; color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
+                            LyraToolButton { symbol: "settings"; text: qsTr("AI settings"); onClicked: root.showSettings() }
+                            LyraToolButton {
+                                objectName: "closeAiPanel"
+                                symbol: "close"
+                                text: root.aiPanelMode==="notes" ? qsTr("Close reading notes") : qsTr("Close AI panel (Ctrl+Shift+A)")
+                                onClicked: root.showAiPanel(false)
+                            }
                         }
-                    }
-                    Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
-                    AiWorkspacePicker {
-                        app: root
-                        selectedKey: root.aiPanelMode === "notes" ? "notes" : aiContent.workspace
-                        Layout.fillWidth: true
-                        Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 5
-                        onPicked: function(key) {
-                            if (key === "notes") root.openRegionNotes();
-                            else root.openAiWorkspace(key);
+                        Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
+                        AiWorkspacePicker {
+                            app: root
+                            selectedKey: root.aiPanelMode === "notes" ? "notes" : aiContent.workspace
+                            Layout.fillWidth: true
+                            Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 5
+                            onPicked: function(key) {
+                                if (key === "notes") root.openRegionNotes();
+                                else root.openAiWorkspace(key);
+                            }
                         }
+                        AiPanel { id: aiContent; app: root; visible:root.aiPanelMode!=="notes"; Layout.fillWidth: true; Layout.fillHeight: true }
+                        RegionNotes {id:regionNotes;app:root;Layout.fillWidth:true;Layout.fillHeight:true}
                     }
-                    AiPanel { id: aiContent; app: root; visible:root.aiPanelMode!=="notes"; Layout.fillWidth: true; Layout.fillHeight: true }
-                    RegionNotes {id:regionNotes;app:root;Layout.fillWidth:true;Layout.fillHeight:true}
-                }
-                Rectangle {
-                    width: 1; height: parent.height; color: theme.separator
-                }
-                MouseArea {
-                    objectName: "aiPanelResizeHandle"
-                    anchors.left: parent.left
-                    width: 6; height: parent.height
-                    cursorShape: Qt.SizeHorCursor
-                    activeFocusOnTab: true
-                    Accessible.name: qsTr("Resize AI panel; Left widens, Right narrows")
-                    property real pressedX: 0
-                    property real initialWidth: 0
-                    onPressed: function(mouse) {
-                        pressedX = mapToItem(root.contentItem, mouse.x, mouse.y).x;
-                        initialWidth = aiDock.width;
+                    Rectangle {
+                        width: 1; height: parent.height; color: theme.separator
                     }
-                    onPositionChanged: function(mouse) {
-                        if (pressed) root.resizeAiPanel(initialWidth + pressedX - mapToItem(root.contentItem, mouse.x, mouse.y).x, false);
+                    MouseArea {
+                        objectName: "aiPanelResizeHandle"
+                        anchors.left: parent.left
+                        width: 6; height: parent.height
+                        cursorShape: Qt.SizeHorCursor
+                        activeFocusOnTab: true
+                        Accessible.name: qsTr("Resize AI panel; Left widens, Right narrows")
+                        property real pressedX: 0
+                        property real initialWidth: 0
+                        onPressed: function(mouse) {
+                            pressedX = mapToItem(root.contentItem, mouse.x, mouse.y).x;
+                            initialWidth = aiDock.width;
+                        }
+                        onPositionChanged: function(mouse) {
+                            if (pressed) root.resizeAiPanel(initialWidth + pressedX - mapToItem(root.contentItem, mouse.x, mouse.y).x, false);
+                        }
+                        onReleased: root.resizeAiPanel(root.aiPanelWidth, true)
+                        Keys.onLeftPressed: root.resizeAiPanel(root.aiPanelWidth + 20, true)
+                        Keys.onRightPressed: root.resizeAiPanel(root.aiPanelWidth - 20, true)
                     }
-                    onReleased: root.resizeAiPanel(root.aiPanelWidth, true)
-                    Keys.onLeftPressed: root.resizeAiPanel(root.aiPanelWidth + 20, true)
-                    Keys.onRightPressed: root.resizeAiPanel(root.aiPanelWidth - 20, true)
                 }
             }
         }

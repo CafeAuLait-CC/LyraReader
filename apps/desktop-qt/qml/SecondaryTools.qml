@@ -81,10 +81,10 @@ Item {
                     symbol:modelData.key === "translation" ? "translation" : modelData.key; text:modelData.title;fitLabel:true
                     display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                     selected:app.aiPanelVisible && app.aiPanelMode!=="notes" && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
-                    onClicked:app.openAiWorkspace(modelData.key)
+                    onClicked:app.toggleAiWorkspace(modelData.key)
                 }
             }
-            LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Reading notes");Accessible.name:qsTr("Reading notes");fitLabel:true;display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon;selected:app.aiPanelVisible && app.aiPanelMode==="notes";enabled:app.currentReader.pageCount>0;onClicked:app.openRegionNotes()}
+            LyraToolButton {objectName:"lyraReadingNotes";symbol:"note";text:qsTr("Reading notes");Accessible.name:qsTr("Reading notes");fitLabel:true;display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon;selected:app.aiPanelVisible && app.aiPanelMode==="notes";enabled:app.currentReader.pageCount>0;onClicked:app.toggleAiWorkspace("notes")}
         }
         Rectangle {anchors.bottom:parent.bottom;width:parent.width;height:1;color:app.colors.separator}
     }
