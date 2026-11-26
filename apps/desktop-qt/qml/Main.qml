@@ -96,7 +96,8 @@ ApplicationWindow {
     AiRegionCard {id:aiRegionCard;app:root}
     DocumentReading {id:documentReadingPopup;app:root}
     function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
-    function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
+    function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"regions");}}
+    function openReadingNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
     function openSavedReadingNote(id) {
         showAiPanel(true);
         if (aiPanelVisible && aiPanelMode === "assistant") aiContent.openSavedNote(id);
@@ -128,7 +129,7 @@ ApplicationWindow {
         const selected = aiPanelVisible && (notes ? aiPanelMode === "notes" : aiPanelMode === "assistant"
             && ((currentReader.aiState.input || {}).view || "summary") === value);
         if (selected) showAiPanelMode(false, notes ? "notes" : "assistant");
-        else if (notes) openRegionNotes();
+        else if (notes) openReadingNotes();
         else openAiWorkspace(value);
     }
     property real aiPanelWidth: session ? Number(session.preference("aiPanelWidth", 360)) : 360
@@ -138,7 +139,7 @@ ApplicationWindow {
     }
     function showAiPanel(show) {showAiPanelMode(show,"assistant");}
     function showAiPanelMode(show,mode) {
-        const panelMode=mode==="notes" ? "notes" : "assistant";
+        const panelMode=mode==="notes" || mode==="regions" ? mode : "assistant";
         if (placedTextController.deferAction(function(){root.showAiPanelMode(show,panelMode);})) return;
         if (show && secondaryRow==="edit" && contentController.deferAction({kind:"assistant",value:true,mode:panelMode})) return;
         if (show) {
@@ -2529,30 +2530,55 @@ ApplicationWindow {
                         anchors.fill: parent
                         spacing: 0
                         RowLayout {
-                            Layout.fillWidth: true
-                            Layout.leftMargin: 14
-                            Layout.rightMargin: 8
-                            Label { text: root.aiPanelMode==="notes" ? qsTr("Reading notes") : aiContent.workspaceTitle; color: theme.textPrimary; font.weight: Font.DemiBold; Layout.fillWidth: true }
-                            LyraToolButton { symbol: "settings"; text: qsTr("AI settings"); onClicked: root.showSettings() }
+                            objectName: "aiPanelHeader"
+                            Layout.fillWidth: true; Layout.preferredHeight: 46; Layout.minimumHeight: 46; Layout.maximumHeight: 46
+                            Layout.leftMargin: 16; Layout.rightMargin: 16
+                            spacing: 8
                             LyraToolButton {
-                                objectName: "closeAiPanel"
-                                symbol: "close"
-                                text: root.aiPanelMode==="notes" ? qsTr("Close reading notes") : qsTr("Close AI panel (Ctrl+Shift+A)")
+                                symbol: root.aiPanelMode === "notes" || root.aiPanelMode === "regions" ? "note" : aiContent.workspace === "chat" ? "chat" : aiContent.workspace === "translation" ? "translation" : "document"
+                                implicitWidth: 18; implicitHeight: 18; padding: 0; focusPolicy: Qt.NoFocus; hoverEnabled: false
+                                icon.color: theme.accent; Accessible.ignored: true; background: null
+                            }
+                            Label {
+                                objectName: "aiPanelHeaderTitle"
+                                text: root.aiPanelMode === "notes" ? qsTr("Reading notes") : root.aiPanelMode === "regions" ? qsTr("Interleaf discussions") : aiContent.workspaceTitle
+                                color: theme.textPrimary; font.pixelSize: 14; font.weight: Font.DemiBold; Layout.fillWidth: true; Layout.minimumWidth: 0; elide: Text.ElideRight
+                            }
+                            LyraToolButton {
+                                objectName: aiContent.workspace === "chat" ? "openAiChatHistory" : "openAiTaskHistory"
+                                symbol: "history"; text: aiContent.workspace === "chat" ? qsTr("Conversation history") : qsTr("Task history")
+                                visible: root.aiPanelMode === "assistant" && aiContent.workspace !== "translation"
+                                enabled: !aiContent.running && !root.currentReader.pendingCommands
+                                onClicked: aiContent.openHistory()
+                            }
+                            LyraToolButton {
+                                objectName: "clearAiConversation"
+                                symbol: "free-text"; text: qsTr("New conversation")
+                                visible: root.aiPanelMode === "assistant" && aiContent.workspace === "chat"
+                                enabled: !aiContent.running && (!!aiContent.viewState.chatSession || !!aiContent.input.chatQuestion)
+                                onClicked: aiContent.startNewChat()
+                            }
+                            LyraToolButton {
+                                objectName: "copyAiReadingNotes"
+                                symbol: "copy"; text: qsTr("Copy reading notes")
+                                visible: root.aiPanelMode === "notes"
+                                enabled: !!savedNotes.entries.length && !savedNotes.command
+                                onClicked: savedNotes.copyAll()
+                            }
+                            LyraToolButton { symbol: "settings"; text: qsTr("Lyra AI settings"); onClicked: root.showSettings() }
+                            LyraToolButton {
+                                objectName: "closeAiPanel"; symbol: "close"
+                                text: qsTr("Close AI panel (Ctrl+Shift+A)")
                                 onClicked: root.showAiPanel(false)
                             }
                         }
                         Rectangle { Layout.fillWidth: true; height: 1; color: theme.separator }
-                        AiWorkspacePicker {
-                            app: root
-                            selectedKey: root.aiPanelMode === "notes" ? "notes" : aiContent.workspace
-                            Layout.fillWidth: true
-                            Layout.leftMargin: 10; Layout.rightMargin: 10; Layout.topMargin: 5
-                            onPicked: function(key) {
-                                if (key === "notes") root.openRegionNotes();
-                                else root.openAiWorkspace(key);
-                            }
+                        AiPanel { id: aiContent; app: root; visible:root.aiPanelMode==="assistant"; Layout.fillWidth: true; Layout.fillHeight: true }
+                        ReadingNotesSidebar {
+                            id: savedNotes
+                            app: root; Layout.fillWidth: true; Layout.fillHeight: true
+                            onRequestUpdate: function(noteId) { aiContent.prepareReadingNoteUpdate(noteId); }
                         }
-                        AiPanel { id: aiContent; app: root; visible:root.aiPanelMode!=="notes"; Layout.fillWidth: true; Layout.fillHeight: true }
                         RegionNotes {id:regionNotes;app:root;Layout.fillWidth:true;Layout.fillHeight:true}
                     }
                     Rectangle {
@@ -2760,7 +2786,7 @@ ApplicationWindow {
             root.clearNavigation();
             root.pendingLayoutPosition=null;
             root.cancelRegionSelection();aiRegionCard.closeCard(false);
-            if(root.aiPanelMode==="notes")root.aiPanelVisible=false;
+            if(root.aiPanelMode==="notes" || root.aiPanelMode==="regions")root.aiPanelVisible=false;
             documentReadingPopup.close();
             root.cancelErase();
             ++root.positionRestoreEpoch;

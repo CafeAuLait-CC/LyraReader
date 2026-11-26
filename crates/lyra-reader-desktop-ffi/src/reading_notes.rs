@@ -469,11 +469,53 @@ impl DesktopDocument {
         recent: bool,
     ) -> Result<Value, String> {
         self.read_workspace(source, false, |workspace| {
-            Ok(
-                json!(workspace.notes(query, recent).into_iter().map(|note| json!({
-                "id":note.id,"title":note.title,"status":note.status,"modified":note.modified
-            })).collect::<Vec<_>>()),
-            )
+            let records = workspace
+                .records()
+                .into_iter()
+                .map(|record| (record.id, (record.kind, record.source_id)))
+                .collect::<std::collections::HashMap<_, _>>();
+            Ok(json!(
+                workspace
+                    .notes(query, recent)
+                    .into_iter()
+                    .map(|note| {
+                        let modified = note.modified;
+                        let origin = records.get(&note.source_id);
+                        let origin_kind = origin.map(|record| record.0.clone());
+                        let origin_scope = origin.map(|record| record.1.clone());
+                        let mut value = note_value(workspace, note, source);
+                        // Preserve the existing list wire type; the detail's edit version is a string.
+                        value["modified"] = json!(modified);
+                        value["origin_kind"] = json!(origin_kind);
+                        value["origin_scope"] = json!(origin_scope);
+                        value
+                    })
+                    .collect::<Vec<_>>()
+            ))
+        })
+    }
+
+    /// Read the shared, versioned task store in one batch. Opening history never writes
+    /// a cache or constructs a provider request, and never invents trusted source pages.
+    pub(super) fn reading_tasks(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        kind: &str,
+        source_id: Option<&str>,
+    ) -> Result<Value, String> {
+        self.read_workspace(source, false, |workspace| {
+            let fingerprint = source.document_identity().sha256;
+            Ok(json!(workspace.task_history(kind, source_id)?.into_iter().map(|record| {
+                let verified = record.source_hash == fingerprint;
+                let source_pages = if verified {
+                    record.pages.iter().copied().filter(|page| *page > 0 && *page <= source.page_count()).collect::<Vec<_>>()
+                } else { Vec::new() };
+                json!({"id":record.id,"kind":record.kind,"source_id":record.source_id,
+                    "title":record.title,"content":record.content,"excerpt":record.excerpt,
+                    "pages":record.pages,"source_pages":source_pages,"language":record.language,
+                    "detail":record.detail,"model":record.model,"modified":record.modified.to_string(),
+                    "status":if verified { record.status.as_str() } else { "sourceChanged" }})
+            }).collect::<Vec<_>>()))
         })
     }
 
@@ -603,7 +645,7 @@ fn note_value(
     } else {
         "sourceChanged"
     };
-    json!({"id":note.id,"title":note.title,"content":note.content,"thoughts":note.thoughts,
+    json!({"id":note.id,"title":note.title,"content":note.content,"thoughts":note.thoughts,"source_id":note.source_id,
         "modified":note.modified.to_string(),"status":status,"source_pages":pages,
         "suggestion":suggestion,"discussion_available":discussion_available})
 }

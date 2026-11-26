@@ -23,7 +23,7 @@ Pane {
     readonly property var turn:turns.length ? turns[Math.min(turnIndex,turns.length-1)] : detail && detail.question ? detail : null
     readonly property var verifiedPages:detail && !detail.locationInvalidated ? (detail.verified_source_pages || [])[turnIndex] || [] : []
     function stateLabel(state){return state==="finished" ? qsTr("Completed") : state==="cancelled" ? qsTr("Stopped") : state==="failed" ? qsTr("Failed") : qsTr("Unfinished");}
-    readonly property bool active:app.aiPanelVisible && app.aiPanelMode==="notes" && app.currentReader.pageCount>0
+    readonly property bool active:app.aiPanelVisible && app.aiPanelMode==="regions" && app.currentReader.pageCount>0
     property string readError:""
     property int ownerGeneration:-1
     property var exportContext:null
@@ -38,7 +38,7 @@ Pane {
     background:Rectangle {color:notes.app.colors.sidebarBg}
     signal closed()
     function open(){app.openRegionNotes();}
-    function close(){if(app.aiPanelVisible && app.aiPanelMode==="notes")app.showAiPanel(false);}
+    function close(){if(app.aiPanelVisible && app.aiPanelMode==="regions")app.showAiPanel(false);}
     function activate() {
         owner=app.currentReader;ownerGeneration=owner.documentGeneration;
         detail=null;selectedId="";readError="";

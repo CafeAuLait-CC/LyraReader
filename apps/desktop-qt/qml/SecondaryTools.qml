@@ -80,7 +80,7 @@ Item {
                     objectName:"lyraWorkspace"+modelData.key
                     symbol:modelData.key === "translation" ? "translation" : modelData.key; text:modelData.title;fitLabel:true
                     display:lyraStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
-                    selected:app.aiPanelVisible && app.aiPanelMode!=="notes" && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
+                    selected:app.aiPanelVisible && app.aiPanelMode==="assistant" && ((app.currentReader.aiState.input || {}).view || "summary")===modelData.key
                     onClicked:app.toggleAiWorkspace(modelData.key)
                 }
             }

@@ -53,7 +53,7 @@ Pane {
     readonly property var ownerGeneration: owner.documentGeneration
     onOwnerChanged: resetSourceView()
     onOwnerGenerationChanged: resetSourceView()
-    readonly property string workspaceTitle: workspace === "chat" ? qsTr("Document chat") : workspace === "translation" ? qsTr("Translation") : qsTr("Summary")
+    readonly property string workspaceTitle: workspace === "chat" ? qsTr("Chat") : workspace === "translation" ? qsTr("Translate") : qsTr("Summary")
     readonly property var plan: viewState.previewView === workspace ? viewState.plan || null : null
     readonly property bool previewReady: !!plan && !viewState.planSent
     readonly property bool synthesisPreview: previewReady && plan.kind === "summary_synthesis"
@@ -69,7 +69,33 @@ Pane {
     rightPadding: 10
     topPadding: compact ? 6 : 10
     bottomPadding: compact ? 6 : 10
-    background: Rectangle { color: app.colors.sidebarBg }
+    background: Rectangle { color: app.colors.panelBg }
+    property bool taskHistoryShown: false
+    function openHistory() {
+        if (workspace === "chat") chatHistory.browse();
+        else if (workspace === "summary") {
+            taskHistoryShown = !taskHistoryShown;
+            if (taskHistoryShown) taskStore.reload("summary");
+        }
+    }
+    function startNewChat() {
+        if (!running) { chatHistory.close(); owner.newAiChat(); }
+    }
+    function prepareReadingNoteUpdate(noteId) {
+        const request = baseRequest("SummarizeDocument");
+        request.language = input.summaryLanguage || null;
+        owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
+    }
+    onWorkspaceChanged: taskHistoryShown = false
+    AiTaskStore { id: taskStore; app: aiPanel.app }
+    AiTaskHistory {
+        app: aiPanel.app; store: taskStore
+        anchors.fill: parent
+        visible: aiPanel.taskHistoryShown && aiPanel.workspace === "summary"
+        onClosed: aiPanel.taskHistoryShown = false
+        onKeepNote: function(id) { readingNotes.browse(id); }
+        onCitation: function(link, plan) { aiPanel.followHistoryLink(link, plan); }
+    }
     function openSavedNote(id) { readingNotes.browse("", id); }
     function sortedRange(range) {
         return {page: range.page, start: Math.min(range.start, range.end), end: Math.max(range.start, range.end)};
@@ -78,6 +104,7 @@ Pane {
         return !!a && !!b && a.page === b.page && a.start === b.start && a.end === b.end;
     }
     function resetSourceView() {
+        taskHistoryShown = false;
         if (payload && payload.visible) payload.close();
         if (selectionSource && selectionSource.visible) selectionSource.close();
         if (translationHistory && translationHistory.visible) translationHistory.close();
@@ -325,6 +352,7 @@ Pane {
     }
     ColumnLayout {
         anchors.fill: parent
+        visible: !aiPanel.taskHistoryShown
         spacing: aiPanel.compact ? 3 : 6
         Label {
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
@@ -756,20 +784,6 @@ Pane {
                 enabled: !!aiPanel.plan && !aiPanel.running && aiPanel.owner.pendingCommands === 0
                 onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
             }
-            Button {
-                objectName: "clearAiConversation"
-                text: qsTr("New chat")
-                visible: aiPanel.workspace === "chat"
-                enabled: !aiPanel.running && (!!aiPanel.viewState.chatSession || !!aiPanel.input.chatQuestion)
-                onClicked: aiPanel.owner.newAiChat()
-            }
-            Button {
-                objectName: "openAiChatHistory"
-                text: qsTr("Past chats…")
-                visible: aiPanel.workspace === "chat"
-                enabled: !aiPanel.running && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0
-                onClicked: chatHistory.browse()
-            }
             Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
             Button {
                 objectName: "keepAiSummaryNote"
@@ -790,9 +804,7 @@ Pane {
         id: readingNotes
         app: aiPanel.app
         onRequestUpdate: function(noteId) {
-            const request = aiPanel.baseRequest("SummarizeDocument");
-            request.language = aiPanel.input.summaryLanguage || null;
-            aiPanel.owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
+            aiPanel.prepareReadingNoteUpdate(noteId);
         }
     }
     Dialog {

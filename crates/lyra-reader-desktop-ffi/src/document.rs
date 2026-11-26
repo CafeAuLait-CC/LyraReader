@@ -1169,6 +1169,11 @@ impl DesktopDocument {
             "ai_chat_sessions" => self.chat_sessions(&d),
             "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
             "ai_chat_draft" => self.save_chat_draft(&d, arg(&r, "draft")?),
+            "ai_reading_tasks" => self.reading_tasks(
+                &d,
+                &text(&r, "kind")?,
+                r.get("source_id").and_then(Value::as_str),
+            ),
             "ai_reading_notes" => self.reading_notes(
                 &d,
                 &text(&r, "query")?,
@@ -2654,6 +2659,71 @@ mod tests {
         let before = fs::read(&sidecar).unwrap();
         assert!(doc.command(json!({"op":"mark_create","entry":{"kind":"signature","page":0,"version":1,"color":"#000000FF","note":"","image":"invalid","rect":{"x":10,"y":10,"width":10,"height":10}}})).is_err());
         assert_eq!(before, fs::read(&sidecar).unwrap());
+    }
+
+    #[test]
+    fn reading_sidebar_batches_note_metadata_and_task_history_without_writes() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = doc.active().unwrap();
+        doc.update_reading_workspace(&source, |workspace, sha, _| {
+            let summary = ReadingRecord {
+                id: "sidebar-summary".into(),
+                kind: "summary".into(),
+                source_id: "document".into(),
+                title: "Synthetic overview".into(),
+                content: "## Overview\nApproved finding [p.1].".into(),
+                pages: vec![1, 99],
+                source_hash: sha.into(),
+                status: "finished".into(),
+                modified: 2,
+                model: "fixture".into(),
+                detail: "Brief".into(),
+                ..Default::default()
+            };
+            workspace.put(summary.clone())?;
+            workspace.keep(summary, "sidebar-note".into())?;
+            workspace.put(ReadingRecord {
+                id: "old-sidebar-summary".into(),
+                kind: "summary".into(),
+                source_id: "document".into(),
+                content: "Older source".into(),
+                pages: vec![1],
+                source_hash: "different-source".into(),
+                status: "finished".into(),
+                modified: 1,
+                ..Default::default()
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        let path = cache_path(&fixture.path)
+            .parent()
+            .unwrap()
+            .join(crate::reading_history::WORKSPACE_FILE);
+        let before = fs::read(&path).unwrap();
+        let tasks = doc
+            .command(json!({"op":"ai_reading_tasks","kind":"summary","source_id":"document"}))
+            .unwrap();
+        assert_eq!(tasks.as_array().unwrap().len(), 2);
+        assert_eq!(tasks[0]["content"], "## Overview\nApproved finding [p.1].");
+        assert_eq!(tasks[0]["source_pages"], json!([1]));
+        assert_eq!(tasks[1]["status"], "sourceChanged");
+        assert_eq!(tasks[1]["source_pages"], json!([]));
+        assert!(
+            doc.command(json!({"op":"ai_reading_tasks","kind":"note"}))
+                .is_err()
+        );
+        let notes = doc
+            .command(json!({"op":"ai_reading_notes","query":"Approved","recent":false}))
+            .unwrap();
+        assert_eq!(notes.as_array().unwrap().len(), 1);
+        assert_eq!(notes[0]["origin_kind"], "summary");
+        assert_eq!(notes[0]["origin_scope"], "document");
+        assert_eq!(notes[0]["content"], tasks[0]["content"]);
+        assert_eq!(notes[0]["source_pages"], json!([1]));
+        assert!(notes[0]["modified"].is_u64());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]

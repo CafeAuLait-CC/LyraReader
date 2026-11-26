@@ -368,7 +368,7 @@ Item {
                     MenuItem {objectName:"saveAiRegionNote";text:qsTr("Save to Reading Notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onTriggered:card.owner.saveAiRegionNote()}
                     MenuItem {text:qsTr("Request Details");enabled:card.previewReady;onTriggered:payload.open()}
                     MenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable;height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
-                    MenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openRegionNotes()}
+                    MenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openReadingNotes()}
                     MenuItem {text:qsTr("Open in AI Panel");enabled:!!card.attachment.saved && !!card.attachment.history_id;onTriggered:card.app.openSavedReadingNote(card.attachment.history_id)}
                     MenuItem {text:qsTr("Read document (optional)…");enabled:!!card.owner && !!card.owner.documentReading.choice_pending;onTriggered:card.app.openDocumentReading()}
                     MenuSeparator {}
