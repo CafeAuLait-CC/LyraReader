@@ -176,6 +176,24 @@ protected:
     }
 };
 
+class ChatGptPreferenceGuard {
+public:
+    ChatGptPreferenceGuard() {
+        QSettings settings;
+        for(const auto &key:keys())m_saved.insert(key,settings.value(key));
+    }
+    ~ChatGptPreferenceGuard() {
+        QSettings settings;
+        for(auto it=m_saved.cbegin();it!=m_saved.cend();++it)
+            if(it.value().isValid())settings.setValue(it.key(),it.value());else settings.remove(it.key());
+        settings.sync();ChatGptAccounts::instance()->refreshConnection();
+    }
+    static QStringList keys() {return {"chatGptPlan/accounts","chatGptPlan/selected","chatGptPlan/useForChat",
+        "chatGptPlan/useForSelection","chatGptPlan/useForLayeredSummaries","chatGptPlan/useForWholeDocument","chatGptPlan/connectionMode"};}
+private:
+    QVariantMap m_saved;
+};
+
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
     qmlRegisterType<ReadingScrollMemory>("LyraReader",1,0,"ReadingScrollMemory");
@@ -339,6 +357,9 @@ private slots:
         capturedChatGptUrl = url;
     }
     void chatGptSignInIsExplicitAndCancellationSavesNoAccount() {
+        ChatGptPreferenceGuard profileGuard;QSettings saved;
+        for(const auto &key:ChatGptPreferenceGuard::keys())saved.remove(key);
+        saved.sync();QVERIFY(ChatGptAccounts::instance()->refreshConnection());
         NativeCorpus::Viewer view;
         QVERIFY(view.window);
         auto *accounts = view.workspace.chatGptAccounts();
@@ -367,10 +388,11 @@ private slots:
         QVERIFY(capturedChatGptUrl.isEmpty());
         auto *reload=settings->findChild<QQuickItem *>("reloadChatGptModels");
         QVERIFY(reload && !reload->isVisible());
-        auto *selectionPreference = settings->findChild<QObject *>("useChatGptForSelection");
-        QVERIFY(selectionPreference);
-        QVERIFY(!selectionPreference->property("checked").toBool());
-        QVERIFY(!selectionPreference->property("enabled").toBool());
+        auto *choice=visualItem(settings->contentItem(),"settingsAiConnectionModeSegment1");
+        QVERIFY(choice);QVERIFY(!accounts->signingIn());
+        QVERIFY(QMetaObject::invokeMethod(choice,"clicked"));
+        QCOMPARE(accounts->connectionMode(),QString("chatGPT"));
+        QVERIFY(!accounts->signingIn());QVERIFY(capturedChatGptUrl.isEmpty());
         auto *button = settings->findChild<QObject *>("continueWithChatGpt");
         QVERIFY(button && button->property("enabled").toBool());
         QVERIFY(QMetaObject::invokeMethod(button, "clicked"));
@@ -395,7 +417,8 @@ private slots:
 
         accounts->cancelSignIn();
         QVERIFY(!accounts->busy());
-        QVERIFY(!accounts->useForChat());
+        QVERIFY(accounts->useForChat());
+        QVERIFY(!accounts->connected());
         QVERIFY(accounts->accounts().isEmpty());
         QVERIFY(settings->close());
     }
@@ -477,6 +500,220 @@ private slots:
         QVERIFY(!settings.value(selection).toBool());
         QVERIFY(settings.value(useForChat).toBool());
     }
+    void connectionModesKeepLegacyGrantsUntilAnExplicitChoice() {
+        ChatGptPreferenceGuard restore;QSettings settings;
+        for(const auto &key:ChatGptPreferenceGuard::keys())settings.remove(key);
+        settings.sync();auto *accounts=ChatGptAccounts::instance();QVERIFY(accounts->refreshConnection());
+        QCOMPARE(accounts->connectionMode(),QString("apiKey"));QVERIFY(accounts->connectionReady());
+        QVERIFY(!accounts->useForChat() && !accounts->useForSelection());QVERIFY(!settings.contains("chatGptPlan/connectionMode"));
+        const QVariantList roster{QVariantMap{{"id","synthetic-mode-account"},{"connected",true},{"model","synthetic-mode-model"},
+            {"future_metadata",QVariantMap{{"opaque","retained"}}}}};
+        settings.setValue("chatGptPlan/accounts",roster);settings.setValue("chatGptPlan/selected","synthetic-mode-account");
+        settings.setValue("chatGptPlan/useForSelection",true);settings.setValue("chatGptPlan/useForChat",false);settings.sync();
+        QSignalSpy modes(accounts,&ChatGptAccounts::connectionModeChanged);QVERIFY(accounts->refreshConnection());
+        QCOMPARE(accounts->connectionMode(),QString("legacy"));QVERIFY(accounts->connectionReady());QVERIFY(accounts->useForSelection());
+        QVERIFY(!accounts->useForChat() && !accounts->useForLayeredSummaries() && !accounts->useForWholeDocument());
+        QVERIFY(!accounts->connectionModeNote().isEmpty());settings.sync();QVERIFY(!settings.contains("chatGptPlan/connectionMode"));
+        QVERIFY(accounts->selectConnectionMode("chatGPT"));QCOMPARE(accounts->connectionMode(),QString("chatGPT"));
+        QVERIFY(accounts->useForChat() && accounts->useForSelection() && accounts->useForLayeredSummaries() && accounts->useForWholeDocument());
+        settings.sync();QCOMPARE(settings.value("chatGptPlan/accounts").toList(),roster);
+        QVERIFY(settings.value("chatGptPlan/useForSelection").toBool());QVERIFY(!settings.value("chatGptPlan/useForChat").toBool());
+        QVERIFY(!settings.contains("chatGptPlan/useForWholeDocument"));
+        QVERIFY(accounts->selectConnectionMode("apiKey"));QVERIFY(!accounts->useForChat() && !accounts->useForSelection());
+        const QVariantMap unknown{{"future_mode",true}};settings.setValue("chatGptPlan/connectionMode",unknown);settings.sync();
+        QVERIFY(accounts->refreshConnection());QCOMPARE(accounts->connectionMode(),QString("invalid"));QVERIFY(!accounts->connectionReady());
+        QVERIFY(!accounts->useForSelection());QVERIFY(!accounts->selectConnectionMode("legacy"));
+        settings.sync();QCOMPARE(settings.value("chatGptPlan/connectionMode").toMap(),unknown);
+        QVERIFY(accounts->selectConnectionMode("apiKey"));QVERIFY(accounts->connectionReady());
+        settings.sync();QCOMPARE(settings.value("chatGptPlan/accounts").toList(),roster);QVERIFY(settings.value("chatGptPlan/useForSelection").toBool());
+        QVERIFY(modes.count()>=5);
+    }
+
+    void connectionModeWritesKeepFreshMetadataFromAnotherProcess() {
+        const auto role=qEnvironmentVariable("LYRA_READER_MODE_CHECK_ROLE");
+        const auto run=[&](const QString &next,const QString &folder) {
+            auto env=QProcessEnvironment::systemEnvironment();env.insert("LYRA_READER_MODE_CHECK_ROLE",next);env.insert("LYRA_READER_CHECK_SETTINGS_ROOT",folder);
+            QProcess child;child.setProcessEnvironment(env);child.setProcessChannelMode(QProcess::MergedChannels);
+            child.start(QCoreApplication::applicationFilePath(),{root,"connectionModeWritesKeepFreshMetadataFromAnotherProcess"});
+            QVERIFY(child.waitForFinished(20000));QCOMPARE(child.exitStatus(),QProcess::NormalExit);const auto output=child.readAll();QVERIFY2(child.exitCode()==0,output.constData());
+        };
+        if(role.isEmpty()){QTemporaryDir config;QVERIFY(config.isValid());run("reader",config.path());return;}
+        QSettings settings;
+        const auto profile=[](const QString &id,const QString &opaque){return QVariantMap{{"id",id},{"connected",true},{"model","synthetic-model"},{"future_metadata",opaque}};};
+        const QVariantList first{profile("synthetic-one","first")};
+        const QVariantList latest{profile("synthetic-one","written elsewhere"),profile("synthetic-two","keep newest")};
+        if(role=="writer") {
+            settings.setValue("chatGptPlan/accounts",latest);settings.setValue("chatGptPlan/selected","synthetic-two");
+            settings.setValue("chatGptPlan/useForSelection",false);settings.sync();QCOMPARE(settings.status(),QSettings::NoError);return;
+        }
+        QCOMPARE(role,QString("reader"));settings.setValue("chatGptPlan/accounts",first);settings.setValue("chatGptPlan/selected","synthetic-one");
+        settings.setValue("chatGptPlan/useForSelection",true);settings.sync();auto *accounts=ChatGptAccounts::instance();QVERIFY(accounts->refreshConnection());
+        QCOMPARE(accounts->connectionMode(),QString("legacy"));QVERIFY(accounts->useForSelection());
+        run("writer",qEnvironmentVariable("LYRA_READER_CHECK_SETTINGS_ROOT"));
+        QVERIFY(accounts->selectConnectionMode("apiKey"));QCOMPARE(accounts->accountId(),QString("synthetic-two"));
+        settings.sync();QCOMPARE(settings.value("chatGptPlan/accounts").toList(),latest);QVERIFY(!settings.value("chatGptPlan/useForSelection").toBool());
+        QCOMPARE(settings.value("chatGptPlan/connectionMode").toString(),QString("apiKey"));QCOMPARE(settings.status(),QSettings::NoError);
+    }
+
+    void settingsConnectionChoiceKeepsHiddenProviderDraftsAndCredentialsLocal_data() {
+        QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("narrow-dark")<<true;
+    }
+    void settingsConnectionChoiceKeepsHiddenProviderDraftsAndCredentialsLocal() {
+        QFETCH(bool,dark);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property).*"));
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profileGuard;QSettings saved;
+        saved.remove("chatGptPlan/connectionMode");
+        const QVariantList roster{QVariantMap{{"id","synthetic-settings-account"},{"label","Synthetic connection"},{"email","reader@example.invalid"},
+            {"connected",true},{"model","synthetic-saved-model"},{"models",QVariantList{QVariantMap{{"id","synthetic-saved-model"},{"name","Synthetic saved model"}}}},
+            {"future_metadata","keep"}}};
+        saved.setValue("chatGptPlan/accounts",roster);saved.setValue("chatGptPlan/selected","synthetic-settings-account");
+        saved.setValue("chatGptPlan/useForSelection",true);saved.setValue("chatGptPlan/useForChat",false);saved.sync();
+        auto *accounts=ChatGptAccounts::instance();QVERIFY(accounts->refreshConnection());QCOMPARE(accounts->connectionMode(),QString("legacy"));
+        auto *vault=new FakeCredentialStore;WorkspaceController workspace(nullptr,vault);QQmlApplicationEngine engine;
+        const QVariantMap initial{{"baseUrl","http://127.0.0.1:1/v1"},{"model","synthetic-api-model"},{"future_provider_field","keep"}};
+        workspace.setPreference("ai",initial);workspace.setPreference("auxiliarySettingsGeometry",QVariantMap{{"width",dark?360:560},{"height",dark?580:650}});
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const auto close=qScopeGuard([&]{window->close();});window->setProperty("appearance",dark?"dark":"light");window->setProperty("reduceMotion",dark);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());
+        auto *picker=visualItem(settings->contentItem(),"settingsAiConnectionMode");QVERIFY(picker);QCOMPARE(picker->property("currentIndex").toInt(),-1);
+        auto *indicator=visualItem(picker,"settingsAiConnectionModeIndicator");QVERIFY(indicator && !indicator->isVisible());
+        auto *provider=visualItem(settings->contentItem(),"settingsApiProvider"),*cloud=visualItem(settings->contentItem(),"settingsChatGptProvider");QVERIFY(provider && cloud);QVERIFY(provider->isVisible() && cloud->isVisible());
+        auto *notice=visualItem(settings->contentItem(),"settingsAiConnectionNotice");QVERIFY(notice && notice->isVisible());
+        auto *base=visualItem(settings->contentItem(),"settingsBaseUrl"),*model=visualItem(settings->contentItem(),"settingsAiModel"),*secret=visualItem(settings->contentItem(),"settingsApiKey");QVERIFY(base && model && secret);
+        base->setProperty("text","http://127.0.0.1:1/unsaved");model->setProperty("text","unsaved-provider-draft");secret->setProperty("text","SYNTHETIC_UNSUBMITTED_KEY");
+        auto *chat=visualItem(picker,"settingsAiConnectionModeSegment1");QVERIFY(chat);settings->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),settings);chat->forceActiveFocus();QTest::keyClick(settings,Qt::Key_Space);
+        QTRY_COMPARE(accounts->connectionMode(),QString("chatGPT"));QTRY_VERIFY(!provider->isVisible() && cloud->isVisible());QVERIFY(secret->property("text").toString().isEmpty());
+        QTRY_VERIFY(indicator->isVisible());QTRY_VERIFY(qAbs(indicator->x()-(3+picker->property("cellWidth").toDouble()+4))<.5);
+        QCOMPARE(vault->requests.size(),0);QVERIFY(QMetaObject::invokeMethod(settings,"save"));QTRY_VERIFY(!settings->isVisible());
+        const auto value=window->property("aiSettings");const auto current=value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toVariant().toMap():value.toMap();
+        QCOMPARE(current,initial);QCOMPARE(workspace.preference("ai",{}).toMap(),initial);QCOMPARE(vault->requests.size(),0);
+        saved.sync();QCOMPARE(saved.value("chatGptPlan/accounts").toList(),roster);QVERIFY(saved.value("chatGptPlan/useForSelection").toBool());QVERIFY(!saved.value("chatGptPlan/useForChat").toBool());
+        QSignalSpy reopenedFrames(settings,&QQuickWindow::frameSwapped);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());
+        // A remapped Wayland window can be visible before its new swapchain exists.
+        // Capture only after an exposed frame, rather than forcing grabWindow into
+        // the surface teardown/recreation boundary.
+        QTRY_VERIFY(settings->isExposed());QTRY_VERIFY(!reopenedFrames.isEmpty());
+        auto *scroll=visualItem(settings->contentItem(),"settingsScroll");QVERIFY(scroll);auto *flick=scroll->property("contentItem").value<QQuickItem *>();QVERIFY(flick);
+        flick->setProperty("contentY",std::max(0.,picker->mapToItem(flick,QPointF(0,0)).y()-20));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");if(!evidence.isEmpty())QVERIFY(settings->grabWindow().save(evidence+(dark?"-connection-chat-dark.png":"-connection-chat-light.png")));
+        auto *api=visualItem(picker,"settingsAiConnectionModeSegment0");QVERIFY(api);settings->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),settings);api->forceActiveFocus();QTest::keyClick(settings,Qt::Key_Space);
+        QCOMPARE(accounts->connectionMode(),QString("apiKey"));QTRY_VERIFY(provider->isVisible() && !cloud->isVisible());
+        if(dark)QCOMPARE(indicator->x(),3.);
+        else QTRY_VERIFY_WITH_TIMEOUT(indicator->x()>3.5 && indicator->x()<3+picker->property("cellWidth").toDouble()+3.5,150);
+        QTRY_VERIFY(qAbs(indicator->x()-3)<.5);
+        QVERIFY(!accounts->useForSelection());saved.sync();QVERIFY(saved.value("chatGptPlan/useForSelection").toBool());
+        if(!evidence.isEmpty())QVERIFY(settings->grabWindow().save(evidence+(dark?"-connection-api-dark.png":"-connection-api-light.png")));
+        QVERIFY(settings->close());QCOMPARE(accounts->connectionMode(),QString("apiKey"));QCOMPARE(vault->requests.size(),0);
+    }
+
+    void unifiedConnectionRoutesEveryPreviewWithoutSendingOrFallingBack() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profileGuard;QSettings saved;
+        for(const auto &key:ChatGptPreferenceGuard::keys())saved.remove(key);
+        saved.setValue("chatGptPlan/accounts",QVariantList{QVariantMap{{"id","synthetic-unified"},{"connected",true},{"model","synthetic-plan-model"}}});
+        saved.setValue("chatGptPlan/selected","synthetic-unified");saved.setValue("chatGptPlan/connectionMode","chatGPT");saved.sync();
+        auto *accounts=ChatGptAccounts::instance();QVERIFY(accounts->refreshConnection());
+        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-unified-preview.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-api-model"},{"imageInput",true}});
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",17}});
+        struct Case {QString view;int action;QString scope;bool inplace=false;};
+        for(const auto &entry:QList<Case>{{"summary",1,{}},{"summary",5,{}},{"summary",2,{}},{"summary",0,{}},{"chat",4,{}},{"translation",3,"selection"},{"translation",3,"document"},{"translation",3,"selection",true}}) {
+            reader->setAiInput("view",entry.view);reader->setAiInput("action",entry.action);
+            reader->setAiInput("question","What does LyraReader fixture say?");
+            if(!entry.scope.isEmpty()){reader->setAiInput("translationScope",entry.scope);reader->setAiInput("inplace",entry.inplace);}
+            QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
+            const auto state=reader->aiState(),plan=state.value("plan").toMap();QVERIFY2(!plan.isEmpty(),qPrintable(state.value("status").toString()));
+            QCOMPARE(plan.value("chatgpt_account").toString(),QString("synthetic-unified"));QCOMPARE(plan.value("model").toString(),QString("synthetic-plan-model"));
+            if(entry.inplace)QCOMPARE(plan.value("kind").toString(),QString("inplace_translation"));
+            QCOMPARE(plan.value("endpoint").toString(),QString("https://api.openai.com/v1/responses"));
+            const auto parts=plan.value("parts").toList();QVERIFY(!parts.isEmpty());
+            for(const auto &part:parts){const auto body=QJsonDocument::fromJson(part.toMap().value("wire_body").toString().toUtf8()).object();QVERIFY(body.value("stream").toBool());QVERIFY(!body.value("store").toBool());}
+            reader->invalidateAiPlan();QCOMPARE(server.requests.size(),0);
+        }
+        QVERIFY(QMetaObject::invokeMethod(window,"openDocumentReading"));auto *reading=window->findChild<QObject *>("documentReadingPopup");QVERIFY(reading);
+        QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));
+        QCOMPARE(reader->documentReading().value("plan").toMap().value("chatgpt_account").toString(),QString("synthetic-unified"));reader->stopDocumentReading();QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(QMetaObject::invokeMethod(reading,"close"));
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands());
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QVERIFY(QMetaObject::invokeMethod(card,"open"));
+        reader->setAiRegionQuestion("Explain this synthetic region");QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(reader->aiState().value("plan").toMap().value("chatgpt_account").toString(),QString("synthetic-unified"));
+        const auto official=reader->aiState().value("plan").toMap();saved.setValue("chatGptPlan/connectionMode","apiKey");saved.sync();
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(window->property("operationStatus").toString().contains("settings changed"));QCOMPARE(accounts->connectionMode(),QString("apiKey"));
+        QVERIFY(!reader->aiState().contains("plan"));QVERIFY(QMetaObject::invokeMethod(window,"sendAi",Q_ARG(QVariant,QVariant::fromValue(reader)),Q_ARG(QVariant,official),Q_ARG(QVariant,QString()),Q_ARG(QVariant,QString())));
+        QCOMPARE(window->property("credentialReadId").toDouble(),-1.);QVERIFY(!reader->aiState().value("running").toBool());
+        QVERIFY(QMetaObject::invokeMethod(card,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(reader->aiState().value("plan").toMap().value("model").toString(),QString("synthetic-api-model"));
+        // Choosing a disconnected plan must not silently fall back to the local API.
+        saved.setValue("chatGptPlan/accounts",QVariantList{});saved.sync();QVERIFY(accounts->selectConnectionMode("chatGPT"));
+        reader->setAiInput("view","chat");QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->aiState().contains("plan"));
+        QVERIFY(window->property("operationStatus").toString().contains("Sign in"));QCOMPARE(server.requests.size(),0);
+        saved.setValue("chatGptPlan/connectionMode",QVariantMap{{"unknown",true}});saved.sync();QVERIFY(accounts->refreshConnection());
+        QVERIFY(!panel->property("chatConfigured").toBool());QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(!reader->aiState().contains("plan"));QCOMPARE(server.requests.size(),0);
+    }
+
+    void unifiedConnectionKeepsNotePreviewsReviewedAndLocalEditingAvailable() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profileGuard;QSettings saved;
+        for(const auto &key:ChatGptPreferenceGuard::keys())saved.remove(key);saved.sync();auto *accounts=ChatGptAccounts::instance();QVERIFY(accounts->refreshConnection());
+        MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Synthetic completed discussion [p.1]"}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-unified-notes.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        const QVariantMap settings{{"baseUrl",server.baseUrl()},{"model","synthetic-note-model"}};window->setProperty("aiSettings",settings);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
+        const auto region=reader->aiRegion().value("history_id").toString();QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->setRegionNoteDraft(region,"Original manually saved ideas"));QVERIFY(reader->saveRegionNoteDraft());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *regionNotes=window->findChild<QObject *>("regionNotes");QVERIFY(regionNotes);QVERIFY(QMetaObject::invokeMethod(regionNotes,"load",Q_ARG(QVariant,region)));
+        auto *keep=regionNotes->findChild<QObject *>("keepRegionKnowledgeNote");QVERIFY(keep);QTRY_VERIFY(keep->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        auto *notes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(notes);QTRY_COMPARE(notes->property("note").toMap().value("content").toString(),QString("Original manually saved ideas"));const auto noteId=notes->property("note").toMap().value("id").toString();QVERIFY(QMetaObject::invokeMethod(notes,"close"));
+        reader->setAiRegionQuestion("Explain the synthetic fixture");QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands());reader->prepareAiRegion(settings);QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY(!reader->aiState().value("running").toBool());reader->flushAiRegionNote(false);QTRY_VERIFY(!reader->regionPersistencePending() && !reader->pendingCommands());QCOMPARE(server.requests.size(),1);
+        saved.setValue("chatGptPlan/accounts",QVariantList{QVariantMap{{"id","synthetic-note-plan"},{"connected",true},{"model","synthetic-note-plan-model"}}});saved.setValue("chatGptPlan/selected","synthetic-note-plan");saved.sync();QVERIFY(accounts->selectConnectionMode("chatGPT"));
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QVERIFY(QMetaObject::invokeMethod(card,"open"));QVERIFY(QMetaObject::invokeMethod(card,"prepareKnowledge"));QTRY_COMPARE(reader->pendingCommands(),0);
+        auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("kind").toString(),QString("region_knowledge_note"));QCOMPARE(plan.value("chatgpt_account").toString(),QString("synthetic-note-plan"));QCOMPARE(plan.value("endpoint").toString(),QString("https://api.openai.com/v1/responses"));
+        // The account lock stops before any vault access, proving new note kinds
+        // reached admission without sending synthetic discussion to a provider.
+        const auto folder=QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation)).filePath("chatgpt-accounts");QVERIFY(QDir().mkpath(folder));const auto hash=QString::fromLatin1(QCryptographicHash::hash(QByteArray("synthetic-note-plan"),QCryptographicHash::Sha256).toHex());QLockFile lock(QDir(folder).filePath("chatgpt-"+hash+".lock"));lock.setStaleLockTime(0);QVERIFY(lock.tryLock(0));
+        QVERIFY(!accounts->send(reader,plan,{}));QVERIFY(accounts->status().contains("being updated"));QVERIFY(!accounts->busy());
+        window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",17}});auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepareReadingNoteUpdate",Q_ARG(QVariant,noteId)));QTRY_COMPARE(reader->pendingCommands(),0);
+        plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("kind").toString(),QString("reading_note_suggestion"));QCOMPARE(plan.value("chatgpt_account").toString(),QString("synthetic-note-plan"));
+        QVERIFY(!accounts->send(reader,plan,{}));QVERIFY(accounts->status().contains("being updated"));QCOMPARE(server.requests.size(),1);
+        saved.setValue("chatGptPlan/connectionMode",QVariantList{"unknown"});saved.sync();QVERIFY(accounts->refreshConnection());QVERIFY(!reader->aiState().contains("plan"));
+        QVERIFY(reader->setRegionNoteDraft(region,"Local edits still work without an AI connection"));QVERIFY(reader->saveRegionNoteDraft());QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->hasUnsavedReadingNotes());QCOMPARE(server.requests.size(),1);
+    }
+
+    void changingConnectionRetiresAllWindowsTabsAndLateCredentialIntent() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profileGuard;QSettings saved;
+        for(const auto &key:ChatGptPreferenceGuard::keys())saved.remove(key);saved.sync();auto *accounts=ChatGptAccounts::instance();QVERIFY(accounts->refreshConnection());
+        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto first=scratch.filePath("synthetic-first.pdf"),second=scratch.filePath("synthetic-second.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",first));QVERIFY(QFile::copy(first,second));
+        auto *vault=new FakeCredentialStore;WorkspaceController workspace(nullptr,vault);QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        NativeCorpus::Viewer other;QVERIFY(other.window);other.workspace.openFile(QUrl::fromLocalFile(first));auto *peer=other.workspace.activeReader();
+        workspace.openFile(QUrl::fromLocalFile(first));auto *reader=workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());QTRY_VERIFY(peer->pageCount()==1 && !peer->loading() && !peer->pendingCommands());
+        const QVariantMap request{{"action","DocumentChat"},{"current_page",0},{"question","Synthetic draft"},{"base_url",server.baseUrl()},{"model","synthetic-api-model"},{"document_knowledge_pages",QVariantList{}},{"reasoning_mode","default"},{"reasoning_encoding","none"}};
+        reader->setAiInput("view","chat");reader->setAiInput("question","Keep this unsent draft");reader->prepareAi(request);peer->prepareAi(request);
+        QTRY_COMPARE(reader->pendingCommands(),0);QTRY_COMPARE(peer->pendingCommands(),0);const auto old=reader->aiState().value("plan").toMap();QVERIFY(!old.isEmpty());QVERIFY(!peer->aiState().value("plan").toMap().isEmpty());
+        auto *term=qobject_cast<ReadingTermController *>(reader->readingTerm());QVERIFY(term);auto termRequest=request;termRequest.insert("action","SummarizeDocument");termRequest.insert("question","LyraReader");QVERIFY(term->prepare(termRequest));QTRY_COMPARE(term->state().value("phase").toString(),QString("preview"));
+        auto knowledge=request;knowledge.insert("action","SummarizeDocument");knowledge.insert("question",QVariant{});knowledge.insert("document_knowledge",true);reader->prepareDocumentReading(knowledge);QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));
+        workspace.openFile(QUrl::fromLocalFile(second));auto *tab=workspace.activeReader();QVERIFY(tab!=reader);QTRY_VERIFY(tab->pageCount()==1 && !tab->loading() && !tab->pendingCommands());tab->prepareAi(request);QTRY_COMPARE(tab->pendingCommands(),0);QVERIFY(!tab->aiState().value("plan").toMap().isEmpty());
+        // Simulate the asynchronous credential boundary with a loopback plan. If the
+        // old intent survived, its reply could start a real mock HTTP request.
+        const auto id=workspace.credentials()->read(server.baseUrl());QCOMPARE(vault->requests.size(),1);
+        window->setProperty("credentialReadId",double(id));window->setProperty("pendingAiReader",QVariant::fromValue(reader));window->setProperty("pendingAiPlan",old);
+        QVERIFY(accounts->selectConnectionMode("chatGPT"));
+        QCOMPARE(window->property("credentialReadId").toDouble(),-1.);QVERIFY(!window->property("pendingAiReader").value<QObject *>());
+        for(auto *value:{reader,tab,peer})QVERIFY(!value->aiState().contains("plan"));
+        QVERIFY(term->state().isEmpty());QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("idle"));
+        QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QString("Keep this unsent draft"));
+        vault->reply(0,"SYNTHETIC_LATE_KEY");QTest::qWait(100);QVERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),0);
+        // Even a retained API plan cannot start or request a new credential in plan mode.
+        QVERIFY(QMetaObject::invokeMethod(window,"sendAi",Q_ARG(QVariant,QVariant::fromValue(reader)),Q_ARG(QVariant,old),Q_ARG(QVariant,QString()),Q_ARG(QVariant,QString())));
+        QCOMPARE(vault->requests.size(),1);QCOMPARE(server.requests.size(),0);
+    }
+
     void chatGptSettingsLabelsFitTheSmallestRestorableWindow_data() {
         QTest::addColumn<QString>("appearance");
         QTest::newRow("light") << QStringLiteral("light");
@@ -496,8 +733,8 @@ private slots:
         QVERIFY(settings);
         QTRY_VERIFY(settings->isVisible());
         QTRY_COMPARE(settings->width(), 360);
-        for (const auto *name : {"useChatGptForSelection", "useChatGptForLayeredSummaries", "useChatGptForWholeDocument"}) {
-            auto *checkBox = settings->findChild<QQuickItem *>(name);
+        for (const auto *name : {"settingsAiConnectionModeSegment0", "settingsAiConnectionModeSegment1"}) {
+            auto *checkBox = visualItem(settings->contentItem(),name);
             QVERIFY(checkBox);
             const auto label = [&] { return checkBox->property("contentItem").value<QQuickItem *>(); };
             QTRY_VERIFY(label() && label()->width() > 0);
@@ -7048,7 +7285,7 @@ Rectangle {
         MockChatServer sentinel;QVERIFY(sentinel.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("qt-ai-request-fixture.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);reader->requestText(0);QTRY_VERIFY(!reader->textPages().value("0").toMap().value("chars").toList().isEmpty());
         view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-golden-model"},{"reasoningMode","low"},{"reasoningEncoding","reasoning_effort"}});view.window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",12}});auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);QJsonArray actual;
         for(int action=0;action<6;++action) {
-            reader->setAiInput("action",action);if(action==2 || action==4)reader->setAiInput("question","Explain the synthetic fixture text.");if(action==3)reader->setAiInput("language","French");QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto plan=reader->aiState().value("plan").toMap();QVERIFY2(!plan.isEmpty(),qPrintable(reader->aiState().value("status").toString()));QJsonArray bodies;for(const auto &part:plan.value("parts").toList()){const auto body=part.toMap().value("wire_body").toString();QVERIFY(!body.isEmpty());bodies.append(body);}actual.append(QJsonObject{{"action",action},{"wire_bodies",bodies},{"source_pages",QJsonArray::fromVariantList(plan.value("source_pages").toList())}});
+            reader->setAiInput("action",action);if(action==2 || action==4)reader->setAiInput("question","Explain the synthetic fixture text.");if(action==3){reader->setAiInput("language","French");reader->setAiInput("translationScope","selection");}QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);const auto plan=reader->aiState().value("plan").toMap();QVERIFY2(!plan.isEmpty(),qPrintable(reader->aiState().value("status").toString()));QJsonArray bodies;for(const auto &part:plan.value("parts").toList()){const auto body=part.toMap().value("wire_body").toString();QVERIFY(!body.isEmpty());bodies.append(body);}actual.append(QJsonObject{{"action",action},{"wire_bodies",bodies},{"source_pages",QJsonArray::fromVariantList(plan.value("source_pages").toList())}});
         }
         QCOMPARE(sentinel.requests.size(),0);const auto output=qEnvironmentVariable("LYRA_READER_WRITE_QT_AI_GOLDEN");if(!output.isEmpty()){QFile file(output);QVERIFY(file.open(QIODevice::WriteOnly|QIODevice::NewOnly));const auto bytes=QJsonDocument(QJsonObject{{"schema_version",1},{"provenance","Synthetic text-page.pdf; native Qt ordinary requests and shared reading tasks"},{"cases",actual}}).toJson(QJsonDocument::Indented);QCOMPARE(file.write(bytes),bytes.size());return;}
         QFile golden(root+"/tests/fixtures/qt-ai-request-goldens.json");QVERIFY2(golden.open(QIODevice::ReadOnly),"The adopted public synthetic Qt request golden is required");const auto expected=QJsonDocument::fromJson(golden.readAll()).object();QCOMPARE(expected.value("schema_version").toInt(),1);QCOMPARE(actual,expected.value("cases").toArray());

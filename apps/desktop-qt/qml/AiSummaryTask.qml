@@ -42,6 +42,7 @@ AiReadingScrollView {
     readonly property bool hasResult: !!result.output
     readonly property bool popupVisible: more.visible
     readonly property bool configured: {
+        if(!app.aiConnectionReady)return false;
         const account = app.session ? app.session.chatGptAccounts : null;
         const useAccount = account && (panel.selectedSummary ? account.useForSelection : account.useForWholeDocument);
         return useAccount ? account.connected && !!String(account.model || "").trim() : !!String(app.aiSettings.model || "").trim();

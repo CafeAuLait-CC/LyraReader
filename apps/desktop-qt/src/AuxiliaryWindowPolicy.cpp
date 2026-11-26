@@ -157,5 +157,12 @@ void AuxiliaryWindowPolicy::returnFocus() {
     const auto owner=m_owner;
     // A one-shot preview destroys its policy on close. Keep the deferred activation
     // scoped to the surviving owner instead, so that destruction cannot cancel it.
-    if(owner)QTimer::singleShot(0,owner,[owner]{if(owner && owner->isVisible())owner->requestActivate();});
+    if(owner)QTimer::singleShot(0,owner,[owner] {
+        if(!owner || !owner->isVisible())return;
+        // A dialog can be reopened, or another auxiliary window shown, before this
+        // close callback runs. Returning focus must not override that newer intent.
+        for(const auto *window:QGuiApplication::topLevelWindows())
+            if(window->isVisible() && window->transientParent()==owner)return;
+        owner->requestActivate();
+    });
 }

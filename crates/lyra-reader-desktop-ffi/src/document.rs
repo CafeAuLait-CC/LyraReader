@@ -1033,12 +1033,16 @@ impl DesktopDocument {
                 if account.is_some() {
                     let reading = r["reading"]["kind"].as_str();
                     let eligible = match request.action {
-                        AiActionRecord::DocumentChat => r.get("reading").is_none(),
+                        AiActionRecord::DocumentChat
+                        | AiActionRecord::AskSelection
+                        | AiActionRecord::SummarizePage => r.get("reading").is_none(),
                         AiActionRecord::SummarizeSelection => reading == Some("summary"),
                         AiActionRecord::TranslateSelection => reading == Some("translation"),
                         AiActionRecord::SummarizeDocument => {
-                            matches!(reading, Some("summary" | "translation"))
-                                && request.selection.is_none()
+                            matches!(
+                                reading,
+                                Some("summary" | "translation" | "note" | "region_note")
+                            ) && request.selection.is_none()
                         }
                         AiActionRecord::RegionQuestion => {
                             r.get("reading").is_none()
@@ -1063,6 +1067,7 @@ impl DesktopDocument {
                             &text(&r["reading"], "id")?,
                             None,
                             request,
+                            account,
                         );
                     }
                     if options.kind == "region_note" {
@@ -1071,6 +1076,7 @@ impl DesktopDocument {
                             &text(&r["reading"], "id")?,
                             Some(&text(&r["reading"], "expected_history_revision")?),
                             request,
+                            account,
                         );
                     }
                     if let Some(id) = r["reading"]["saved_translation"].as_str() {
@@ -1359,7 +1365,12 @@ impl DesktopDocument {
                 }
                 if account.is_some() {
                     let eligible = match (plan.action, r["plan"]["kind"].as_str()) {
-                        (AiActionRecord::DocumentChat, None) => true,
+                        (
+                            AiActionRecord::DocumentChat
+                            | AiActionRecord::AskSelection
+                            | AiActionRecord::SummarizePage,
+                            None,
+                        ) => true,
                         (
                             AiActionRecord::SummarizeAbstract
                             | AiActionRecord::SummarizeSection
@@ -1377,6 +1388,10 @@ impl DesktopDocument {
                         (AiActionRecord::SummarizeDocument, Some("summary_synthesis")) => {
                             r["plan"]["summary_capture"].as_str().is_some()
                         }
+                        (
+                            AiActionRecord::SummarizeDocument,
+                            Some("reading_note_suggestion" | "region_knowledge_note"),
+                        ) => r["plan"]["note_capture"].as_str().is_some(),
                         _ => false,
                     };
                     if !eligible
@@ -1431,7 +1446,7 @@ impl DesktopDocument {
                         let token=text(&r["plan"],"note_capture")?;
                         let capture={
                             let mut pending=self.pending_note.lock().map_err(|_|"Note review state is unavailable.")?;
-                            if !pending.as_ref().is_some_and(|capture|capture.matches(&token,kind,&plan,&d.document_identity().sha256)) {
+                            if !pending.as_ref().is_some_and(|capture|capture.matches(&token,kind,&plan,&d.document_identity().sha256,account)) {
                                 return Err("This note preview changed. Review it again before sending.".into());
                             }
                             pending.take().ok_or("The reviewed note request is unavailable.")?
@@ -5885,6 +5900,105 @@ mod tests {
             "base_url":"http://localhost:11434/v1","model":"synthetic-summary",
             "temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none",
             "document_knowledge_text":"UNVERIFIED_PARTIAL_CONTEXT","document_knowledge_pages":[1]})
+    }
+
+    #[test]
+    fn chatgpt_native_actions_and_notes_keep_the_reviewed_account_and_wire() {
+        use lyra_reader_ai::region_history::{AnswerState, History, Turn};
+        let fixture = Fixture::new("text-page.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let mut request = summary_settings();
+        request["chatgpt_account"] = json!("synthetic-unified");
+        request["question"] = json!("What does LyraReader fixture say?");
+        for action in ["SummarizePage", "AskSelection"] {
+            request["action"] = json!(action);
+            request["selection"] = if action == "AskSelection" {
+                json!({"page":0,"start":0,"end":17})
+            } else {
+                Value::Null
+            };
+            let plan = doc
+                .command(json!({"op":"ai_preview","request":request}))
+                .unwrap();
+            assert_eq!(plan["chatgpt_account"], "synthetic-unified");
+            assert_eq!(
+                plan["endpoint"],
+                lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+            );
+            assert!(
+                doc.command(json!({"op":"ai_start","plan":plan,"api_key":"unused"}))
+                    .unwrap_err()
+                    .contains("connection changed")
+            );
+        }
+        let id = saved_region(&doc);
+        doc.command(json!({"op":"region_note","id":id,"text":"Original manually saved ideas"}))
+            .unwrap();
+        let revision = doc.command(json!({"op":"region_list"})).unwrap()["revision"].clone();
+        let note = doc
+            .command(
+                json!({"op":"ai_reading_keep_region","id":id,"expected_history_revision":revision}),
+            )
+            .unwrap();
+        let path = region_path(&fixture.path);
+        drop(doc);
+        let mut history = History::decode(&fs::read(&path).unwrap()).unwrap();
+        let mut region = history.get(&id).unwrap().clone();
+        region.turns.push(Turn {
+            id: crate::marks::uuid().unwrap(),
+            question: "SYNTHETIC_NOTE_QUESTION".into(),
+            answer: "SYNTHETIC_NOTE_ANSWER".into(),
+            state: AnswerState::Finished,
+            error: None,
+            created_at: 0.0,
+            source_pages: Some(vec![1]),
+        });
+        history.put(region).unwrap();
+        fs::write(&path, history.encode().unwrap()).unwrap();
+        let stored = fs::read(&path).unwrap();
+        let doc = fixture.open();
+        let revision = doc.command(json!({"op":"region_list"})).unwrap()["revision"].clone();
+        request["action"] = json!("SummarizeDocument");
+        request["selection"] = Value::Null;
+        for (kind, target) in [("region_note", json!(id)), ("note", note["id"].clone())] {
+            let plan=doc.command(json!({"op":"ai_preview","request":request,"reading":{"kind":kind,"detail":"Standard","id":target,"expected_history_revision":revision}})).unwrap();
+            assert_eq!(plan["chatgpt_account"], "synthetic-unified");
+            assert_eq!(
+                plan["endpoint"],
+                lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+            );
+            for part in plan["parts"].as_array().unwrap() {
+                let body = part["wire_body"].as_str().unwrap();
+                let wire: Value = serde_json::from_str(body).unwrap();
+                assert_eq!(wire["stream"], true);
+                assert_eq!(wire["store"], false);
+                assert!(
+                    body.contains("SYNTHETIC_NOTE_QUESTION")
+                        && body.contains("SYNTHETIC_NOTE_ANSWER")
+                );
+            }
+            let capture = doc.pending_note.lock().unwrap();
+            let capture = capture.as_ref().unwrap();
+            let record: AiPlanRecord = serde_json::from_value(plan.clone()).unwrap();
+            assert!(capture.matches(
+                plan["note_capture"].as_str().unwrap(),
+                plan["kind"].as_str().unwrap(),
+                &record,
+                &doc.active().unwrap().document_identity().sha256,
+                Some("synthetic-unified")
+            ));
+            assert!(!capture.matches(
+                plan["note_capture"].as_str().unwrap(),
+                plan["kind"].as_str().unwrap(),
+                &record,
+                &doc.active().unwrap().document_identity().sha256,
+                Some("another-account")
+            ));
+            assert!(doc.ai.lock().unwrap().is_none());
+        }
+        assert_eq!(fs::read(path).unwrap(), stored);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
 
     #[test]

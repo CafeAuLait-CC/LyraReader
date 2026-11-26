@@ -82,6 +82,33 @@ bool ChatGptAccounts::busy() const {
     return bool(m_auth) || m_intent!=VaultIntent::None;
 }
 
+QString ChatGptAccounts::connectionMode() const {
+    switch(m_connectionMode) {
+    case ConnectionMode::ApiKey:return QStringLiteral("apiKey");
+    case ConnectionMode::ChatGpt:return QStringLiteral("chatGPT");
+    case ConnectionMode::Legacy:return QStringLiteral("legacy");
+    case ConnectionMode::Invalid:return QStringLiteral("invalid");
+    }
+    return QStringLiteral("invalid");
+}
+QString ChatGptAccounts::connectionModeNote() const {
+    if(m_connectionMode==ConnectionMode::Legacy)
+        return tr("Your previous per-feature choices remain active until you choose one connection for all AI tools.");
+    if(m_connectionMode==ConnectionMode::Invalid)
+        return tr("The saved AI connection choice is unreadable. Choose API key or ChatGPT plan before using AI.");
+    return {};
+}
+bool ChatGptAccounts::selectConnectionMode(const QString &mode) {
+    if(mode!=QStringLiteral("apiKey") && mode!=QStringLiteral("chatGPT")) {
+        setStatus(tr("Choose API key or ChatGPT plan."));return false;
+    }
+    if(!reloadPreferences())return false;
+    if(m_hasConnectionChoice && mode==connectionMode())return true;
+    const bool saved=writePreference(QStringLiteral("connectionMode"),mode);
+    if(saved && mode==QStringLiteral("apiKey") && signingIn())cancelSignIn();
+    setStatus(saved?QString{}:tr("Could not save the AI connection choice."));return saved;
+}
+
 void ChatGptAccounts::setStatus(const QString &message) {
     m_status=message;
     emit changed();
@@ -95,16 +122,32 @@ bool ChatGptAccounts::readPreferences(QSettings &settings) {
     const bool useForSelection=settings.value(QStringLiteral("useForSelection"),false).toBool();
     const bool useForLayers=settings.value(QStringLiteral("useForLayeredSummaries"),false).toBool();
     const bool useForDocument=settings.value(QStringLiteral("useForWholeDocument"),false).toBool();
+    const bool hasChoice=settings.contains(QStringLiteral("connectionMode"));
+    ConnectionMode mode=ConnectionMode::Invalid;
+    if(hasChoice) {
+        const auto raw=settings.value(QStringLiteral("connectionMode"));
+        if(raw.metaType()==QMetaType::fromType<QString>()) {
+            if(raw.toString()==QStringLiteral("apiKey"))mode=ConnectionMode::ApiKey;
+            else if(raw.toString()==QStringLiteral("chatGPT"))mode=ConnectionMode::ChatGpt;
+        }
+    } else {
+        const bool legacy=!accounts.isEmpty() || !selected.isEmpty()
+            || settings.contains(QStringLiteral("useForChat")) || settings.contains(QStringLiteral("useForSelection"))
+            || settings.contains(QStringLiteral("useForLayeredSummaries")) || settings.contains(QStringLiteral("useForWholeDocument"));
+        mode=legacy?ConnectionMode::Legacy:ConnectionMode::ApiKey;
+    }
     settings.endGroup();
     const bool changed=accounts!=m_accounts || selected!=m_selected || useForChat!=m_useForChat
         || useForSelection!=m_useForSelection || useForLayers!=m_useForLayeredSummaries
-        || useForDocument!=m_useForWholeDocument;
+        || useForDocument!=m_useForWholeDocument || mode!=m_connectionMode || hasChoice!=m_hasConnectionChoice;
     m_accounts=accounts;
     m_selected=selected;
     m_useForChat=useForChat;
     m_useForSelection=useForSelection;
     m_useForLayeredSummaries=useForLayers;
     m_useForWholeDocument=useForDocument;
+    m_connectionMode=mode;m_hasConnectionChoice=hasChoice;
+    if(changed)++m_profileRevision;
     return changed;
 }
 
@@ -115,8 +158,10 @@ bool ChatGptAccounts::reloadPreferences() {
         setStatus(tr("Could not load the ChatGPT account preferences."));
         return false;
     }
+    const auto previousMode=m_connectionMode;
     if(readPreferences(settings)) {
         m_vault.clearSession();
+        if(previousMode!=m_connectionMode)emit connectionModeChanged();
         emit profileChanged();
         emit changed();
     }
@@ -395,6 +440,7 @@ void ChatGptAccounts::signOut() {
 }
 
 bool ChatGptAccounts::allowsPlan(const QVariantMap &plan,const QString &readingToken) const {
+    if(m_connectionMode==ConnectionMode::ApiKey || m_connectionMode==ConnectionMode::Invalid)return false;
     const auto action=plan.value(QStringLiteral("action")).toString();
     const auto kind=plan.value(QStringLiteral("kind")).toString();
     const auto scope=plan.value(QStringLiteral("reading_scope")).toMap();
@@ -410,7 +456,7 @@ bool ChatGptAccounts::allowsPlan(const QVariantMap &plan,const QString &readingT
         || (wholeTask && m_useForWholeDocument)
         || action==QStringLiteral("RegionQuestion") || (layered && m_useForLayeredSummaries)
         : action==QStringLiteral("SummarizeDocument"); // Reading has its own explicit ChatGPT preview.
-    return allowed && connected() && plan.value(QStringLiteral("chatgpt_account")).toString()==m_selected
+    return (m_connectionMode==ConnectionMode::ChatGpt || allowed) && connected() && plan.value(QStringLiteral("chatgpt_account")).toString()==m_selected
         && plan.value(QStringLiteral("model")).toString()==model();
 }
 
@@ -426,6 +472,7 @@ bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,cons
     m_pendingReader=alive;
     m_pendingPlan=plan;
     m_pendingReadingToken=readingToken;
+    m_pendingConnectionMode=connectionMode();
     m_intent=VaultIntent::LoadForChat;
     m_vaultId=m_vault.read(vaultKey(m_selected));
     emit changed();
@@ -489,7 +536,9 @@ void ChatGptAccounts::finishChat(const QString &token,const QString &error) {
     m_pendingReader.clear();
     const auto plan=std::exchange(m_pendingPlan,{});
     const auto readingToken=std::exchange(m_pendingReadingToken,{});
+    const auto mode=std::exchange(m_pendingConnectionMode,{});
     if(error.isEmpty() && reader && reloadPreferences() && reader && allowsPlan(plan,readingToken)
+       && mode==connectionMode()
        && reader->startChatGptRequest(m_selected,token,plan,readingToken)) {
         setStatus({});
         return;

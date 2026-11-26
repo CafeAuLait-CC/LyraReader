@@ -20,9 +20,13 @@ Popup {
     Connections {target:reading.app;function onCurrentReaderChanged(){if(reading.visible)reading.close();}}
     readonly property var accounts: app.session ? app.session.chatGptAccounts : null
     readonly property bool chatGptAvailable: !!accounts && accounts.connected && !!accounts.model
-    function prepare() { prepareForConnection(false); }
+    function prepare() { prepareForConnection(!!accounts && accounts.connectionMode==="chatGPT"); }
     function prepareForConnection(useChatGpt) {
-        if (useChatGpt && (!chatGptAvailable || accounts.busy)) return;
+        if(!app.beginAiPreparation())return;
+        if(accounts && (accounts.connectionMode==="apiKey" && useChatGpt
+                || accounts.connectionMode==="chatGPT" && !useChatGpt))return;
+        if(useChatGpt && !chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return;}
+        if(useChatGpt && accounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
         const settings=app.aiSettings;
         const request={action:"SummarizeDocument",document_knowledge:true,document_knowledge_text:null,document_knowledge_pages:[],
             current_page:0,selection:null,question:null,language:null,history:[],region:null,
@@ -70,12 +74,12 @@ Popup {
                 Label {visible:!!reading.state.cache_warning;Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;color:reading.app.colors.warningFg;text:reading.state.cache_warning || ""}
             }
         }
-        Button {objectName:"previewDocumentReading";text:reading.state.phase==="failed" ? qsTr("Retry: Preview Reading") : qsTr("Preview Document Reading");Layout.fillWidth:true;visible:!reading.state.ready;enabled:!!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading && !reading.busy && reading.owner.pendingCommands===0;onClicked:reading.prepare()}
+        Button {objectName:"previewDocumentReading";text:reading.state.phase==="failed" ? qsTr("Retry: Preview Reading") : qsTr("Preview Document Reading");Layout.fillWidth:true;visible:!reading.state.ready;enabled:reading.app.aiConnectionReady && !!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading && !reading.busy && reading.owner.pendingCommands===0;onClicked:reading.prepare()}
         Button {
             objectName:"previewChatGptDocumentReading"
             text:qsTr("Preview Reading with ChatGPT plan")
             Layout.fillWidth:true
-            visible:!reading.state.ready && reading.chatGptAvailable
+            visible:!reading.state.ready && reading.chatGptAvailable && reading.accounts.connectionMode==="legacy"
             enabled:!!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading
                 && !reading.busy && reading.owner.pendingCommands===0 && !!reading.accounts && !reading.accounts.busy
             onClicked:reading.prepareForConnection(true)

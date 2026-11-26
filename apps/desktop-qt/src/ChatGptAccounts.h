@@ -23,6 +23,10 @@ class ChatGptAccounts : public QObject {
     Q_PROPERTY(QString accountId READ accountId NOTIFY profileChanged)
     Q_PROPERTY(QString model READ model NOTIFY profileChanged)
     Q_PROPERTY(bool connected READ connected NOTIFY profileChanged)
+    Q_PROPERTY(QString connectionMode READ connectionMode NOTIFY connectionModeChanged)
+    Q_PROPERTY(QString connectionModeNote READ connectionModeNote NOTIFY connectionModeChanged)
+    Q_PROPERTY(bool connectionReady READ connectionReady NOTIFY connectionModeChanged)
+    Q_PROPERTY(quint64 profileRevision READ profileRevision NOTIFY profileChanged)
     Q_PROPERTY(bool useForChat READ useForChat WRITE setUseForChat NOTIFY profileChanged)
     Q_PROPERTY(bool useForSelection READ useForSelection WRITE setUseForSelection NOTIFY profileChanged)
     Q_PROPERTY(bool useForLayeredSummaries READ useForLayeredSummaries WRITE setUseForLayeredSummaries NOTIFY profileChanged)
@@ -38,10 +42,14 @@ public:
     QString accountId() const { return m_selected; }
     QString model() const;
     bool connected() const;
-    bool useForChat() const { return m_useForChat; }
-    bool useForSelection() const { return m_useForSelection; }
-    bool useForLayeredSummaries() const { return m_useForLayeredSummaries; }
-    bool useForWholeDocument() const { return m_useForWholeDocument; }
+    QString connectionMode() const;
+    QString connectionModeNote() const;
+    bool connectionReady() const { return m_connectionMode!=ConnectionMode::Invalid; }
+    quint64 profileRevision() const { return m_profileRevision; }
+    bool useForChat() const { return effectiveGrant(m_useForChat); }
+    bool useForSelection() const { return effectiveGrant(m_useForSelection); }
+    bool useForLayeredSummaries() const { return effectiveGrant(m_useForLayeredSummaries); }
+    bool useForWholeDocument() const { return effectiveGrant(m_useForWholeDocument); }
     bool busy() const;
     bool signingIn() const { return m_auth && m_worker==WorkerIntent::SignIn; }
     QString status() const { return m_status; }
@@ -53,6 +61,8 @@ public:
     Q_INVOKABLE void reloadModels();
     Q_INVOKABLE void signOut();
     Q_INVOKABLE bool send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken);
+    Q_INVOKABLE bool selectConnectionMode(const QString &mode);
+    Q_INVOKABLE bool refreshConnection() { return reloadPreferences(); }
 
     void setUseForChat(bool value);
     void setUseForSelection(bool value);
@@ -62,12 +72,16 @@ public:
 signals:
     void changed();
     void profileChanged();
+    void connectionModeChanged();
     void chatRequestFailed(ReaderController *reader,const QString &message);
 
 private:
     explicit ChatGptAccounts(QObject *parent);
     enum class VaultIntent { None, Save, LoadForChat, SaveRefresh, LoadForRevoke, Remove, LoadForModels, SaveModels };
     enum class WorkerIntent { SignIn, Refresh, Revoke, Models };
+    enum class ConnectionMode { ApiKey, ChatGpt, Legacy, Invalid };
+    bool effectiveGrant(bool legacy) const { return m_connectionMode==ConnectionMode::ChatGpt
+        || (m_connectionMode==ConnectionMode::Legacy && legacy); }
 
     QVariantMap selected() const;
     void poll();
@@ -94,6 +108,9 @@ private:
     bool m_useForSelection=false;
     bool m_useForLayeredSummaries=false;
     bool m_useForWholeDocument=false;
+    ConnectionMode m_connectionMode=ConnectionMode::ApiKey;
+    bool m_hasConnectionChoice=false;
+    quint64 m_profileRevision=0;
     VaultIntent m_intent=VaultIntent::None;
     WorkerIntent m_worker=WorkerIntent::SignIn;
     quint64 m_vaultId=0;
@@ -101,6 +118,6 @@ private:
     QString m_refreshedToken;
     bool m_revoked=false;
     QVariantMap m_candidate,m_pendingPlan;
-    QString m_pendingReadingToken;
+    QString m_pendingReadingToken,m_pendingConnectionMode;
     QPointer<ReaderController> m_pendingReader;
 };

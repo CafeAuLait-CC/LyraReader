@@ -4,7 +4,8 @@ use lyra_reader_ai::workspace::{ReadingRecord, ReadingWorkspace, reading_scope_k
 use lyra_reader_ffi::api::{
     AiActionRecord, AiConversationTurnRecord, AiMergePlanRequestRecord, AiPlanRecord,
     AiPlanRequestRecord, AiReadingOptionsRecord, AiWireTransport, LyraReaderDocument,
-    ai_reading_note_input, build_ai_merge_plan, render_ai_plan, style_ai_reading_plan,
+    ai_reading_note_input, build_ai_merge_plan, render_ai_plan, render_chatgpt_plan,
+    style_ai_reading_plan,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -46,6 +47,7 @@ pub(super) struct PendingNote {
     wire_parts: Vec<[u8; 32]>,
     consolidation: Option<Box<AiMergePlanRequestRecord>>,
     language: String,
+    account: Option<String>,
 }
 
 impl PendingNote {
@@ -79,6 +81,9 @@ impl PendingNote {
             result["region_id"] = json!(self.region_id);
         }
         result["note_capture"] = json!(self.token);
+        if let Some(account) = &self.account {
+            result["chatgpt_account"] = json!(account);
+        }
         if final_consolidation {
             result["consolidation"] = json!(true);
         }
@@ -104,7 +109,7 @@ impl PendingNote {
                     self.language.clone(),
                 )
             })
-            .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions))
+            .and_then(|plan| render_note_plan(plan, self.account.as_deref()))
             .map_err(|error| error.to_string())?;
         self.endpoint = plan.endpoint.clone();
         self.wire_parts = plan
@@ -122,8 +127,10 @@ impl PendingNote {
         kind: &str,
         plan: &AiPlanRecord,
         fingerprint: &str,
+        account: Option<&str>,
     ) -> bool {
         self.kind() == kind
+            && self.account.as_deref() == account
             && self.token == token
             && self.fingerprint == fingerprint
             && self.endpoint == plan.endpoint
@@ -161,6 +168,7 @@ impl DesktopDocument {
         id: &str,
         reviewed_region: Option<&str>,
         mut request: AiPlanRequestRecord,
+        account: Option<&str>,
     ) -> Result<Value, String> {
         let fingerprint = document.document_identity().sha256;
         let saved = if reviewed_region.is_none() {
@@ -249,7 +257,7 @@ impl DesktopDocument {
                     detail: "Standard".into(),
                 },
             )
-            .and_then(|plan| render_ai_plan(plan, AiWireTransport::ChatCompletions))
+            .and_then(|plan| render_note_plan(plan, account))
             .map_err(|error| error.to_string())?;
         let consolidation = (plan.parts.len() > 1)
             .then(|| consolidation_request(&plan, reasoning_mode, reasoning_encoding).map(Box::new))
@@ -274,6 +282,7 @@ impl DesktopDocument {
                 .collect(),
             consolidation,
             language,
+            account: account.map(str::to_owned),
         };
         let result = capture.preview_value(plan, false)?;
         *self
@@ -588,6 +597,17 @@ impl DesktopDocument {
     }
 }
 
+fn render_note_plan(
+    plan: AiPlanRecord,
+    account: Option<&str>,
+) -> Result<AiPlanRecord, lyra_reader_ffi::api::LyraReaderFfiError> {
+    if account.is_some() {
+        render_chatgpt_plan(plan)
+    } else {
+        render_ai_plan(plan, AiWireTransport::ChatCompletions)
+    }
+}
+
 fn find_note(workspace: &ReadingWorkspace, id: &str) -> Result<ReadingRecord, String> {
     workspace
         .records()
@@ -667,4 +687,89 @@ fn note_value(
         value["source"] = json!(context);
     }
     value
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[test]
+    fn note_consolidation_retains_its_account_and_exact_responses_body() {
+        let mut plan = lyra_reader_ffi::api::build_ai_connection_test_plan(
+            "http://127.0.0.1:9/v1".into(),
+            "synthetic-notes".into(),
+        )
+        .unwrap();
+        plan.action = AiActionRecord::SummarizeDocument;
+        plan.document_title = "Synthetic note".into();
+        plan.page_count = 1;
+        plan.source_pages = vec![1];
+        plan.parts[0].pages = vec![1];
+        plan.parts[0].primary_page = 1;
+        plan.parts[0].total = 2;
+        plan.parts.push(plan.parts[0].clone());
+        plan.parts[1].index = 1;
+        for account in [None, Some("synthetic-reviewed-account")] {
+            let plan = render_note_plan(plan.clone(), account).unwrap();
+            let merge = consolidation_request(&plan, "default".into(), "none".into()).unwrap();
+            let capture = PendingNote {
+                token: "before-consolidation".into(),
+                target: None,
+                fingerprint: "synthetic-sha".into(),
+                region_id: "synthetic-region".into(),
+                region_revision: "synthetic-revision".into(),
+                covered_turns: 2,
+                endpoint: plan.endpoint.clone(),
+                wire_parts: vec![],
+                consolidation: Some(Box::new(merge)),
+                language: "English".into(),
+                account: account.map(str::to_owned),
+            };
+            let (capture, preview) = capture
+                .consolidate(vec![
+                    "SYNTHETIC_FIRST_PART".into(),
+                    "SYNTHETIC_SECOND_PART".into(),
+                ])
+                .unwrap();
+            let record: AiPlanRecord = serde_json::from_value(preview.clone()).unwrap();
+            assert!(capture.matches(
+                preview["note_capture"].as_str().unwrap(),
+                "region_knowledge_note",
+                &record,
+                "synthetic-sha",
+                account
+            ));
+            assert!(!capture.matches(
+                preview["note_capture"].as_str().unwrap(),
+                "region_knowledge_note",
+                &record,
+                "synthetic-sha",
+                Some("changed-account")
+            ));
+            assert_eq!(
+                preview.get("chatgpt_account").and_then(Value::as_str),
+                account
+            );
+            let body = preview["parts"][0]["wire_body"].as_str().unwrap();
+            let wire: Value = serde_json::from_str(body).unwrap();
+            assert!(
+                body.contains("SYNTHETIC_FIRST_PART") && body.contains("SYNTHETIC_SECOND_PART")
+            );
+            if account.is_some() {
+                assert_eq!(
+                    preview["endpoint"],
+                    lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+                );
+                assert_eq!(wire["store"], false);
+                assert!(wire["input"].is_array());
+            } else {
+                assert!(wire["messages"].is_array());
+                assert!(
+                    preview["endpoint"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("/chat/completions")
+                );
+            }
+        }
+    }
 }

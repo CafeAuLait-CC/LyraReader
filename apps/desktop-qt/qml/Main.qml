@@ -1978,9 +1978,35 @@ ApplicationWindow {
         if (session)
             session.credentials.remove(account);
     }
+    readonly property bool aiConnectionReady: !session || session.chatGptAccounts.connectionReady
+    function refreshAiConnection() {
+        const accounts=session ? session.chatGptAccounts : null;
+        if(!accounts)return true;
+        if(!accounts.refreshConnection()) {operationStatus=accounts.status;return false;}
+        if(!accounts.connectionReady) {operationStatus=accounts.connectionModeNote;return false;}
+        return true;
+    }
+    function beginAiPreparation() {
+        const accounts=session ? session.chatGptAccounts : null;
+        const revision=accounts ? accounts.profileRevision : 0;
+        if(!refreshAiConnection())return false;
+        if(accounts && accounts.profileRevision!==revision) {
+            if(currentReader)currentReader.invalidateAiPlan();
+            operationStatus=qsTr("The AI connection settings changed. Preview the request again.");return false;
+        }
+        return true;
+    }
     function startPreparedAi(owner,key,plan,purpose,token) {
+        if(!owner || !refreshAiConnection() || !owner || !aiConnectionMatches(plan))return false;
         if(purpose==="term")return owner.startAiTerm(key,plan);
         return purpose==="document-reading" ? owner.startDocumentReading(key,plan,token) : owner.startAi(key,plan);
+    }
+    function aiConnectionMatches(plan) {
+        if(!plan)return false;
+        const accounts=session ? session.chatGptAccounts : null;
+        if(!accounts)return !plan.chatgpt_account;
+        return accounts.connectionReady && (accounts.connectionMode==="legacy"
+            || (accounts.connectionMode==="chatGPT")===!!plan.chatgpt_account);
     }
     function abandonTermCredential(owner,plan) {
         if(pendingAiPurpose==="term" && pendingAiReader===owner && plan && plan.term_token
@@ -1990,8 +2016,13 @@ ApplicationWindow {
         }
     }
     function sendAi(owner, plan, purpose, token) {
-        if (!owner || !plan)
+        if (!owner || !plan || !refreshAiConnection() || !owner)
             return;
+        if(!aiConnectionMatches(plan)) {
+            operationStatus=plan.chatgpt_account ? qsTr("Check the ChatGPT connection, then Preview and Send again.")
+                : qsTr("The AI connection settings changed. Preview the request again.");
+            return;
+        }
         if (plan.chatgpt_account) {
             const readingToken = purpose === "document-reading" ? token || "" : "";
             if (!session || (purpose === "document-reading" && !readingToken)
@@ -2013,6 +2044,18 @@ ApplicationWindow {
     }
     Connections {
         target: root.session ? root.session.chatGptAccounts : null
+        function onConnectionModeChanged() {
+            root.credentialReadId=-1;root.pendingAiReader=null;root.pendingAiPlan=null;root.pendingAiToken="";
+            if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
+            if(!root.session)return;
+            root.session.credentials.clearSession();
+            for(const tab of root.session.tabs) {
+                const reader=tab.reader;
+                reader.readingTerm.cancel();reader.cancelAi();reader.invalidateAiPlan();
+                if(["preparing","preview","starting","reading"].indexOf(reader.documentReading.phase)>=0)
+                    reader.stopDocumentReading();
+            }
+        }
         function onChatRequestFailed(reader, message) {
             if (reader === root.currentReader) root.operationStatus = message;
         }

@@ -17,15 +17,20 @@ ApplicationWindow {
     property bool auditOnOpen: false
     objectName:"settingsWindow"
     required property var app
+    readonly property var accounts: app.session ? app.session.chatGptAccounts : null
+    property string connectionError: ""
     readonly property var colors:app.colors
     title:qsTr("Settings · LyraReader")
     visible:false
     flags:Qt.Dialog
     transientParent:app
     color:app.colors.windowBg
+    font.pixelSize: 13
     palette:app.palette
     AuxiliaryWindowPolicy {id:policy}
     function open() {
+        connectionError="";
+        if(accounts && !accounts.refreshConnection())connectionError=accounts.status;
         if(visible){requestActivate();return;}
         initialAppearance=app.appearance;initialPaper=app.paperAppearance;
         appearanceEdited=false;paperPresetEdited=false;
@@ -88,14 +93,19 @@ ApplicationWindow {
         }
         // An appearance-only save must retain prepared requests and unknown fields.
         // An explicit credential change still retires pending credential reads/plans.
-        if(aiChanged || apiKey.text.length) {
+        const providerVisible=!accounts || accounts.connectionMode!=="chatGPT";
+        if(providerVisible && (aiChanged || apiKey.text.length)) {
             app.aiSettings=nextAi;
             if(app.session)app.session.setPreference("ai",app.aiSettings);
         }
-        if (apiKey.text.length)
+        if (providerVisible && apiKey.text.length)
             app.saveAiCredential(baseUrl.text, apiKey.text);
         apiKey.clear();
         close();
+    }
+    Connections {
+        target: settings.accounts
+        function onConnectionModeChanged() {settings.connectionError="";if(settings.accounts.connectionMode==="chatGPT")apiKey.clear();}
     }
     onClosing: {
         policy.cancelPresentation();
@@ -191,67 +201,106 @@ ApplicationWindow {
                     font.weight: Font.DemiBold
                     Layout.topMargin: 12
                 }
-                TextField {
-                    id: baseUrl
-                    objectName:"settingsBaseUrl"
+                Button {objectName:"openAuditTrail";text:qsTr("Local audit trail…");onClicked:auditDialog.open()}
+                Label {text:qsTr("Use AI with");textFormat:Text.PlainText}
+                LyraReadingSegmentedPicker {
+                    objectName: "settingsAiConnectionMode"
+                    app: settings.app
                     Layout.fillWidth: true
-                    placeholderText: qsTr("Base URL, e.g. http://localhost:11434/v1")
-                    text: app.aiSettings.baseUrl || "http://localhost:11434/v1"
-                    Accessible.name: qsTr("AI base URL")
-                }
-                TextField {
-                    id: modelName
-                    Layout.fillWidth: true
-                    placeholderText: qsTr("Model name")
-                    text: app.aiSettings.model || ""
-                    Accessible.name: qsTr("AI model")
-                }
-                ComboBox {
-                    id: reasoning
-                    Layout.fillWidth: true
-                    model: ["default", "off", "low", "high", "max"]
-                    currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningMode || "default"))
-                }
-                CheckBox {
-                    id:imageInput
-                    objectName:"settingsAiImageInput"
-                    text:qsTr("This model accepts region images")
-                    checked:!!app.aiSettings.imageInput
-                    Layout.fillWidth:true
-                }
-                ComboBox {
-                    id: encoding
-                    Layout.fillWidth: true
-                    model: ["none", "thinking", "reasoning_effort", "output_config", "reasoning.effort"]
-                    currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningEncoding || "none"))
-                }
-                TextField {
-                    id: apiKey
-                    objectName:"settingsApiKey"
-                    Layout.fillWidth: true
-                    placeholderText: qsTr("API key — saved only in the system keychain")
-                    echoMode: TextInput.Password
-                    Accessible.name: qsTr("AI API key")
+                    choices: [{title:qsTr("API key")},{title:qsTr("ChatGPT plan")}]
+                    currentIndex: !settings.accounts || settings.accounts.connectionMode==="apiKey" ? 0
+                        : settings.accounts.connectionMode==="chatGPT" ? 1 : -1
+                    activateSelected: true
+                    enabled: !!settings.accounts
+                    onActivated: function(index) {
+                        settings.connectionError="";
+                        if(!settings.accounts.selectConnectionMode(index===0?"apiKey":"chatGPT"))
+                            settings.connectionError=settings.accounts.status;
+                    }
                 }
                 Label {
-                    textFormat: Text.PlainText
-                    text: qsTr("Remote requests send the previewed document text only after Send. Keys use the system keychain; no plaintext fallback.")
-                    wrapMode: Text.Wrap
-                    Layout.fillWidth: true
-                    color: app.colors.textSecondary
+                    objectName: "settingsAiConnectionNotice"
+                    text: settings.connectionError || (settings.accounts ? settings.accounts.connectionModeNote : "")
+                    visible: !!text
+                    Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                    color: settings.connectionError || (settings.accounts && !settings.accounts.connectionReady)
+                        ? settings.colors.errorFg : settings.colors.textSecondary
                     font.pixelSize: 11
                 }
-                Button {objectName:"openAuditTrail";text:qsTr("Local audit trail…");onClicked:auditDialog.open()}
-                Button {
-                    text: qsTr("Remove Saved Key")
-                    onClicked: app.removeAiCredential(baseUrl.text)
+                Label {
+                    text: qsTr("Connection and account choices apply immediately.")
+                    textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+                    color: settings.colors.textSecondary; font.pixelSize: 11
+                }
+                ColumnLayout {
+                    id: providerSettings
+                    objectName: "settingsApiProvider"
+                    visible: !settings.accounts || settings.accounts.connectionMode!=="chatGPT"
+                    Layout.fillWidth: true; spacing: 12
+                    Label {text:qsTr("Provider (OpenAI-compatible)");font.weight:Font.DemiBold;textFormat:Text.PlainText}
+                    TextField {
+                        id: baseUrl
+                        objectName:"settingsBaseUrl"
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("Base URL, e.g. http://localhost:11434/v1")
+                        text: app.aiSettings.baseUrl || "http://localhost:11434/v1"
+                        Accessible.name: qsTr("AI base URL")
+                    }
+                    TextField {
+                        id: modelName
+                        objectName: "settingsAiModel"
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("Model name")
+                        text: app.aiSettings.model || ""
+                        Accessible.name: qsTr("AI model")
+                    }
+                    ComboBox {
+                        id: reasoning
+                        Layout.fillWidth: true
+                        model: ["default", "off", "low", "high", "max"]
+                        currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningMode || "default"))
+                    }
+                    CheckBox {
+                        id:imageInput
+                        objectName:"settingsAiImageInput"
+                        text:qsTr("This model accepts region images")
+                        checked:!!app.aiSettings.imageInput
+                        Layout.fillWidth:true
+                    }
+                    ComboBox {
+                        id: encoding
+                        Layout.fillWidth: true
+                        model: ["none", "thinking", "reasoning_effort", "output_config", "reasoning.effort"]
+                        currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningEncoding || "none"))
+                    }
+                    TextField {
+                        id: apiKey
+                        objectName:"settingsApiKey"
+                        Layout.fillWidth: true
+                        placeholderText: qsTr("API key — saved only in the system keychain")
+                        echoMode: TextInput.Password
+                        Accessible.name: qsTr("AI API key")
+                    }
+                    Label {
+                        textFormat: Text.PlainText
+                        text: qsTr("Remote requests send the previewed document text only after Send. Keys use the system keychain; no plaintext fallback.")
+                        wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                        color: app.colors.textSecondary
+                        font.pixelSize: 11
+                    }
+                    Button {
+                        text: qsTr("Remove Saved Key")
+                        onClicked: app.removeAiCredential(baseUrl.text)
+                    }
                 }
                 ColumnLayout {
                     id: chatGptSettings
+                    objectName: "settingsChatGptProvider"
                     readonly property var accounts: app.session ? app.session.chatGptAccounts : null
                     readonly property var selected: accounts ?
                         accounts.accounts.find(entry => entry.id === accounts.accountId) : null
-                    visible: !!accounts
+                    visible: !!accounts && accounts.connectionMode!=="apiKey"
                     Layout.topMargin: 12
                     Layout.fillWidth: true
                     Label {
@@ -308,53 +357,15 @@ ApplicationWindow {
                         Accessible.name: qsTr("ChatGPT model")
                         onActivated: chatGptSettings.accounts.selectModel(currentValue)
                     }
-                    CheckBox {
+                    Button {
+                        objectName: "reloadChatGptModels"
                         Layout.fillWidth: true
-                        text: qsTr("Document chat")
-                        Accessible.name: qsTr("Use ChatGPT plan for document chat")
-                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForChat
-                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
-                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
-                        onToggled: chatGptSettings.accounts.useForChat = checked
-                    }
-                    CheckBox {
-                        objectName: "useChatGptForSelection"
-                        Layout.fillWidth: true
-                        text: qsTr("Selection summary and translation")
-                        Accessible.name: qsTr("Use ChatGPT plan for selection summary and translation")
-                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForSelection
-                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
-                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
-                        onToggled: chatGptSettings.accounts.useForSelection = checked
-                    }
-                    CheckBox {
-                        objectName: "useChatGptForLayeredSummaries"
-                        Layout.fillWidth: true
-                        text: qsTr("Layered summaries")
-                        Accessible.name: qsTr("Use ChatGPT plan for layered summaries")
-                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForLayeredSummaries
-                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
-                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
-                        onToggled: chatGptSettings.accounts.useForLayeredSummaries = checked
-                    }
-                    CheckBox {
-                        objectName: "useChatGptForWholeDocument"
-                        Layout.fillWidth: true
-                        text: qsTr("Whole-document summary and translation")
-                        Accessible.name: qsTr("Use ChatGPT plan for whole-document summary and translation")
-                        checked: !!chatGptSettings.accounts && chatGptSettings.accounts.useForWholeDocument
-                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy &&
-                            (checked || (chatGptSettings.accounts.connected && !!chatGptSettings.accounts.model))
-                        onToggled: chatGptSettings.accounts.useForWholeDocument = checked
+                        text: qsTr("Reload models")
+                        visible: !!chatGptSettings.accounts && chatGptSettings.accounts.connected
+                        enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
+                        onClicked: chatGptSettings.accounts.reloadModels()
                     }
                     RowLayout {
-                        Button {
-                            objectName: "reloadChatGptModels"
-                            text: qsTr("Reload models")
-                            visible: !!chatGptSettings.accounts && chatGptSettings.accounts.connected
-                            enabled: !!chatGptSettings.accounts && !chatGptSettings.accounts.busy
-                            onClicked: chatGptSettings.accounts.reloadModels()
-                        }
                         Button {
                             text: qsTr("Sign Out")
                             visible: !!chatGptSettings.accounts && chatGptSettings.accounts.connected

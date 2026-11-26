@@ -273,7 +273,7 @@ void ReaderController::setAiRegionQuestion(const QString &text) {
 }
 void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledgeNote) {
     if(!m_aiRegion.contains(QStringLiteral("image_png")) || m_aiRegion.value(QStringLiteral("loading")).toBool() || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return;
-    const QString chatgptAccount=knowledgeNote?QString{}:settings.value(QStringLiteral("chatgptAccount")).toString();
+    const QString chatgptAccount=settings.value(QStringLiteral("chatgptAccount")).toString();
     if(regionNeedsSave()) {
         if(knowledgeNote)return;
         invalidateAiPlan();m_regionContinuationPending=true;m_regionContinuationSettings=settings;
@@ -295,8 +295,8 @@ void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledg
         {QStringLiteral("base_url"),settings.value(QStringLiteral("baseUrl"),QStringLiteral("http://localhost:11434/v1"))},{QStringLiteral("model"),settings.value(QStringLiteral("model"),QString{})},
         {QStringLiteral("temperature"),QVariant{}},{QStringLiteral("max_tokens"),QVariant{}},
         {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}};
+    if(!chatgptAccount.isEmpty())request.insert(QStringLiteral("chatgpt_account"),chatgptAccount);
     if(!knowledgeNote) {
-        if(!chatgptAccount.isEmpty())request.insert(QStringLiteral("chatgpt_account"),chatgptAccount);
         prepareAi(request);
         return;
     }

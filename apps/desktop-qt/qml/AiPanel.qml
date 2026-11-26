@@ -90,6 +90,7 @@ Pane {
     property string lastKeptNoteId: ""
     property string notice: ""
     readonly property bool chatConfigured: {
+        if(!app.aiConnectionReady)return false;
         const account = app.session ? app.session.chatGptAccounts : null;
         return account && account.useForChat ? account.connected && !!String(account.model || "").trim() : !!String(app.aiSettings.model || "").trim();
     }
@@ -168,6 +169,9 @@ Pane {
     }
     function prepareReadingNoteUpdate(noteId) {
         const request = baseRequest("SummarizeDocument");
+        request.selection=null;
+        const accounts=app.session ? app.session.chatGptAccounts : null;
+        if(accounts && !connectChatGpt(request,accounts,accounts.connectionMode==="chatGPT"))return;
         request.language = input.summaryLanguage || null;
         owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
     }
@@ -256,6 +260,7 @@ Pane {
         };
     }
     function connectChatGpt(request, accounts, enabled) {
+        if(!app.beginAiPreparation())return false;
         if (!enabled) return true;
         if (!accounts.connected || !accounts.model) {
             app.operationStatus = qsTr("Sign in and choose a ChatGPT model in Settings.");
@@ -305,7 +310,8 @@ Pane {
         }
         else {
             const request = baseRequest(modes[action]);
-            if (request.action === "DocumentChat" && accounts && !connectChatGpt(request, accounts, accounts.useForChat)) return;
+            if (accounts && !connectChatGpt(request, accounts, accounts.connectionMode==="chatGPT"
+                    || (request.action === "DocumentChat" && accounts.useForChat))) return;
             owner.prepareAi(request);
         }
     }

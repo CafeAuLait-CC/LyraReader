@@ -7,6 +7,7 @@ Item {
     required property var choices
     property int currentIndex: 0
     property real indicatorIndex: currentIndex
+    property bool activateSelected: false
     signal activated(int index)
     implicitHeight: 36
     readonly property real cellWidth: Math.max(0, (width - 10) / 2)
@@ -15,11 +16,11 @@ Item {
     function choose(index, reason) {
         const button = buttons.itemAt(index);
         if (!enabled || !button) return;
-        if (currentIndex !== index) activated(index);
+        if (currentIndex !== index || activateSelected) activated(index);
         button.forceActiveFocus(reason);
     }
     Behavior on indicatorIndex {
-        enabled: !picker.app.reduceMotion
+        enabled: !picker.app.reduceMotion && picker.currentIndex >= 0 && picker.indicatorIndex >= 0
         NumberAnimation { duration: 180; easing.type: Easing.InOutQuad }
     }
     Rectangle {
@@ -29,6 +30,7 @@ Item {
     }
     Rectangle {
         objectName: picker.objectName + "Indicator"
+        visible: picker.currentIndex >= 0 && picker.currentIndex < picker.choices.length
         x: 3 + (picker.cellWidth + 4) * (app.reduceMotion ? picker.currentIndex : picker.indicatorIndex)
         y: 3; width: picker.cellWidth; height: picker.height - 6
         radius: 6; color: app.colors.selectedBg

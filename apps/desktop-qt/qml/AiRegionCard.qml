@@ -247,7 +247,12 @@ Item {
     }
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){closeAnimated();event.accepted=true;}
-    function prepare(){if(owner===app.currentReader){showingNote=false;owner.prepareAiRegion(app.aiSettings);}}
+    function prepare(){
+        if(owner!==app.currentReader)return;
+        if(chatGptAccounts && chatGptAccounts.connectionMode==="chatGPT") {prepareWithChatGpt();return;}
+        if(!app.beginAiPreparation())return;
+        showingNote=false;owner.prepareAiRegion(app.aiSettings);
+    }
     function submitQuestion() {
         if (previewReady && !running && owner && !owner.pendingCommands)
             app.sendAi(owner,plan);
@@ -255,9 +260,25 @@ Item {
             prepare();
     }
     function prepareWithChatGpt() {
-        if (owner!==app.currentReader || !chatGptAvailable || chatGptAccounts.busy) return;
+        if(!app.beginAiPreparation() || !chatGptAccounts
+                || ["legacy","chatGPT"].indexOf(chatGptAccounts.connectionMode)<0)return;
+        if(owner!==app.currentReader)return;
+        if(!chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return;}
+        if(chatGptAccounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
+        showingNote=false;
         owner.prepareAiRegion({baseUrl:"https://api.openai.com/v1", model:chatGptAccounts.model,
             imageInput:true, chatgptAccount:chatGptAccounts.accountId});
+    }
+    function prepareKnowledge() {
+        if(owner!==app.currentReader || !app.beginAiPreparation())return;
+        const settings=Object.assign({},app.aiSettings);
+        if(chatGptAccounts && chatGptAccounts.connectionMode==="chatGPT") {
+            if(!chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return;}
+            if(chatGptAccounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
+            settings.baseUrl="https://api.openai.com/v1";settings.model=chatGptAccounts.model;
+            settings.chatgptAccount=chatGptAccounts.accountId;settings.reasoningMode="default";settings.reasoningEncoding="none";
+        }
+        showingNote=true;owner.prepareAiRegion(settings,true);
     }
     function follow(link,plan) {
         if(owner!==app.currentReader || plan.generation!==owner.documentGeneration)return;
@@ -363,11 +384,11 @@ Item {
                         objectName:"prepareAiRegionKnowledge"
                         text:qsTr("Finish & Make Note…")
                         enabled:!!card.attachment.completed_turn_count && !card.candidate && !!card.owner && !!card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
-                        onTriggered:{card.showingNote=true;card.owner.prepareAiRegion(card.app.aiSettings,true);}
+                        onTriggered:card.prepareKnowledge()
                     }
                     MenuItem {objectName:"saveAiRegionNote";text:qsTr("Save to Reading Notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onTriggered:card.owner.saveAiRegionNote()}
                     MenuItem {text:qsTr("Request Details");enabled:card.previewReady;onTriggered:payload.open()}
-                    MenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable;height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
+                    MenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable && card.chatGptAccounts.connectionMode==="legacy";height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
                     MenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openReadingNotes()}
                     MenuItem {text:qsTr("Open in AI Panel");enabled:!!card.attachment.saved && !!card.attachment.history_id;onTriggered:card.app.openSavedReadingNote(card.attachment.history_id)}
                     MenuItem {text:qsTr("Read document (optional)…");enabled:!!card.owner && !!card.owner.documentReading.choice_pending;onTriggered:card.app.openDocumentReading()}

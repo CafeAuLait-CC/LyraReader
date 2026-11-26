@@ -17,12 +17,14 @@ Item {
     readonly property bool popupVisible: more.visible || termPopup.anyVisible || (!!timeline.headerItem && timeline.headerItem.languagePicker.popupVisible)
     readonly property bool covered: panel.payloadOpen || !!panel.reviewTicket || panel.running
     readonly property bool configured: {
+        if(!app.aiConnectionReady)return false;
         const accounts = app.session ? app.session.chatGptAccounts : null;
         const useAccount = accounts && (panel.translateDocument ? accounts.useForWholeDocument : accounts.useForSelection);
         return useAccount ? accounts.connected && !!String(accounts.model || "").trim() : !!String(app.aiSettings.model || "").trim();
     }
     readonly property bool canReview: configured && !panel.running && !owner.pendingCommands && owner.pageCount > 0
     readonly property bool termConfigured: {
+        if(!app.aiConnectionReady)return false;
         const accounts = app.session ? app.session.chatGptAccounts : null;
         return accounts && accounts.useForWholeDocument ? accounts.connected && !!String(accounts.model || "").trim()
             : !!String(app.aiSettings.model || "").trim();
