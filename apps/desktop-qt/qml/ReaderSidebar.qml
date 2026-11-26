@@ -233,25 +233,69 @@ Pane {
                 objectName: "outlineSidebar"
                 PanelWheelHandler { viewport: outline }
                 clip: true
-                model: app.currentReader.data.outline || []
+                model: Logic.outlineRows(app.currentReader.data.outline || [])
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
+                    id: outlineRow
                     required property var modelData
+                    required property int index
+                    objectName: "outlineRow" + index
                     activeFocusOnTab: true
+                    hoverEnabled: true
                     Accessible.onPressAction: if (enabled && visible)
                         clicked()
                     width: outline.width
-                    height: Math.max(42, outlineText.implicitHeight + 18)
-                    leftPadding: 12 + modelData.depth * 13
-                    highlighted: modelData.page === app.currentPage
-                    Accessible.name: modelData.title
-                    contentItem: Label {
-                        id: outlineText
-                        textFormat: Text.PlainText
-                        text: modelData.title
-                        wrapMode: Text.Wrap
-                        font.pixelSize: 12
-                        color: app.colors.textPrimary
+                    height: Math.max(24, outlineContent.implicitHeight + topPadding + bottomPadding)
+                    leftPadding: 8 + modelData.indent
+                    rightPadding: 8
+                    topPadding: 1
+                    bottomPadding: 1
+                    Accessible.name: modelData.page === null
+                        ? qsTr("%1 · %2").arg(modelData.number).arg(modelData.title)
+                        : qsTr("%1 · %2 · page %3").arg(modelData.number).arg(modelData.title).arg(modelData.page + 1)
+                    background: Rectangle {
+                        color: outlineRow.down ? app.colors.pressedBg : outlineRow.hovered ? app.colors.hoverBg : "transparent"
+                        radius: 6
+                        border.width: outlineRow.visualFocus ? 2 : 0
+                        border.color: app.colors.focusRing
+                    }
+                    contentItem: RowLayout {
+                        id: outlineContent
+                        spacing: 6
+                        Label {
+                            objectName: "outlineNumber" + outlineRow.index
+                            textFormat: Text.PlainText
+                            text: outlineRow.modelData.number
+                            Layout.minimumWidth: 18
+                            Layout.alignment: Qt.AlignBaseline
+                            horizontalAlignment: Text.AlignRight
+                            font.pixelSize: 11
+                            font.features: ({"tnum": 1})
+                            color: app.colors.textSecondary
+                        }
+                        Label {
+                            objectName: "outlineTitle" + outlineRow.index
+                            Layout.fillWidth: true
+                            Layout.minimumWidth: 0
+                            Layout.alignment: Qt.AlignBaseline
+                            textFormat: Text.PlainText
+                            text: outlineRow.modelData.title
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 2
+                            elide: Text.ElideRight
+                            font.pixelSize: 13
+                            color: app.colors.textPrimary
+                        }
+                        Label {
+                            objectName: "outlinePage" + outlineRow.index
+                            visible: outlineRow.modelData.page !== null
+                            textFormat: Text.PlainText
+                            text: visible ? outlineRow.modelData.page + 1 : ""
+                            Layout.alignment: Qt.AlignBaseline
+                            font.pixelSize: 11
+                            font.features: ({"tnum": 1})
+                            color: app.colors.textSecondary
+                        }
                     }
                     onClicked: if (modelData.page !== null)
                         app.navigate(modelData.page, modelData.y_pt || 0)

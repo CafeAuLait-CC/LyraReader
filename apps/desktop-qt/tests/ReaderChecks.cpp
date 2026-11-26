@@ -3453,6 +3453,58 @@ private slots:
         const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-sidebar-segments-"+appearance+".png"));
     }
 
+    void outlineRowsKeepMacHierarchyAndCompactTargets_data() {
+        QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void outlineRowsKeepMacHierarchyAndCompactTargets() {
+        QFETCH(QString,appearance);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(900,750);window->setProperty("appearance",appearance);window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/outlined.pdf"));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==3 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"outline")));QVERIFY(settleReaderViewport(window));
+        auto *outline=visualItem(window->contentItem(),"outlineSidebar");QVERIFY(outline);QTRY_COMPARE(outline->property("count").toInt(),8);
+        QQmlExpression rows(QQmlEngine::contextForObject(outline),outline,"model.map(function(row){return row.number;}).join(',')");
+        QCOMPARE(rows.evaluate().toString(),QString("1,1.1,1.1.1,2,2.1,2.1.1,2.2,3"));QVERIFY(!rows.hasError());
+        const QStringList titles{"Chapter One","Background","Prior work","Chapter Two","Method","Detail","Setup","Chapter Three"};
+        auto *colors=window->property("colors").value<QObject *>();QVERIFY(colors);
+        for(int i=0;i<8;++i) {
+            auto *row=visualItem(outline,"outlineRow"+QString::number(i));QVERIFY(row);auto *title=visualItem(row,"outlineTitle"+QString::number(i));auto *number=visualItem(row,"outlineNumber"+QString::number(i));auto *page=visualItem(row,"outlinePage"+QString::number(i));QVERIFY(title && number && page);
+            QCOMPARE(title->property("text").toString(),titles[i]);QCOMPARE(title->property("maximumLineCount").toInt(),2);QCOMPARE(QQmlProperty(title,"font.pixelSize").read().toInt(),13);
+            QCOMPARE(row->property("leftPadding").toDouble(),8.+reader->data().value("outline").toList()[i].toMap().value("depth").toInt()*10);
+            QVERIFY(row->height()<42);QVERIFY(number->width()>=18);QVERIFY(title->x()>=number->x()+number->width()+5.9);
+            const auto entry=reader->data().value("outline").toList()[i].toMap();QCOMPARE(page->property("visible").toBool(),!entry.value("page").isNull());
+            auto *accessible=QAccessible::queryAccessibleInterface(row);QVERIFY(accessible);QVERIFY(accessible->text(QAccessible::Name).contains(titles[i]));
+        }
+        auto *header=visualItem(outline,"outlineRow3"),*detail=visualItem(outline,"outlineRow5");QVERIFY(header && detail);const auto oldPage=window->property("currentPage");
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);header->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QCOMPARE(window->property("currentPage"),oldPage);
+        auto *background=detail->property("background").value<QQuickItem *>();QVERIFY(background);detail->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(detail->hasActiveFocus());QCOMPARE(QQmlProperty(background,"border.width").read().toInt(),2);
+        QTest::keyPress(window,Qt::Key_Space);QCOMPARE(background->property("color").value<QColor>(),colors->property("pressedBg").value<QColor>());QTest::keyRelease(window,Qt::Key_Space);QTRY_COMPARE(window->property("currentPage").toInt(),2);
+        QTest::mouseMove(window,QPoint(5,5),20);QCOMPARE(background->property("color").value<QColor>(),QColor("transparent"));
+        QTest::mouseMove(window,detail->mapToScene(QPointF(detail->width()/2,detail->height()/2)).toPoint(),20);QTRY_VERIFY(detail->property("hovered").toBool());QCOMPARE(background->property("color").value<QColor>(),colors->property("hoverBg").value<QColor>());
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-outline-"+appearance+".png"));
+        const QString longTitle="A long <b>literal title</b> with several sections and paragraphs that must remain readable without moving the target page outside a narrow sidebar";
+        QVERIFY(QQmlProperty(outline,"model").write(QVariantList{QVariantMap{{"title",longTitle},{"number","1.2.3"},{"indent",20},{"depth",2},{"page",1},{"y_pt",160.}}}));
+        for(int width:{700,1100}) {
+            window->setWidth(width);QVERIFY(settleReaderViewport(window));QQuickItem *row=nullptr,*title=nullptr,*number=nullptr,*page=nullptr;
+            QTRY_VERIFY((row=visualItem(outline,"outlineRow0")) && (title=visualItem(row,"outlineTitle0")) && (number=visualItem(row,"outlineNumber0")) && (page=visualItem(row,"outlinePage0")));
+            QTRY_COMPARE(qRound(row->width()),width<850 ? 210 : 250);QTRY_VERIFY(title->property("truncated").toBool());QVERIFY(title->property("lineCount").toInt()<=2);QCOMPARE(title->property("text").toString(),longTitle);QCOMPARE(title->property("textFormat").toInt(),int(Qt::PlainText));
+            QVERIFY(title->width()>30);QVERIFY(page->x()>=title->x()+title->width()+5.9);
+            QTRY_VERIFY2(page->mapToItem(row,QPointF(page->width(),0)).x()<=row->width()-row->property("rightPadding").toDouble()+.1,qPrintable(QString("Page right %1 outside row %2").arg(page->mapToItem(row,QPointF(page->width(),0)).x()).arg(row->width())));
+            QTRY_VERIFY(qAbs(number->y()+number->baselineOffset()-title->y()-title->baselineOffset())<.1);QTRY_VERIFY(qAbs(page->y()+page->baselineOffset()-title->y()-title->baselineOffset())<.1);
+        }
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-outline-long-"+appearance+".png"));
+        auto *row=visualItem(outline,"outlineRow0");QVERIFY(row);row->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_COMPARE(window->property("currentPage").toInt(),1);
+        QVariant location;QVERIFY(QMetaObject::invokeMethod(window,"currentNavigationLocation",Q_RETURN_ARG(QVariant,location)));
+        QCOMPARE(location.toMap().value("anchor").toMap().value("page").toInt(),1);QVERIFY(qAbs(location.toMap().value("anchor").toMap().value("y").toDouble()-160.)<2.);
+    }
+
+    void outlineNumberingKeepsMissingDestinationsAndDepthGaps() {
+        QFile script(":/qml/ReaderLogic.js");QVERIFY(script.open(QIODevice::ReadOnly));auto code=script.readAll();code=code.mid(code.indexOf('\n')+1);QJSEngine engine;QVERIFY(!engine.evaluate(QString::fromUtf8(code)).isError());
+        auto input=engine.evaluate("[{title:'First',depth:0,page:0,y_pt:12},{title:'No parent',depth:2,page:null,y_pt:null},{title:'Second',depth:0,page:2,y_pt:160}]");
+        auto result=engine.globalObject().property("outlineRows").call({input});QVERIFY(!result.isError());const auto rows=result.toVariant().toList();QCOMPARE(rows.size(),3);
+        QCOMPARE(rows[0].toMap().value("number").toString(),QString("1"));QCOMPARE(rows[1].toMap().value("number").toString(),QString("1.0.1"));QCOMPARE(rows[1].toMap().value("indent").toInt(),20);QVERIFY(rows[1].toMap().value("page").isNull());QCOMPARE(rows[2].toMap().value("number").toString(),QString("2"));QCOMPARE(rows[2].toMap().value("y_pt").toDouble(),160.);
+        QVERIFY(input.property(0).property("number").isUndefined());QCOMPARE(input.property(0).property("y_pt").toNumber(),12.);
+    }
+
     void toolbarHierarchyAndLyraToolsMatchMac() {
         QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
         NativeCorpus::Viewer view;QVERIFY(view.window);

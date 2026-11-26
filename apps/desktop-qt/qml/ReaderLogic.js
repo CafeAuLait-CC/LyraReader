@@ -1,5 +1,17 @@
 .pragma library
 
+// Sidebar numbering is presentation, as in macOS OutlineNumbering. The engine
+// supplies a depth-first outline; a destination-less section still consumes a number.
+function outlineRows(entries) {
+    const counters = []
+    return entries.map(function(entry) {
+        while (counters.length <= entry.depth) counters.push(0)
+        counters[entry.depth] += 1
+        counters.length = entry.depth + 1
+        return Object.assign({}, entry, {number: counters.join("."), indent: entry.depth * 10})
+    })
+}
+
 function nearestCharacter(chars, x, y, excluded) {
     const omitted=new Set(excluded || [])
     let best = -1, distance = Infinity
