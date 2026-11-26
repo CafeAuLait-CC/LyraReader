@@ -64,7 +64,11 @@ Pane {
                                              && result.responsePlan.kind === "reading_translation"
                                              ? result.translationBlocks || [] : []
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
-    padding: compact ? 6 : 10
+    // Height-dependent density must not move scope labels horizontally mid-selection.
+    leftPadding: 10
+    rightPadding: 10
+    topPadding: compact ? 6 : 10
+    bottomPadding: compact ? 6 : 10
     background: Rectangle { color: app.colors.sidebarBg }
     function openSavedNote(id) { readingNotes.browse("", id); }
     function sortedRange(range) {
@@ -85,7 +89,7 @@ Pane {
     }
     Timer {
         id: refreshSelection
-        interval: 85
+        interval: 80
         onTriggered: {
             const range = aiPanel.liveRange;
             if (!range) return;
@@ -120,47 +124,68 @@ Pane {
                 aiPanel.locate(ticket.range, ticket.prepared);
         }
     }
-    component SelectionCard: ColumnLayout {
+    component SelectionCard: Pane {
         id: card
         required property string title
         required property string text
         required property var range
         required property bool prepared
         required property string labelName
-        spacing: 2
+        property bool partial: false
+        property bool expanded: false
+        property string fullText: ""
+        onTextChanged: { expanded = false; fullText = ""; }
+        onRangeChanged: { expanded = false; fullText = ""; }
         Layout.fillWidth: true
-        Label {
-            text: card.title; color: app.colors.textSecondary; font.pixelSize: 11
-            Layout.fillWidth: true
-        }
-        RowLayout {
-            Layout.fillWidth: true
-            Label {
-                id: excerptLabel
-                objectName: card.labelName
-                Layout.fillWidth: true; Layout.minimumWidth: 0
-                textFormat: Text.PlainText; wrapMode: Text.Wrap
-                maximumLineCount: 2; elide: Text.ElideRight
-                text: card.text
-                color: app.colors.textSecondary; font.pixelSize: 13
-                Accessible.name: card.title
-            }
-            ToolButton {
-                objectName: card.labelName + "More"
-                visible: !!card.range && excerptLabel.truncated
-                text: qsTr("More")
-                Accessible.name: qsTr("Show %1").arg(card.title)
-                onClicked: {
-                    selectionSource.snapshot = {prepared: card.prepared, page: card.range.page, title: card.title, text: card.text};
-                    selectionSource.open();
+        padding: 12
+        background: Rectangle { radius: 8; color: "transparent"; border.color: app.colors.separator }
+        contentItem: ColumnLayout {
+            spacing: 8
+            RowLayout {
+                Layout.fillWidth: true
+                Label { text: card.title; color: app.colors.textPrimary; font.pixelSize: 12; Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap }
+                ToolButton {
+                    objectName: card.labelName + "Locate"
+                    text: qsTr("Locate"); palette.buttonText: app.colors.accent
+                    enabled: !!card.range
+                    Accessible.name: qsTr("Locate %1 in document").arg(card.title)
+                    onClicked: aiPanel.locate(card.range, card.prepared)
                 }
             }
-            ToolButton {
-                objectName: card.labelName + "Locate"
-                text: qsTr("Locate")
-                enabled: !!card.range
-                Accessible.name: qsTr("Locate %1 in document").arg(card.title)
-                onClicked: aiPanel.locate(card.range, card.prepared)
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                Rectangle { width: 2; Layout.fillHeight: true; color: app.colors.separator }
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
+                    Label {
+                        id: excerptLabel
+                        objectName: card.labelName
+                        Layout.fillWidth: true; Layout.minimumWidth: 0
+                        textFormat: Text.PlainText; wrapMode: Text.Wrap
+                        maximumLineCount: card.expanded ? 2147483647 : 3
+                        elide: card.expanded ? Text.ElideNone : Text.ElideRight
+                        text: card.fullText || card.text || qsTr("Select a passage in the document.")
+                        color: app.colors.textSecondary; font.pixelSize: 13
+                        Accessible.name: card.title
+                    }
+                    ToolButton {
+                        objectName: card.labelName + "More"
+                        visible: card.expanded || excerptLabel.truncated || card.partial
+                        text: card.expanded ? qsTr("Less") : qsTr("More")
+                        palette.buttonText: app.colors.accent
+                        Accessible.name: card.expanded ? qsTr("Collapse selected passage") : qsTr("Expand selected passage")
+                        onClicked: {
+                            if (!card.expanded && card.partial && !card.prepared && card.range) {
+                                const excerpt = app.selectedTextResult(card.range);
+                                if (excerpt.error !== undefined) { app.operationStatus = excerpt.error; return; }
+                                card.fullText = excerpt.text;
+                            }
+                            card.expanded = !card.expanded;
+                        }
+                    }
+                }
             }
         }
     }
@@ -325,9 +350,20 @@ Pane {
             visible: aiPanel.workspace === "summary"
             Layout.fillWidth: true
         }
+        LyraReadingSegmentedPicker {
+            objectName: "aiSummaryScope"
+            app: aiPanel.app
+            choices: [{title: qsTr("Whole document"), icon: "document"}, {title: qsTr("Selection"), icon: "selection"}]
+            currentIndex: aiPanel.selectedSummary ? 1 : 0
+            visible: aiPanel.wholeSummary || aiPanel.selectedSummary
+            enabled: !aiPanel.running && !aiPanel.owner.pendingCommands
+            Layout.fillWidth: true
+            Accessible.name: qsTr("Summary source")
+            onActivated: function(index) { aiPanel.owner.setAiInput("action", index ? 5 : 1); }
+        }
         ComboBox {
             objectName: "aiSummaryTarget"
-            visible: aiPanel.workspace === "summary" && !aiPanel.unitMode && !aiPanel.batchMode
+            visible: aiPanel.workspace === "summary" && !aiPanel.unitMode && !aiPanel.batchMode && !aiPanel.wholeSummary && !aiPanel.selectedSummary
             Layout.fillWidth: true
             model: [qsTr("Document"), qsTr("Selected text"), qsTr("This page"), qsTr("Question about selection")]
             currentIndex: [1, 5, 0, 2].indexOf(aiPanel.action)
@@ -345,15 +381,16 @@ Pane {
             onActivated: aiPanel.owner.setAiInput("summaryDetail", values[currentIndex])
         }
         SelectionCard {
-            visible: !!aiPanel.currentExcerpt && !!text && !aiPanel.sameRange(range, aiPanel.preparedRange)
+            visible: aiPanel.selectedSummary || (aiPanel.workspace === "translation" && !aiPanel.translateDocument)
             range: aiPanel.liveRange
             prepared: false
-            title: aiPanel.currentExcerpt && aiPanel.currentExcerpt.partial ? qsTr("Start of selection") : qsTr("Current selection")
+            title: range ? qsTr("Selected passage · p. %1").arg(range.page + 1) : qsTr("Selected passage")
+            partial: !!aiPanel.currentExcerpt && aiPanel.currentExcerpt.partial
             text: aiPanel.currentExcerpt ? aiPanel.currentExcerpt.text : ""
             labelName: "aiLiveSelection"
         }
         SelectionCard {
-            visible: aiPanel.selectedSources.length > 0
+            visible: aiPanel.previewReady && aiPanel.selectedSources.length > 0 && !aiPanel.sameRange(aiPanel.liveRange, aiPanel.preparedRange)
             range: aiPanel.preparedRange
             prepared: true
             title: qsTr("Previewed source")
@@ -419,15 +456,16 @@ Pane {
                 onContextGenerationChanged: recreate()
                 onLoaded: { item.targetReader = aiPanel.owner; item.expectedGeneration = aiPanel.owner.documentGeneration; }
             }
-        ComboBox {
+        LyraReadingSegmentedPicker {
             objectName: "aiTranslationScope"
+            app: aiPanel.app
             visible: aiPanel.workspace === "translation"
-            enabled: !aiPanel.running
+            enabled: !aiPanel.running && !aiPanel.owner.pendingCommands
             Layout.fillWidth: true
-            model: [qsTr("Selected text"), qsTr("Document")]
-            currentIndex: aiPanel.translateDocument ? 1 : 0
-            Accessible.name: qsTr("Translation scope")
-            onActivated: aiPanel.owner.setAiInput("translationScope", currentIndex === 1 ? "document" : "selection")
+            choices: [{title: qsTr("Whole document"), icon: "document"}, {title: qsTr("Selection"), icon: "selection"}]
+            currentIndex: aiPanel.translateDocument ? 0 : 1
+            Accessible.name: qsTr("Translation source")
+            onActivated: function(index) { aiPanel.owner.setAiInput("translationScope", index ? "selection" : "document"); }
         }
         CheckBox {
             objectName: "inplaceTranslationMode"

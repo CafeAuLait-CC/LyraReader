@@ -4500,6 +4500,55 @@ private slots:
         QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
     }
 
+    void readingSourceSegmentsKeepLabelsStillAndFollowOnlyTheCandidate_data() {
+        QTest::addColumn<bool>("reduceMotion");
+        QTest::newRow("light-motion") << false;
+        QTest::newRow("dark-reduced-motion") << true;
+    }
+    void readingSourceSegmentsKeepLabelsStillAndFollowOnlyTheCandidate() {
+        QFETCH(bool,reduceMotion);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|ReferenceError:|Binding loop|Required property).*"));
+        MockChatServer server;QVERIFY(server.listen());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        window->setProperty("appearance",reduceMotion?"dark":"light");window->setProperty("reduceMotion",reduceMotion);
+        window->setMaximumSize(QSize(700,760));window->resize(700,760);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/two-column-line-numbers.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0);QTRY_COMPARE(reader->pendingCommands(),0);
+        reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));
+        QTRY_VERIFY(!window->property("sidePanelMotionActive").toBool());
+        auto *picker=visualItem(window->contentItem(),"aiSummaryScope");QVERIFY(picker && picker->isVisible());
+        auto *first=visualItem(picker,"aiSummaryScopeSegment0"),*second=visualItem(picker,"aiSummaryScopeSegment1"),*indicator=visualItem(picker,"aiSummaryScopeIndicator");
+        QVERIFY(first && second && indicator);
+        const auto bounds=[&](QQuickItem *item){return item->mapRectToItem(picker,item->boundingRect());};
+        QTRY_COMPARE(bounds(indicator),bounds(first));const auto firstRect=bounds(first),secondRect=bounds(second);
+        first->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Right);
+        QTRY_COMPARE(reader->aiState().value("input").toMap().value("summaryAction").toInt(),5);
+        QTRY_VERIFY(second->hasActiveFocus());
+        if(reduceMotion)QCOMPARE(bounds(indicator),secondRect);
+        QTRY_COMPARE(bounds(indicator),secondRect);QCOMPARE(bounds(first),firstRect);QCOMPARE(bounds(second),secondRect);
+        const auto end=reader->textPages().value("0").toMap().value("chars").toList().size()-1;
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",end}}));
+        auto *live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
+        const auto exact=reader->selectionText(0,0,int(end)).value("text").toString();
+        QTRY_COMPARE(live->property("text").toString(),reader->selectionText(0,0,int(qMin<qsizetype>(end,2047))).value("text").toString());
+        auto *more=visualItem(window->contentItem(),"aiLiveSelectionMore");QVERIFY(more);QTRY_VERIFY(more->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(more,"clicked"));QTRY_COMPARE(live->property("text").toString(),exact);QCOMPARE(more->property("text").toString(),QString("Less"));
+        QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",30},{"end",90}}));
+        QTRY_COMPARE(live->property("text").toString(),reader->selectionText(0,30,90).value("text").toString());
+        reader->setAiInput("view","translation");
+        auto *translation=visualItem(window->contentItem(),"aiTranslationScope");QVERIFY(translation);QTRY_VERIFY(translation->isVisible());
+        auto *document=visualItem(translation,"aiTranslationScopeSegment0"),*selection=visualItem(translation,"aiTranslationScopeSegment1");QVERIFY(document && selection);
+        selection->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Left);
+        QTRY_COMPARE(reader->aiState().value("input").toMap().value("translationScope").toString(),QString("document"));QTRY_VERIFY(!live->isVisible());
+        QTest::keyClick(window,Qt::Key_Right);QTRY_VERIFY(live->isVisible());
+        QTRY_COMPARE(live->property("text").toString(),reader->selectionText(0,30,90).value("text").toString());
+        QCOMPARE(server.requests.size(),0);QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-"+QString::fromLatin1(QTest::currentDataTag())+".png"));
+    }
+
     void selectedSummaryFreezesFilteredTextAndRequiresExplicitSend() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());
@@ -4551,7 +4600,8 @@ private slots:
         QTRY_VERIFY(!window->property("positionRestoring").toBool());
         QVERIFY(QMetaObject::invokeMethod(locate,"clicked"));
         QCOMPARE(window->property("selection").toMap().value("end").toInt(),int(end));
-        QTRY_VERIFY(!live->isVisible()); // One card when the current and previewed ranges agree.
+        QTRY_VERIFY(live->isVisible()); // The top card remains the live candidate even when it agrees with the reviewed source.
+        QTRY_VERIFY(!locate->isVisible());
         QCOMPARE(server.requests.size(),0);
         QTRY_COMPARE(reader->pendingCommands(),0);
 
