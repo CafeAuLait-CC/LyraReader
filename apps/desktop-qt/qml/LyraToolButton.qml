@@ -11,6 +11,7 @@ ToolButton {
     property var theme: ApplicationWindow.window ? ApplicationWindow.window.colors : null
     implicitWidth: display === AbstractButton.IconOnly ? (fitLabel ? 34 : 32) : fitLabel ? labelledWidth : implicitContentWidth + 18
     implicitHeight: 32
+    hoverEnabled: true
     padding: 7
     display: AbstractButton.IconOnly
     Binding { target: control; property: "font.pixelSize"; value: control.mainLabel ? 14 : 12; when: control.fitLabel || control.mainLabel }
@@ -35,14 +36,15 @@ ToolButton {
     icon.width: 18
     icon.height: 18
     icon.color: !theme ? "transparent" : !enabled ? theme.textDisabled : selected ? theme.selectedFg : theme.iconPrimary
-    palette.buttonText: !theme ? "transparent" : selected ? theme.selectedFg : theme.textPrimary
+    palette.buttonText: !theme ? "transparent" : !enabled ? theme.textDisabled : selected ? theme.selectedFg : theme.textPrimary
     background: Rectangle {
-        radius: 5
-        color: !control.theme ? "transparent" : control.selected ? control.theme.selectedBg : control.down ? control.theme.pressedBg : control.hovered ? control.theme.hoverBg : "transparent"
+        radius: 6
+        color: !control.theme ? "transparent" : control.down ? control.theme.pressedBg : control.selected ? control.theme.selectedBg : control.hovered && control.enabled ? control.theme.hoverBg : "transparent"
         border.width: control.visualFocus ? 2 : 0
         border.color: control.theme ? control.theme.focusRing : "transparent"
     }
     Accessible.name: text
+    Accessible.selected: selected
     ToolTip.visible: hovered && text.length > 0
     ToolTip.text: text
     ToolTip.delay: 500

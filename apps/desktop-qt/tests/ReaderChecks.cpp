@@ -3408,6 +3408,31 @@ private slots:
         wheel({},QPoint(0,120),Qt::ControlModifier);
         QTRY_VERIFY(view.window->property("zoom").toDouble()>oldZoom);
     }
+    void toolbarFeedbackAndSelectedAccessibilityFollowMac_data() {
+        QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void toolbarFeedbackAndSelectedAccessibilityFollowMac() {
+        QFETCH(QString,appearance);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->setProperty("appearance",appearance);window->setProperty("reduceMotion",true);window->resize(1100,800);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"lyra"),Q_ARG(QVariant,false)));
+        auto *button=visualItem(window->contentItem(),"lyraButton");QVERIFY(button);auto *background=button->property("background").value<QQuickItem *>();QVERIFY(background);
+        auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible);QVERIFY(accessible->state().selected);
+        auto *colors=window->property("colors").value<QObject *>();QVERIFY(colors);const auto color=[&](const char *key){return colors->property(key).value<QColor>();};
+        QVERIFY(color("selectedBg").isValid() && color("pressedBg").isValid() && color("hoverBg").isValid());
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-selected-"+appearance+".png"));
+        const auto geometry=button->mapRectToScene(button->boundingRect());QCOMPARE(background->property("color").value<QColor>(),color("selectedBg"));QCOMPARE(background->property("radius").toDouble(),6.);
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);button->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(button->hasActiveFocus());QTRY_COMPARE(QQmlProperty(background,"border.width").read().toInt(),2);
+        QTest::keyPress(window,Qt::Key_Space);QVERIFY(button->property("down").toBool());QVERIFY(accessible->state().selected);QCOMPARE(background->property("color").value<QColor>(),color("pressedBg"));QCOMPARE(button->mapRectToScene(button->boundingRect()),geometry);
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-pressed-"+appearance+".png"));
+        QTest::keyRelease(window,Qt::Key_Space);QTRY_VERIFY(!button->property("selected").toBool());QVERIFY(!accessible->state().selected);QCOMPARE(window->property("secondaryRow").toString(),QString());
+        QVERIFY(button->property("hoverEnabled").toBool());
+        QTest::mouseMove(window,QPoint(5,5),20);QTest::mouseMove(window,button->mapToScene(QPointF(button->width()/2,button->height()/2)).toPoint(),20);QTRY_VERIFY(button->property("hovered").toBool());QCOMPARE(background->property("color").value<QColor>(),color("hoverBg"));
+        button->setEnabled(false);QCOMPARE(background->property("color").value<QColor>(),QColor("transparent"));QCOMPARE(QQmlProperty(button,"icon.color").read().value<QColor>(),color("textDisabled"));QCOMPARE(QQmlProperty(button,"palette.buttonText").read().value<QColor>(),color("textDisabled"));
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-feedback-"+appearance+".png"));
+    }
+
     void toolbarHierarchyAndLyraToolsMatchMac() {
         QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
         NativeCorpus::Viewer view;QVERIFY(view.window);
