@@ -22,7 +22,9 @@ Dialog {
     standardButtons: Dialog.Close
     function browse(source, noteId = "") { open(); editor.browse(source, noteId); }
     function refresh() { editor.refresh(); }
+    function finishInput() { editor.finishInput(); }
     function change(field, value) { editor.change(field, value); }
+    onAboutToHide: editor.finishInput()
     onClosed: editor.reset()
     contentItem: AiReadingNotesContent {
         id: editor

@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QPointer>
+#include <QTextDocument>
 #include <QUuid>
 #include <QtConcurrentRun>
 #include <cmath>
@@ -35,6 +36,8 @@ QVariantList ReaderController::aiMathMarkup(const QString &text) const {
 
 void ReaderController::initAi() {
     initTranslations();initDocumentReading();initRegionPersistence();initSummaryCatalog();initSummaryBatch();
+    m_readingNoteSaveTimer.setSingleShot(true);m_readingNoteSaveTimer.setInterval(500);
+    connect(&m_readingNoteSaveTimer,&QTimer::timeout,this,&ReaderController::flushReadingNoteThoughts);
     m_chatDraftTimer.setSingleShot(true);
     m_chatDraftTimer.setInterval(350);
     connect(&m_chatDraftTimer,&QTimer::timeout,this,[this]{flushAiChatDraft();});
@@ -47,6 +50,8 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi(bool preserveTranslationViews) {
+    m_readingNoteSaveTimer.stop();
+    if(m_readingNoteDraft.isEmpty()){m_readingNoteAutomatic=false;m_readingNoteSaveError.clear();}
     resetTranslations(preserveTranslationViews);resetSummaryBatch();
     ++m_aiPreviewEpoch;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();
     resetSummaryCatalog();
@@ -59,7 +64,9 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
     m_regionHistory.clear();m_aiRegionSaveId=0;m_generatedRegionNoteSaveId=0;emit regionHistoryChanged();
     m_chatDraftTimer.stop();m_chatDraftSaveId=0;m_savedChatDraft.clear();m_chatDraftSnapshot.clear();m_afterChatDraft.reset();
-    m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiState.clear();emit aiStateChanged();
+    m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiState.clear();
+    QPointer<ReaderController> alive(this);
+    emit regionNoteDraftChanged();if(alive)emit aiStateChanged();
 }
 void ReaderController::cancelAiRegionCapture() {
     m_aiRegionRestoreId=0;m_regionContinuationPending=false;m_regionContinuationSettings.clear();
@@ -781,23 +788,61 @@ quint64 ReaderController::saveRegionNoteDraft() {
     if(!m_document || m_pendingCommands || m_regionNoteDraft.isEmpty())return 0;
     m_regionNoteSaveSnapshot=m_regionNoteDraft;m_regionNoteSaveId=submit(QStringLiteral("region_note"),m_regionNoteSaveSnapshot);return m_regionNoteSaveId;
 }
+bool ReaderController::canSetReadingNoteDraft(const QString &id)const {
+    return m_document && !m_snapshotMode && !m_loading && !m_revisionCommands && !id.isEmpty()
+        && (m_readingNoteDraft.isEmpty() || m_readingNoteDraft.value(QStringLiteral("id")).toString()==id);
+}
 bool ReaderController::setReadingNoteDraft(const QVariantMap &draft) {
-    const auto id=draft.value(QStringLiteral("id")).toString();
-    if(!m_document || m_snapshotMode || m_loading || m_revisionCommands || id.isEmpty()
-       || (!m_readingNoteDraft.isEmpty() && m_readingNoteDraft.value(QStringLiteral("id")).toString()!=id))return false;
-    if(m_readingNoteDraft!=draft) {
+    if(!canSetReadingNoteDraft(draft.value(QStringLiteral("id")).toString()))return false;
+    m_readingNoteSaveTimer.stop();
+    const bool wasAutomatic=m_readingNoteAutomatic;m_readingNoteAutomatic=false;
+    if(m_readingNoteDraft!=draft || wasAutomatic) {
         m_readingNoteDraft=draft;
         emit regionNoteDraftChanged();
     }
     return true;
 }
+bool ReaderController::setReadingNoteThoughts(const QString &id,const QString &modified,const QString &text) {
+    if(!canSetReadingNoteDraft(id) || (!m_readingNoteDraft.isEmpty() && !m_readingNoteAutomatic))return false;
+    // A completed earlier snapshot may have rebased this draft before the UI
+    // receives its result. Never replace that version with a stale view's value.
+    const auto version=m_readingNoteDraft.isEmpty()?modified:m_readingNoteDraft.value(QStringLiteral("expected_modified")).toString();
+    if(version.isEmpty())return false;
+    const QVariantMap next{{QStringLiteral("id"),id},{QStringLiteral("expected_modified"),version},{QStringLiteral("thoughts"),text}};
+    const bool changed=next!=m_readingNoteDraft || !m_readingNoteAutomatic;
+    m_readingNoteDraft=next;m_readingNoteAutomatic=true;
+    if(!m_readingNoteSaveId && m_readingNoteSaveError.isEmpty())m_readingNoteSaveTimer.start(500);
+    if(changed)emit regionNoteDraftChanged();
+    return true;
+}
+QString ReaderController::nativeReadingEditorText(const QString &text)const {
+    // Match Qt's native editor serialization only for its saved baseline.
+    // PDF selections, source snapshots and AI request text must remain untouched.
+    QTextDocument document;
+    document.setPlainText(text);
+    return document.toPlainText();
+}
+void ReaderController::pauseReadingNoteAutosave() {
+    m_readingNoteSaveTimer.stop();
+    if(m_readingNoteAutomatic){m_readingNoteAutomatic=false;emit regionNoteDraftChanged();}
+}
+void ReaderController::flushReadingNoteThoughts() {
+    m_readingNoteSaveTimer.stop();
+    if(!m_readingNoteAutomatic || m_readingNoteDraft.isEmpty() || m_readingNoteSaveId || !m_readingNoteSaveError.isEmpty())return;
+    QPointer<ReaderController> alive(this);
+    if(!saveReadingNoteDraft() && alive) {
+        m_readingNoteSaveError=tr("The document is busy. Your thoughts are still kept in this tab. Try saving again.");
+        emit regionNoteDraftChanged();
+    }
+}
 void ReaderController::discardReadingNoteDraft() {
     if(m_readingNoteSaveId || m_readingNoteDraft.isEmpty())return;
-    m_readingNoteDraft.clear();
+    m_readingNoteSaveTimer.stop();m_readingNoteAutomatic=false;m_readingNoteSaveError.clear();m_readingNoteDraft.clear();
     emit regionNoteDraftChanged();
 }
 quint64 ReaderController::saveReadingNoteDraft() {
     if(!m_document || m_snapshotMode || m_loading || m_revisionCommands || m_readingNoteSaveId || m_readingNoteDraft.isEmpty())return 0;
+    m_readingNoteSaveTimer.stop();m_readingNoteSaveError.clear();m_readingNoteSaveAutomatic=m_readingNoteAutomatic;
     m_readingNoteSaveSnapshot=m_readingNoteDraft;
     m_readingNoteSaveId=m_commandSequence+1;
     QPointer<ReaderController> alive(this);
@@ -823,12 +868,20 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         emit aiStateChanged();return;
     }
     if(operation==QStringLiteral("ai_reading_note_update") && id==m_readingNoteSaveId) {
+        const auto noteId=m_readingNoteSaveSnapshot.value(QStringLiteral("id")).toString();
+        const bool automatic=m_readingNoteSaveAutomatic;
         m_readingNoteSaveId=0;
+        m_readingNoteSaveError=error;
         if(error.isEmpty()) {
             if(m_readingNoteDraft==m_readingNoteSaveSnapshot)m_readingNoteDraft.clear();
             else m_readingNoteDraft.insert(QStringLiteral("expected_modified"),result.toMap().value(QStringLiteral("modified")));
         }
         m_readingNoteSaveSnapshot.clear();
+        m_readingNoteSaveAutomatic=false;
+        if(error.isEmpty() && m_readingNoteAutomatic && !m_readingNoteDraft.isEmpty())m_readingNoteSaveTimer.start(0);
+        QPointer<ReaderController> alive(this);const auto generation=m_generation;
+        if(automatic)emit readingNoteAutosaveFinished(noteId,result.toMap(),error);
+        if(!alive || generation!=m_generation)return;
         emit regionNoteDraftChanged();
         return;
     }

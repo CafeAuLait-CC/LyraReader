@@ -12,6 +12,8 @@ Pane {
     property double command: 0
     property var entries: []
     property var note: null
+    property var noteOwner: null
+    property double noteGeneration: 0
     property string preferred: ""
     property string failure: ""
     property bool editing: false
@@ -19,23 +21,43 @@ Pane {
     property var editBaseline: ({})
     property string reviewId: ""
     property bool suggestionExpanded: false
+    property var thoughtsFailureTicket: null
     readonly property string selectedNoteId: note ? note.id : ""
     readonly property var sourceEntry: note ? entries.find(entry => entry.id === note.id) || note : ({})
-    onSelectedNoteIdChanged: suggestionExpanded = false
+    onSelectedNoteIdChanged: { suggestionExpanded = false; thoughtsFailureTicket = null; }
     readonly property bool reviewing: reviewId.length > 0
     readonly property var reviewState: reader ? reader.aiState : ({})
     readonly property var reviewPlan: reviewing && reviewState.previewView === "note"
         && reviewState.plan && reviewState.plan.note_id === reviewId ? reviewState.plan : null
     readonly property bool reviewRunning: reviewing && reviewState.responseView === "note" && !!reviewState.running
     readonly property bool dirty: !!(reader && note && reader.readingNoteDraft.id === note.id)
+    readonly property bool automaticDraftPending: !!(reader && reader.readingNoteAutomatic && reader.readingNoteDraft.id)
+    readonly property bool noteWriteReady: current() && !command && !reader.pendingCommands && !reader.hasUnsavedReadingNotes
     background: Rectangle { color: app.colors.panelBg }
     property bool inlineMode: false
     signal closeRequested()
     function close() { closeRequested(); }
     function copyAll() {
         if (!current() || !app.session) return;
-        app.session.copyText(entries.map(entry => "# " + entry.title + "\n\n" + entry.content + "\n\n" + entry.thoughts).join("\n\n---\n\n"));
+        const draft = reader.readingNoteAutomatic ? reader.readingNoteDraft : ({});
+        app.session.copyText(entries.map(entry => "# " + entry.title + "\n\n" + entry.content + "\n\n"
+            + (draft.id === entry.id ? draft.thoughts : entry.thoughts)).join("\n\n---\n\n"));
         app.showReadingNotice(qsTr("Copied"), reader);
+    }
+    function copyUnsavedThoughts() {
+        if (!current() || !reader.readingNoteAutomatic || !reader.readingNoteDraft.id || !app.session) return;
+        app.session.copyText(reader.readingNoteDraft.thoughts);
+        app.showReadingNotice(qsTr("Copied"), reader);
+    }
+    function discardThoughts(id) {
+        if (!current() || command || editing || reviewing || reader.readingNoteSaving
+                || !reader.readingNoteAutomatic || reader.readingNoteDraft.id !== id) return;
+        finishInput();
+        inlineThoughts.leaveInput();
+        reader.discardReadingNoteDraft();
+        // Another process may have changed or removed the saved record. Do not
+        // label our old view as saved, or recreate the abandoned text on reset.
+        loadNote(id);
     }
     function sourceLabel(entry) {
         if (entry.origin_kind === "summary" && entry.origin_scope === "document") return qsTr("Summary · Whole document");
@@ -46,6 +68,45 @@ Pane {
     }
     signal requestUpdate(string noteId)
 
+    function displayNote(value) {
+        noteOwner = reader; noteGeneration = generation; note = value;
+    }
+    function finishInput() {
+        inlineThoughts.finishInput();
+        if (editing && current() && (editTitle.activeFocus || editContent.activeFocus || editThoughts.activeFocus)) {
+            Qt.inputMethod.commit();
+        }
+    }
+    function revealEditInput(item, focusItem) {
+        const owner = reader, epoch = generation, id = selectedNoteId;
+        const interaction = editDetails.interactionEpoch;
+        Qt.callLater(function() {
+            if (notes.current() && notes.reader === owner && notes.generation === epoch && notes.selectedNoteId === id && notes.editing
+                    && focusItem.activeFocus && editDetails.interactionEpoch === interaction)
+                editDetails.revealItem(item);
+        });
+    }
+    function revealThoughtsFailure() {
+        thoughtsFailureTicket = {owner: reader, generation: generation, id: selectedNoteId,
+            interaction: contents.interactionEpoch, attempts: 0};
+    }
+    function tryRevealThoughtsFailure() {
+        const ticket = thoughtsFailureTicket;
+        if (!ticket) return;
+        if (!current() || reader !== ticket.owner || generation !== ticket.generation || selectedNoteId !== ticket.id
+                || editing || !thoughtsErrorActions.visible || contents.interactionEpoch !== ticket.interaction
+                || ticket.attempts++ >= 4) { thoughtsFailureTicket = null; return; }
+        // A GPU frame already in flight may swap before the newly visible rows
+        // have been laid out. Wait for their ordered, measured geometry too.
+        if (thoughtsErrorActions.height <= 0 || thoughtsFailure.height < thoughtsFailure.implicitHeight - .5
+                || thoughtsFailure.y < inlineThoughts.y + inlineThoughts.height
+                || thoughtsErrorActions.y < thoughtsFailure.y + thoughtsFailure.height) return;
+        contents.revealItem(thoughtsErrorActions);
+        ticket.interaction = contents.interactionEpoch;
+        const f = contents.contentItem;
+        const y = thoughtsErrorActions.mapToItem(f, 0, 0).y;
+        if (y >= -.5 && y + thoughtsErrorActions.height <= f.height + .5) thoughtsFailureTicket = null;
+    }
     function current() {
         return reader && reader === app.currentReader && generation === reader.documentGeneration;
     }
@@ -81,10 +142,14 @@ Pane {
     }
     function read(index) {
         if (!current() || editing || reviewing || index < 0 || index >= entries.length) return;
+        loadNote(entries[index].id);
+    }
+    function loadNote(id) {
+        if (!current() || editing || reviewing || command || !id) return;
         rememberPosition();
         note = null;
         failure = "";
-        command = reader.submit("ai_reading_note", {id: entries[index].id});
+        command = reader.submit("ai_reading_note", {id: id});
     }
     function backToList() {
         if (!current() || editing || reviewing || command) return;
@@ -94,7 +159,10 @@ Pane {
         refresh();
     }
     function beginEditing() {
-        if (!current() || !note || command || reader.documentRevisionPending) return;
+        if (!current() || !note || command || reader.documentRevisionPending || reader.readingNoteSaving
+                || (reader.readingNoteDraft.id && reader.readingNoteDraft.id !== note.id)) return;
+        finishInput();
+        reader.pauseReadingNoteAutosave();
         debounce.stop();
         seeding = true;
         const draft = reader.readingNoteDraft;
@@ -117,7 +185,10 @@ Pane {
         if (!editing || seeding || !current() || !note) return;
         let draft = reader.readingNoteDraft;
         if (draft.id !== note.id) draft = {id: note.id, expected_modified: note.modified};
-        if (value === editBaseline[field]) delete draft[field];
+        if (value === editBaseline[field]) {
+            if (reader.readingNoteSaving) draft[field] = note[field];
+            else delete draft[field];
+        }
         else draft[field] = value;
         if (Object.keys(draft).length === 2) reader.discardReadingNoteDraft();
         else if (!reader.setReadingNoteDraft(draft)) failure = qsTr("This document changed. The current editor text is still visible.");
@@ -135,7 +206,7 @@ Pane {
         command = reader.saveReadingNoteDraft();
     }
     function beginUpdate() {
-        if (!current() || !note || !note.discussion_available || note.suggestion || editing || command || reviewState.running) return;
+        if (!noteWriteReady || !note || !note.discussion_available || note.suggestion || editing || reviewState.running) return;
         debounce.stop();
         failure = "";
         reviewId = note.id;
@@ -147,7 +218,7 @@ Pane {
         reviewId = "";
     }
     function resolveSuggestion(apply) {
-        if (!current() || !note || !note.suggestion || editing || reviewing || command) return;
+        if (!noteWriteReady || !note || !note.suggestion || editing || reviewing) return;
         command = reader.submit("ai_reading_note_review", {review: {id: note.id,
             expected_modified: note.modified, expected_suggestion: note.suggestion.revision, apply: apply}});
     }
@@ -160,15 +231,23 @@ Pane {
         }
     }
     function reset() {
+        finishInput();
+        thoughtsFailureTicket = null;
         debounce.stop();
         reviewId = "";
         editing = false;
-        reader = null; command = 0; entries = []; note = null; preferred = ""; failure = "";
+        reader = null; command = 0; entries = []; note = null; noteOwner = null; noteGeneration = 0; preferred = ""; failure = "";
         search.text = "";
     }
     Connections {
         target: notes.reader
         function onAiStateChanged() { if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
+        function onReadingNoteAutosaveFinished(noteId, result, error) {
+            if (!notes.current() || error) return;
+            notes.entries = notes.entries.map(entry => entry.id === noteId ? Object.assign({}, entry, result) : entry);
+            if (!notes.editing && notes.note && notes.note.id === noteId) notes.displayNote(result);
+            else if (!notes.note && !notes.editing && !notes.reviewing && !notes.command) notes.refresh();
+        }
         function onCommandFinished(id, operation, result, error) {
             if (id !== notes.command || !notes.current()) return;
             notes.rememberPosition();
@@ -185,15 +264,16 @@ Pane {
                 notes.preferred = "";
                 notes.read(picker.currentIndex);
             } else if (operation === "ai_reading_note") {
-                notes.note = result;
-                if (notes.reader.readingNoteDraft.id === result.id) notes.beginEditing();
+                notes.entries = notes.entries.map(entry => entry.id === result.id ? Object.assign({}, entry, result) : entry);
+                notes.displayNote(result);
+                if (notes.reader.readingNoteDraft.id === result.id && !notes.reader.readingNoteAutomatic) notes.beginEditing();
                 else if ((notes.reviewState.running && notes.reviewState.responseView === "note"
                         && notes.reviewState.responsePlan.note_id === result.id)
                     || (notes.reviewState.previewView === "note" && !notes.reviewState.planSent
                         && notes.reviewState.plan && notes.reviewState.plan.note_id === result.id))
                     notes.reviewId = result.id;
             } else if (operation === "ai_reading_note_update") {
-                notes.note = result;
+                notes.displayNote(result);
                 notes.editing = false;
                 if (notes.dirty) notes.beginEditing();
                 else {
@@ -201,9 +281,13 @@ Pane {
                     notes.refresh();
                 }
             } else if (operation === "ai_reading_note_review") {
-                notes.note = result;
+                notes.displayNote(result);
             }
         }
+    }
+    Connections {
+        target: notes.thoughtsFailureTicket ? notes.app : null
+        function onFrameSwapped() { Qt.callLater(notes.tryRevealThoughtsFailure); }
     }
     Timer { id: debounce; interval: 220; onTriggered: notes.refresh() }
 
@@ -261,12 +345,39 @@ Pane {
         }
         Label {
             Layout.fillWidth: true
-            visible: !!text && (!notes.inlineMode || !!notes.failure || !!notes.command || !!notes.note)
+            visible: !!text && (!notes.inlineMode || !!notes.failure || !!notes.command || !!notes.note || notes.automaticDraftPending)
             text: notes.failure || (notes.reviewing ? notes.reviewState.status || ""
                 : notes.command ? (notes.editing ? qsTr("Saving reading note…") : qsTr("Loading reading notes…"))
+                : !notes.note && notes.automaticDraftPending ? notes.reader.readingNoteSaveError
+                    || (notes.reader.regionPersistencePending ? qsTr("Saving thoughts…") : qsTr("Unsaved thoughts"))
                 : !notes.entries.length ? qsTr("No matching notes.")
                 : "")
             wrapMode: Text.Wrap; textFormat: Text.PlainText; color: app.colors.textSecondary
+        }
+        Flow {
+            visible: notes.current() && !!notes.reader.readingNoteDraft.id && notes.reader.readingNoteAutomatic
+                && (!notes.note || notes.note.id !== notes.reader.readingNoteDraft.id)
+                && (!!notes.reader.readingNoteSaveError || !!notes.failure || !notes.reader.regionPersistencePending)
+            Layout.fillWidth: true; spacing: 4
+            LyraToolButton {
+                enabled: !notes.command && !notes.editing && !notes.reviewing
+                text: qsTr("Open unsaved thoughts"); display: AbstractButton.TextOnly
+                onClicked: {
+                    notes.preferred = notes.reader.readingNoteDraft.id;
+                    search.text = ""; debounce.stop(); notes.refresh();
+                }
+            }
+            LyraToolButton {
+                objectName: "copyDetachedReadingThoughts"
+                text: qsTr("Copy unsaved thoughts"); display: AbstractButton.TextOnly
+                onClicked: notes.copyUnsavedThoughts()
+            }
+            LyraToolButton {
+                objectName: "discardDetachedReadingThoughts"
+                text: qsTr("Discard unsaved thoughts"); display: AbstractButton.TextOnly
+                enabled: notes.current() && !notes.command && !notes.reader.readingNoteSaving && !notes.editing && !notes.reviewing
+                onClicked: notes.discardThoughts(notes.reader.readingNoteDraft.id)
+            }
         }
         ColumnLayout {
             visible: notes.inlineMode && !notes.note && !notes.editing && !notes.reviewing && !notes.command && !notes.failure && !notes.entries.length
@@ -338,7 +449,10 @@ Pane {
                         onClicked: notes.backToList()
                     }
                     Item { Layout.fillWidth: true }
-                    Label { text: qsTr("Saved"); font.pixelSize: 11; color: app.colors.textSecondary }
+                    Label {
+                        text: notes.dirty ? notes.reader.readingNoteSaving ? qsTr("Saving…") : qsTr("Unsaved") : qsTr("Saved")
+                        font.pixelSize: 11; color: app.colors.textSecondary
+                    }
                 }
                 TextArea {
                     objectName: "aiReadingNoteTitle"
@@ -359,14 +473,15 @@ Pane {
                 Button {
                     objectName: "editAiReadingNote"
                     text: qsTr("Edit note")
-                    enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending
+                    enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending && !notes.reader.readingNoteSaving
+                        && (!notes.reader.readingNoteDraft.id || notes.reader.readingNoteDraft.id === notes.selectedNoteId)
                     onClicked: notes.beginEditing()
                 }
                 Button {
                     objectName: "previewAiReadingNoteUpdate"
                     visible: !!(notes.note && notes.note.discussion_available && !notes.note.suggestion)
                     text: qsTr("Preview update from discussion")
-                    enabled: notes.current() && !notes.command && !notes.reviewState.running
+                    enabled: notes.noteWriteReady && !notes.reviewState.running
                     onClicked: notes.beginUpdate()
                 }
                 ColumnLayout {
@@ -412,13 +527,13 @@ Pane {
                         Button {
                             objectName: "applyAiReadingNoteSuggestion"
                             text: qsTr("Apply suggestion")
-                            enabled: !notes.command
+                            enabled: notes.noteWriteReady
                             onClicked: notes.resolveSuggestion(true)
                         }
                         Button {
                             objectName: "dismissAiReadingNoteSuggestion"
                             text: qsTr("Keep current note")
-                            enabled: !notes.command
+                            enabled: notes.noteWriteReady
                             onClicked: notes.resolveSuggestion(false)
                         }
                     }
@@ -443,17 +558,43 @@ Pane {
                     text: qsTr("My thoughts"); font.pixelSize: 13; font.weight: Font.DemiBold
                     color: app.colors.textPrimary
                 }
-                TextArea {
-                    objectName: "aiReadingNoteSavedThoughts"
+                AiReadingThoughts {
+                    id: inlineThoughts
+                    objectName: "aiReadingThoughts"
                     Layout.fillWidth: true
-                    text: notes.note ? notes.note.thoughts : ""
-                    placeholderText: qsTr("Add your own thoughts…")
-                    readOnly: true; selectByMouse: true; selectByKeyboard: true
-                    textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
-                    Accessible.name: qsTr("My thoughts")
-                    color: app.colors.textPrimary
-                    padding: 8
-                    background: Rectangle { radius: 8; color: app.colors.noteBg }
+                    Layout.preferredHeight: 112
+                    app: notes.app; reader: notes.noteOwner; generation: notes.noteGeneration; note: notes.note
+                    wheelParent: contents
+                    allowInput: notes.current() && !notes.command && !notes.reader.documentRevisionPending
+                        && (!notes.reader.readingNoteDraft.id || (notes.reader.readingNoteDraft.id === notes.selectedNoteId && notes.reader.readingNoteAutomatic))
+                }
+                Label {
+                    id: thoughtsFailure
+                    Layout.fillWidth: true
+                    visible: !!text
+                    text: inlineThoughts.failure || (notes.dirty && notes.reader.readingNoteAutomatic ? notes.reader.readingNoteSaveError : "")
+                    wrapMode: Text.Wrap; textFormat: Text.PlainText; color: app.colors.warningFg
+                }
+                Flow {
+                    id: thoughtsErrorActions
+                    Layout.fillWidth: true; spacing: 4
+                    visible: notes.dirty && notes.reader.readingNoteAutomatic && !!notes.reader.readingNoteSaveError
+                    onVisibleChanged: {
+                        if (visible) notes.revealThoughtsFailure();
+                        else notes.thoughtsFailureTicket = null;
+                    }
+                    Button {
+                        objectName: "retryAiReadingThoughts"
+                        text: qsTr("Save thoughts again")
+                        enabled: notes.current() && !notes.reader.readingNoteSaving && !notes.reader.documentRevisionPending
+                        onClicked: { notes.finishInput(); notes.reader.saveReadingNoteDraft(); }
+                    }
+                    Button {
+                        objectName: "discardAiReadingThoughts"
+                        text: qsTr("Discard unsaved thoughts")
+                        enabled: notes.current() && !notes.reader.readingNoteSaving
+                        onClicked: notes.discardThoughts(notes.selectedNoteId)
+                    }
                 }
                 Label {
                     visible: !!(notes.note && notes.note.status === "sourceChanged")
@@ -507,44 +648,78 @@ Pane {
                 Accessible.name: qsTr("Exact request to update reading note")
             }
         }
-        ColumnLayout {
+        AiReadingScrollView {
+            id: editDetails
+            objectName: "aiReadingNoteEditScroll"
+            memoryReader: notes.reader; memoryKey: notes.note ? "note-edit-" + notes.note.id : ""
+            memoryReady: notes.current() && !notes.command
             Layout.fillWidth: true; Layout.fillHeight: true
-            visible: notes.editing
-            enabled: !notes.command
-            TextField {
-                id: editTitle
-                objectName: "aiReadingNoteTitleEditor"
-                Layout.fillWidth: true
-                placeholderText: qsTr("Title")
-                Accessible.name: placeholderText
-                onTextEdited: notes.change("title", text)
-            }
-            AiReadingScrollView {
-                id: keyIdeas
-                Layout.fillWidth: true; Layout.fillHeight: true
-                TextArea {
-                    id: editContent
-                    objectName: "aiReadingNoteContentEditor"
-                    width: keyIdeas.availableWidth
-                    placeholderText: qsTr("Key ideas")
-                    Accessible.name: placeholderText
-                    textFormat: TextEdit.PlainText
-                    wrapMode: Text.Wrap
-                    onTextChanged: if (activeFocus) notes.change("content", text)
+            visible: notes.editing; enabled: !notes.command
+            ColumnLayout {
+                id: editFlow
+                objectName: "aiReadingNoteEditFlow"
+                width: editDetails.availableWidth; spacing: 18
+                TextField {
+                    id: editTitle
+                    objectName: "aiReadingNoteTitleEditor"
+                    Layout.fillWidth: true
+                    placeholderText: qsTr("Title"); Accessible.name: placeholderText
+                    onTextEdited: notes.change("title", text)
+                    onActiveFocusChanged: if (activeFocus) notes.revealEditInput(editTitle, editTitle)
                 }
-            }
-            AiReadingScrollView {
-                id: thoughts
-                Layout.fillWidth: true; Layout.fillHeight: true
-                TextArea {
-                    id: editThoughts
-                    objectName: "aiReadingNoteThoughtsEditor"
-                    width: thoughts.availableWidth
-                    placeholderText: qsTr("My thoughts")
-                    Accessible.name: placeholderText
-                    textFormat: TextEdit.PlainText
-                    wrapMode: Text.Wrap
-                    onTextChanged: if (activeFocus) notes.change("thoughts", text)
+                Label { text: qsTr("Key ideas"); font.pixelSize: 13; font.weight: Font.DemiBold; color: app.colors.textPrimary }
+                AiReadingScrollView {
+                    id: keyIdeas
+                    Layout.fillWidth: true; Layout.preferredHeight: 220
+                    wheelParent: editDetails
+                    TextArea {
+                        id: editContent
+                        objectName: "aiReadingNoteContentEditor"
+                        width: keyIdeas.availableWidth; height: Math.max(keyIdeas.availableHeight, implicitHeight)
+                        placeholderText: qsTr("Key ideas"); Accessible.name: placeholderText
+                        textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                        padding: 6
+                        background: Rectangle { radius: 8; color: app.colors.fieldBg }
+                        onTextChanged: if (activeFocus) notes.change("content", text)
+                        onActiveFocusChanged: if (activeFocus) notes.revealEditInput(keyIdeas, editContent)
+                    }
+                }
+                Label { text: qsTr("My thoughts"); font.pixelSize: 13; font.weight: Font.DemiBold; color: app.colors.textPrimary }
+                AiReadingScrollView {
+                    id: thoughts
+                    Layout.fillWidth: true; Layout.preferredHeight: 112
+                    wheelParent: editDetails
+                    TextArea {
+                        id: editThoughts
+                        objectName: "aiReadingNoteThoughtsEditor"
+                        width: thoughts.availableWidth; height: Math.max(thoughts.availableHeight, implicitHeight)
+                        placeholderText: qsTr("My thoughts"); Accessible.name: placeholderText
+                        textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                        padding: 10
+                        background: Rectangle { radius: 8; color: app.colors.noteBg }
+                        onTextChanged: if (activeFocus) notes.change("thoughts", text)
+                        onActiveFocusChanged: if (activeFocus) notes.revealEditInput(thoughts, editThoughts)
+                    }
+                }
+                Flow {
+                    id: editActions
+                    objectName: "aiReadingNoteEditActions"
+                    Layout.fillWidth: true; spacing: 4
+                    Button {
+                        id: saveEditNote
+                        objectName: "saveAiReadingNote"
+                        text: qsTr("Save changes")
+                        enabled: !notes.command && notes.dirty
+                        onClicked: { notes.finishInput(); notes.save(); }
+                        onActiveFocusChanged: if (activeFocus) notes.revealEditInput(editActions, saveEditNote)
+                    }
+                    Button {
+                        id: cancelEditNote
+                        text: qsTr("Cancel editing")
+                        enabled: !notes.command
+                        onClicked: notes.cancelEditing()
+                        onActiveFocusChanged: if (activeFocus) notes.revealEditInput(editActions, cancelEditNote)
+                    }
                 }
             }
         }
@@ -574,21 +749,6 @@ Pane {
             visible: notes.inlineMode && !notes.note && !notes.editing && !notes.reviewing
             symbol: "interleaf"; text: qsTr("Interleaf discussions…"); display: AbstractButton.TextBesideIcon
             onClicked: app.openRegionNotes()
-        }
-        RowLayout {
-            visible: notes.editing
-            Layout.alignment: Qt.AlignRight
-            Button {
-                text: qsTr("Cancel editing")
-                enabled: !notes.command
-                onClicked: notes.cancelEditing()
-            }
-            Button {
-                objectName: "saveAiReadingNote"
-                text: qsTr("Save changes")
-                enabled: !notes.command && notes.dirty
-                onClicked: notes.save()
-            }
         }
     }
 }

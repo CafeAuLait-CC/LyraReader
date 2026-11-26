@@ -171,11 +171,13 @@ ApplicationWindow {
         currentReader.setAiInput("view",value);
         showAiPanel(true);
     }
+    function finishReadingNoteInput() { savedNotes.finishInput(); aiContent.finishReadingNoteInput(); }
     function showAiPanel(show) {showAiPanelMode(show,"assistant");}
     function showAiPanelMode(show,mode) {
         const panelMode=mode==="notes" || mode==="regions" ? mode : "assistant";
         if (placedTextController.deferAction(function(){root.showAiPanelMode(show,panelMode);})) return;
         if (show && secondaryRow==="edit" && contentController.deferAction({kind:"assistant",value:true,mode:panelMode})) return;
+        finishReadingNoteInput();
         if (show) {
             if (secondaryRow==="edit" || secondaryRow==="fill") setSecondaryRow("",true);
             overviewVisible=false;
@@ -530,8 +532,9 @@ ApplicationWindow {
     }
     function prepareForQuit() {
         if ((session && (session.tabTransferInProgress || session.nativeTabDragInProgress())) || closeOperation || pendingDocumentSave || dialogs.closePromptVisible || dialogs.saveDialog.visible) return false;
+        finishReadingNoteInput();
         const tabs=session?session.tabs:[{reader:currentReader}];
-        tabs.forEach(tab=>{tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);});
+        tabs.forEach(tab=>{tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);tab.reader.flushReadingNoteThoughts();});
         if(tabs.some(tab=>tab.reader.hasUnsavedReadingNotes && !tab.reader.regionPersistencePending)){readingNotesBlockClose(-1);return false;}
         if(tabs.some(tab=>tab.reader.chatDraftPending && !tab.reader.chatDraftSaving)){chatDraftsBlockClose(-1);return false;}
         tabs.forEach(tab=>tab.reader.cancelIndexQueries());
@@ -634,7 +637,8 @@ ApplicationWindow {
         if (!session || closeOperation || dialogs.closePromptVisible) return;
         const owner=closeTarget(index);
         if (!owner) return;
-        owner.cancelIndexQueries();owner.flushAiRegionNote();owner.flushAiChatDraft(true);
+        if(owner===currentReader)finishReadingNoteInput();
+        owner.cancelIndexQueries();owner.flushAiRegionNote();owner.flushAiChatDraft(true);owner.flushReadingNoteThoughts();
         dialogs.flushAnnotation();
         closingTab=index;
         pendingCloseReader=owner;
@@ -716,7 +720,8 @@ ApplicationWindow {
         cancelErase();
         if (closeOperation || dialogs.closePromptVisible) {event.accepted=false;return;}
         const tabs=session?session.tabs:[{reader:currentReader}];
-        tabs.forEach(tab=>{tab.reader.cancelIndexQueries();tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);});
+        finishReadingNoteInput();
+        tabs.forEach(tab=>{tab.reader.cancelIndexQueries();tab.reader.flushAiRegionNote();tab.reader.flushAiChatDraft(true);tab.reader.flushReadingNoteThoughts();});
         dialogs.flushAnnotation();
         saveReadingPosition();
         if (hasPendingCloseWork(-1)) {
@@ -2801,6 +2806,7 @@ ApplicationWindow {
         }
         function onTabTransferFailed(reason) {root.operationStatus=reason;}
         function onActiveReaderAboutToChange() {
+            root.finishReadingNoteInput();root.currentReader.flushReadingNoteThoughts();
             root.currentReader.cancelIndexQueries();root.currentReader.flushAiRegionNote();
             if(!root.session.tabTransferInProgress)root.currentReader.flushAiChatDraft();
             regionNotes.close();aiRegionCard.close();root.currentReader.cancelAiRegionCapture();root.cancelRegionSelection();

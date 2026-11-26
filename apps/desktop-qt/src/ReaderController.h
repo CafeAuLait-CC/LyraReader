@@ -48,6 +48,9 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
     Q_PROPERTY(QVariantMap regionNoteDraft READ regionNoteDraft NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QVariantMap readingNoteDraft READ readingNoteDraft NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(bool readingNoteAutomatic READ readingNoteAutomatic NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(bool readingNoteSaving READ readingNoteSaving NOTIFY regionNoteDraftChanged)
+    Q_PROPERTY(QString readingNoteSaveError READ readingNoteSaveError NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(bool hasUnsavedReadingNotes READ hasUnsavedReadingNotes NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(bool regionPersistencePending READ regionPersistencePending NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QString regionPersistenceError READ regionPersistenceError NOTIFY regionNoteDraftChanged)
@@ -118,6 +121,9 @@ public:
     Q_INVOKABLE double shiftedPaperScroll(double sourceY,double reveal=1.0) const;
     QVariantMap regionNoteDraft()const{return m_regionNoteDraft;}
     QVariantMap readingNoteDraft()const{return m_readingNoteDraft;}
+    bool readingNoteAutomatic()const{return m_readingNoteAutomatic;}
+    bool readingNoteSaving()const{return m_readingNoteSaveId!=0;}
+    QString readingNoteSaveError()const{return m_readingNoteSaveError;}
     bool hasUnsavedReadingNotes()const{return !m_readingNoteDraft.isEmpty() || !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty() || regionNeedsSave() || m_aiRegionSaveId || regionRequestRunning();}
     bool regionPersistencePending()const;
     QString regionPersistenceError()const{return m_regionSaveError;}
@@ -128,6 +134,10 @@ public:
     Q_INVOKABLE void discardRegionNoteDraft();
     Q_INVOKABLE quint64 saveRegionNoteDraft();
     Q_INVOKABLE bool setReadingNoteDraft(const QVariantMap &draft);
+    Q_INVOKABLE bool setReadingNoteThoughts(const QString &id,const QString &modified,const QString &text);
+    Q_INVOKABLE QString nativeReadingEditorText(const QString &text)const;
+    Q_INVOKABLE void pauseReadingNoteAutosave();
+    Q_INVOKABLE void flushReadingNoteThoughts();
     Q_INVOKABLE void discardReadingNoteDraft();
     Q_INVOKABLE quint64 saveReadingNoteDraft();
     Q_INVOKABLE bool isSavingRegionNote()const{return m_regionNoteSaveId!=0;}
@@ -251,6 +261,7 @@ signals:
     void aiRegionImageChanged();
     void regionHistoryChanged();
     void regionNoteDraftChanged();
+    void readingNoteAutosaveFinished(const QString &noteId,const QVariantMap &note,const QString &error);
     void textPagesChanged();
     void noteMarkersReady(quint64 request, int page, const QVariantList &markers, const QString &error);
     void commandsChanged();
@@ -352,6 +363,10 @@ private:
     void startAiRegionPaperPlan();
     QVariantMap m_regionHistory,m_regionNoteDraft,m_regionNoteSaveSnapshot;
     QVariantMap m_readingNoteDraft,m_readingNoteSaveSnapshot;
+    bool canSetReadingNoteDraft(const QString &id)const;
+    QTimer m_readingNoteSaveTimer;
+    bool m_readingNoteAutomatic=false,m_readingNoteSaveAutomatic=false;
+    QString m_readingNoteSaveError;
     quint64 m_readingNoteSaveId=0;
     QString m_regionSaveError;
     quint64 m_regionNoteSaveId=0;

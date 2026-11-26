@@ -187,6 +187,7 @@ Pane {
         onCitation: function(link, plan) { aiPanel.followHistoryLink(link, plan); }
     }
     function openSavedNote(id) { readingNotes.browse("", id); }
+    function finishReadingNoteInput() { readingNotes.finishInput(); }
     function sortedRange(range) {
         return {page: range.page, start: Math.min(range.start, range.end), end: Math.max(range.start, range.end)};
     }
