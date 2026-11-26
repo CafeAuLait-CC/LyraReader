@@ -79,8 +79,8 @@ Pane {
                         selected: app.sidebarTab === modelData.key
                         onClicked: app.showSidebar(modelData.key)
                         background: Rectangle {
-                            color: sidebarTabButton.selected ? app.colors.selectedBg : sidebarTabButton.down ? app.colors.pressedBg
-                                  : sidebarTabButton.hovered ? app.colors.hoverBg : "transparent"
+                            color: sidebarTabButton.down ? app.colors.pressedBg
+                                  : sidebarTabButton.selected ? app.colors.selectedBg : app.colors.hoverBg
                             Rectangle {
                                 visible: sidebarTabButton.index > 0
                                 width: 1; height: parent.height

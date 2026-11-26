@@ -3433,6 +3433,26 @@ private slots:
         if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-feedback-"+appearance+".png"));
     }
 
+    void sidebarSegmentsKeepMacSurfacesAndPressedFeedback_data() {
+        QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void sidebarSegmentsKeepMacSurfacesAndPressedFeedback() {
+        QFETCH(QString,appearance);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(900,750);window->setProperty("appearance",appearance);window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/outlined.pdf"));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==3 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"thumbnails")));QVERIFY(settleReaderViewport(window));
+        auto *sidebar=visualItem(window->contentItem(),"readerSidebar");QVERIFY(sidebar);
+        const auto find=[&](const QString &name){const auto visit=[&](auto &&self,QQuickItem *item)->QQuickItem *{if(item->property("text").toString()==name && item->property("selected").isValid())return item;for(auto *child:item->childItems())if(auto *result=self(self,child))return result;return nullptr;};return visit(visit,sidebar);};
+        auto *thumb=find("Thumbnails"),*outline=find("Outline");QVERIFY(thumb && outline);
+        auto *colors=window->property("colors").value<QObject *>();QVERIFY(colors);auto *normal=outline->property("background").value<QQuickItem *>();auto *selected=thumb->property("background").value<QQuickItem *>();QVERIFY(normal && selected);
+        QCOMPARE(normal->property("color").value<QColor>(),colors->property("hoverBg").value<QColor>());QCOMPARE(selected->property("color").value<QColor>(),colors->property("selectedBg").value<QColor>());
+        const auto geometry=thumb->mapRectToScene(thumb->boundingRect());const auto page=window->property("currentPage");window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);thumb->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(thumb->hasActiveFocus());
+        QTest::keyPress(window,Qt::Key_Space);QVERIFY(thumb->property("down").toBool());QCOMPARE(selected->property("color").value<QColor>(),colors->property("pressedBg").value<QColor>());QCOMPARE(thumb->mapRectToScene(thumb->boundingRect()),geometry);
+        QTest::keyRelease(window,Qt::Key_Space);QVERIFY(window->property("sidebarVisible").toBool());QCOMPARE(window->property("sidebarTab").toString(),QString("thumbnails"));QCOMPARE(window->property("currentPage"),page);
+        outline->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QCOMPARE(window->property("sidebarTab").toString(),QString("outline"));auto *outlineAccessible=QAccessible::queryAccessibleInterface(outline),*thumbAccessible=QAccessible::queryAccessibleInterface(thumb);QVERIFY(outlineAccessible && thumbAccessible);QVERIFY(outlineAccessible->state().selected);QVERIFY(!thumbAccessible->state().selected);QCOMPARE(selected->property("color").value<QColor>(),colors->property("hoverBg").value<QColor>());QCOMPARE(window->property("currentPage"),page);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-sidebar-segments-"+appearance+".png"));
+    }
+
     void toolbarHierarchyAndLyraToolsMatchMac() {
         QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
         NativeCorpus::Viewer view;QVERIFY(view.window);
