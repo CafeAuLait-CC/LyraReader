@@ -96,19 +96,29 @@ ColumnLayout {
                             }
                             Component {
                                 id: prose
+                                ColumnLayout {
+                                spacing: 4
                                 TextArea {
                                     id: proseArea
+                                    Layout.fillWidth: true; Layout.minimumWidth: 0
                                     objectName: section.index === 0 && block.index === 0 ? summary.answerName : summary.answerName + "Section" + section.index + "_" + block.index
-                                    text: summary.renderer.markupFor(block.modelData.text)
-                                    textFormat: TextEdit.RichText; wrapMode: TextEdit.Wrap
+                                    readonly property var rendered: summary.renderer.renderFor(block.modelData.text)
+                                    text: rendered.text
+                                    textFormat: rendered.plain ? TextEdit.PlainText : TextEdit.RichText; wrapMode: TextEdit.Wrap
                                     readOnly: true; selectByMouse: true; selectByKeyboard: true
                                     padding: 0; background: null; font.pixelSize: 14; color: app.colors.textPrimary
                                     Accessible.name: qsTr("AI response section")
                                     Keys.onPressed: function(event) { summary.renderer.cursorKey(proseArea, event); }
                                     onLinkActivated: function(link) {
-                                        const sent = summary.value.responsePlan || {};
-                                        summary.citation(link, {action: sent.action, sources: sent.sources || [], source_pages: sent.source_pages || [], generation: summary.value.generation});
+                                        summary.renderer.activateLink(link);
                                     }
+                                }
+                                Label {
+                                    text: proseArea.rendered.warning || ""
+                                    visible: text.length > 0
+                                    textFormat: Text.PlainText; wrapMode: Text.Wrap
+                                    Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
+                                }
                                 }
                             }
                         }

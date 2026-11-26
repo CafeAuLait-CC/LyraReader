@@ -1,6 +1,7 @@
 #include <QEventLoop>
 #include "DisplayCalibration.h"
 #include "ReadingTextGeometry.h"
+#include "ReadingMarkdown.h"
 #include "ReadingSourceHighlight.h"
 #include <QFutureWatcher>
 #include "AuditController.h"
@@ -165,6 +166,7 @@ protected:
 
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
+    qmlRegisterType<ReadingMarkdown>("LyraReader",1,0,"ReadingMarkdown");
     qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
     qmlRegisterType<ReadingSourceHighlight>("LyraReader",1,0,"ReadingSourceHighlight");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
@@ -6069,6 +6071,145 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
     void commandCompletionDoesNotPublishAfterANotificationReopensTheDocument() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto first=scratch.filePath("completion-old.pdf"),second=scratch.filePath("completion-new.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",first));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",second));ReaderController reader;reader.openFile(QUrl::fromLocalFile(first));QTRY_COMPARE(reader.pageCount(),1);QTRY_COMPARE(reader.pendingCommands(),0);QSignalSpy commands(&reader,&ReaderController::commandFinished);bool reopened=false;
         connect(&reader,&ReaderController::dataChanged,this,[&]{if(!reopened && reader.data().contains("links")){reopened=true;reader.openFile(QUrl::fromLocalFile(second));}});reader.submit("links",{{"page",0}});QTRY_VERIFY(reopened);QTRY_COMPARE(reader.pageCount(),3);QTRY_COMPARE(reader.pendingCommands(),0);for(const auto &event:commands)QVERIFY2(event[1].toString()!=QStringLiteral("links"),"The old completion must not be published after a synchronous document switch");QVERIFY(!reader.data().contains("links"));
+    }
+
+    void readingMarkdownKeepsNativeBlocksAndSafeInlineSemantics() {
+        ReadingMarkdown formatter; ReaderController reader;
+        const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
+                                  {"raisedBg", QColor("#F7F4EF")}, {"textSecondary", QColor("#635B50")}};
+        const QString source = QString::fromUtf8(
+            "# Findings\r\n\r\nInline **bold**, *italic*, ~~removed~~, `code $x^2$`, 🧪 é 中文.\r\n"
+            "Soft break  \r\nHard break. Money $5, then $x^2$. [p.1] [p.99]\r\n\r\n"
+            "## Detail\r\n\r\n- first\r\n  - nested\r\n7) numbered\r\n\r\n"
+            "> A quote with **strong**.\r\n\r\n```swift\r\nlet x = \"<img src=bad>\"\r\n$x^2$\r\n```\r\n\r\n"
+            "| Name | Value |\r\n| --- | ---: |\r\n| alpha row | 1 |\r\n| beta row | 2 |\r\n\r\n"
+            "$$\r\n\\frac{a}{b}\r\n$$\r\n\r\n"
+            "[safe](https://example.invalid/a_(b)) ![remote](https://example.invalid/image) "
+            "[unsafe](javascript:alert(1)) <b>literal HTML</b> <mailto:reader@example.invalid> "
+            "[url formula](https://example.invalid/$x^2$) [outer [inner]](https://example.invalid/nested)\r\n");
+        const auto render = [&](const QString &value) { return formatter.render(value, &reader, {1, 99}, 3, 14, colours); };
+        const auto result = render(source); QVERIFY(!result.value("plain").toBool());
+        const auto markup = result.value("text").toString();
+        QVERIFY(!markup.contains("<img") && !markup.contains("href=\"javascript:") && !markup.contains("LYRA-MATH-"));
+        QTextDocument document; document.setHtml(markup); const auto text = document.toPlainText();
+        QVERIFY(!text.contains("# Findings") && !text.contains("## Detail") && !text.contains("```"));
+        QCOMPARE(document.find("Findings").charFormat().font().pixelSize(), 17);
+        QVERIFY(document.find("Findings").charFormat().fontWeight() >= QFont::DemiBold);
+        QVERIFY(document.find("bold").charFormat().fontWeight() >= QFont::Bold);
+        QVERIFY(document.find("italic").charFormat().fontItalic());
+        QVERIFY(document.find("removed").charFormat().fontStrikeOut());
+        QVERIFY(text.contains(QString::fromUtf8("🧪 é 中文")));
+        QVERIFY(text.contains("Money $5, then x2"));
+        QVERIFY(text.contains("code $x^2$") && text.contains("let x = \"<img src=bad>\""));
+        QVERIFY(text.contains("•") && text.contains("◦") && text.contains("7."));
+        QVERIFY(document.find("strong").currentTable());
+        const auto *table = document.find("alpha row").currentTable();
+        QVERIFY(table); QCOMPARE(table->rows(), 3); QCOMPARE(table->columns(), 2);
+        QCOMPARE(table->cellAt(document.find("beta row")).row(), 2);
+        QCOMPARE(document.find("[p.1]").charFormat().anchorHref(), QString("p.1"));
+        QVERIFY(!document.find("[p.99]").charFormat().isAnchor());
+        QCOMPARE(QUrl(document.find("safe").charFormat().anchorHref()), QUrl("https://example.invalid/a_(b)"));
+        QVERIFY(!document.find("unsafe").charFormat().isAnchor());
+        QCOMPARE(QUrl(document.find("url formula").charFormat().anchorHref()), QUrl("https://example.invalid/$x^2$"));
+        QCOMPARE(QUrl(document.find("outer [inner]").charFormat().anchorHref()), QUrl("https://example.invalid/nested"));
+        QVERIFY(document.find("reader@example.invalid").charFormat().isAnchor());
+        QVERIFY(text.contains("<b>literal HTML</b>"));
+        for (auto block = document.begin(); block.isValid(); block = block.next())
+            for (auto part = block.begin(); !part.atEnd(); ++part)
+                QVERIFY(!part.fragment().charFormat().isImageFormat());
+        const QString streaming = "# Growing\n\n**unfinished emphasis\n\n```cpp\nconst auto html = \"<img>\";\n```\n\n$$\n\\frac{a}{b}\n$$";
+        for (qsizetype length = 1; length <= streaming.size(); ++length) {
+            const auto partial = render(streaming.left(length)); QVERIFY(!partial.value("plain").toBool());
+            QTextDocument prefix; prefix.setHtml(partial.value("text").toString());
+            QVERIFY2(!prefix.toPlainText().contains("$$") && !prefix.toPlainText().contains("```"), qPrintable(QString::number(length)));
+            QVERIFY(!partial.value("text").toString().contains("LYRA-MATH-"));
+        }
+        const auto partial = render("**unfinished emphasis"); QTextDocument emphasis; emphasis.setHtml(partial.value("text").toString());
+        QVERIFY(emphasis.find("unfinished").charFormat().fontWeight() >= QFont::Bold);
+        QCOMPARE(render(source), result);
+        const auto bounded = [&](const QString &value) { const auto fallback = render(value); QVERIFY(fallback.value("plain").toBool()); QCOMPARE(fallback.value("text").toString(), value); QVERIFY(!fallback.value("warning").toString().isEmpty()); };
+        bounded(QString(128 * 1024 + 1, QLatin1Char('x')));
+        bounded(QString(50000, QChar(0x4e2d)));
+        bounded(QString(20, QLatin1Char('>')) + " nested quote");
+        QString manyCells; for (int row = 0; row < 70; ++row) manyCells += QString("|x").repeated(70) + "|\n";
+        bounded(manyCells);
+        QElapsedTimer clock; clock.start();
+        const auto large = render(QString(127000, QLatin1Char('x')));
+        qInfo() << "native-markdown 127000-byte plain response format-ms" << clock.elapsed();
+        QVERIFY(!large.value("plain").toBool());
+        QVERIFY(large.value("text").toString().contains(QString(127000, QLatin1Char('x'))));
+    }
+
+    void readingMarkdownKeepsFormulaContextsIndependent() {
+        ReadingMarkdown formatter; ReaderController reader;
+        const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
+                                  {"raisedBg", QColor("#FFFDFA")}, {"textSecondary", QColor("#635B50")}};
+        const auto render = [&](const QString &source) { return formatter.render(source, &reader, {1}, 1, 13, colours); };
+        const auto value = render("An `unfinished inline code\n\n$x^2$ after code.");
+        QVERIFY(!value.value("plain").toBool()); QTextDocument document; document.setHtml(value.value("text").toString());
+        QVERIFY(document.toPlainText().contains("unfinished inline code"));
+        QVERIFY(document.toPlainText().contains("x2 after code."));
+        QVERIFY(!document.toPlainText().contains("$x^2$ after code."));
+        QString many; for (int index = 0; index < 128; ++index) many += "A formula $x^2$ in a paragraph.\n\n";
+        QElapsedTimer clock; clock.start(); const auto batch = render(many);
+        qInfo() << "native-markdown 128 independent formula paragraphs format-ms" << clock.elapsed();
+        QVERIFY(!batch.value("plain").toBool()); QTextDocument paragraphs; paragraphs.setHtml(batch.value("text").toString());
+        QCOMPARE(paragraphs.toPlainText().count("x2"), 128);
+    }
+
+    void readingMarkdownUsesRealNativeResultControls_data() {
+        QTest::addColumn<QString>("theme"); QTest::newRow("light") << QString("light"); QTest::newRow("dark") << QString("dark");
+    }
+    void readingMarkdownUsesRealNativeResultControls() {
+        QFETCH(QString, theme);
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
+        MockChatServer server; QVERIFY(server.listen());
+        const QString response = "# Native heading\r\n\r\n**Bold answer** with *emphasis* [p.1], untrusted [p.99].\r\n\r\n"
+            "- first idea\r\n  - nested idea\r\n\r\n> A quoted answer.\r\n\r\n"
+            "```cpp\r\nconst auto literal = \"<img src=never-requested>\";\r\n```\r\n\r\n"
+            "| Name | Value |\r\n| --- | --- |\r\n| alpha row | 1 |\r\n\r\n"
+            "![remote image](http://127.0.0.1:1/never-requested) <b>literal HTML</b>\r\n";
+        server.responses.append({{MockChatServer::delta({{"content", response.left(response.size()/2)}}),
+            MockChatServer::delta({{"content", response.mid(response.size()/2)}}), QByteArray("data: [DONE]\n\n")}, 12, 200});
+        QTemporaryDir scratch; QVERIFY(scratch.isValid()); const auto path = scratch.filePath("synthetic-markdown.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf", path));
+        RecordingClipboardWorkspace workspace; QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview", new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace", &workspace); engine.rootContext()->setContextProperty("reader", workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml")); QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first()); QVERIFY(window);
+        const auto close = qScopeGuard([&] { window->close(); }); window->setProperty("appearance", theme); window->resize(1050, 1100);
+        workspace.openFile(QUrl::fromLocalFile(path)); auto *reader = workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(), 1); QTRY_COMPARE(reader->pendingCommands(), 0);
+        window->setProperty("aiSettings", QVariantMap{{"baseUrl", server.baseUrl()}, {"model", "synthetic-markdown"}});
+        QVERIFY(QMetaObject::invokeMethod(window, "openAiWorkspace", Q_ARG(QVariant, "summary"))); reader->setAiInput("action", 0);
+        auto *panel = window->findChild<QObject *>("aiPanel"); QVERIFY(panel);
+        QVERIFY(QMetaObject::invokeMethod(panel, "prepare")); QTRY_COMPARE(reader->pendingCommands(), 0);
+        const auto plan = reader->aiState().value("plan").toMap(); QVERIFY(!plan.isEmpty());
+        const auto wire = plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        QVERIFY(reader->startAi("local", plan)); QTRY_VERIFY(!reader->aiState().value("running").toBool()); QTRY_COMPARE(reader->pendingCommands(), 0);
+        auto *area = window->findChild<QQuickItem *>("aiAnswerText"); QVERIFY(area);
+        const auto *quickDocument = area->property("textDocument").value<QQuickTextDocument *>(); QVERIFY(quickDocument);
+        const auto *document = quickDocument->textDocument(); QVERIFY(document);
+        QVERIFY(!document->toPlainText().contains("# Native heading"));
+        QCOMPARE(document->find("Native heading").charFormat().font().pixelSize(), 17);
+        QVERIFY(document->find("Bold answer").charFormat().fontWeight() >= QFont::Bold);
+        QVERIFY(document->find("emphasis").charFormat().fontItalic());
+        QCOMPARE(document->find("[p.1]").charFormat().anchorHref(), QString("p.1"));
+        QVERIFY(!document->find("[p.99]").charFormat().isAnchor());
+        const auto *table = document->find("alpha row").currentTable(); QVERIFY(table); QCOMPARE(table->rows(), 2);
+        auto *palette = window->property("colors").value<QObject *>(); QVERIFY(palette);
+        const auto raised = palette->property("raisedBg").value<QColor>().name(QColor::HexRgb);
+        QVERIFY(area->property("text").toString().contains("background-color:" + raised));
+        QVERIFY(area->property("readOnly").toBool() && area->property("selectByKeyboard").toBool());
+        const auto raw = reader->aiState().value("output").toString(); QVERIFY(raw.endsWith(response));
+        auto *copy = window->findChild<QObject *>("aiAnswerTextCopy"); QVERIFY(copy);
+        QVERIFY(QMetaObject::invokeMethod(copy, "clicked")); QCOMPARE(workspace.copied, raw);
+        QCOMPARE(server.requests.size(), 1);
+        QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n") + 4), wire);
+        QVERIFY(settleReaderViewport(window)); QVERIFY(settleRasterWork(reader)); QTest::qWait(40);
+        const auto evidence = qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if (!evidence.isEmpty()) QVERIFY(window->grabWindow().save(evidence + "-markdown-" + theme + ".png"));
     }
 
     void aiMathUsesNativeMarkupWithoutChangingTheOriginalResponse_data() {

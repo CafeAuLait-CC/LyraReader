@@ -1,7 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
-import "ReaderLogic.js" as Logic
+import LyraReader 1.0
 
 ColumnLayout {
     id: result
@@ -59,12 +59,22 @@ ColumnLayout {
                 : qsTr("Tokens: %1").arg(total);
         return Number.isFinite(cached) ? qsTr("Cached input tokens: %1").arg(cached) : "";
     }
-    function markupFor(text) {
-        if (plainText) return text;
-        const formulas = app.currentReader ? app.currentReader.aiMathMarkup(text) : [];
-        return Logic.answerMarkup(text, citationPages !== undefined ? citationPages : sent.action === "TranslateSelection" ? false
-            : sent.action === "DocumentChat" ? (sent.sources || []).map(source => source.page) : sent.source_pages || [],
-            formulas, String(app.colors.accent));
+    ReadingMarkdown { id: markdown }
+    function renderFor(text) {
+        if (plainText) return {plain: true, text: text};
+        const pages = citationPages !== undefined ? citationPages : sent.action === "TranslateSelection" ? []
+            : sent.action === "DocumentChat" ? (sent.sources || []).map(source => source.page) : sent.source_pages || [];
+        return markdown.render(text, app.currentReader, pages || [],
+            app.currentReader ? app.currentReader.pageCount : 0, bodySize, {
+                accent: app.colors.accent, separator: app.colors.separator,
+                raisedBg: app.colors.raisedBg, textSecondary: app.colors.textSecondary
+            });
+    }
+    function activateLink(link) {
+        // Only explicit activation opens external links; images/HTML never load resources.
+        if (/^(https?:|mailto:)/i.test(link)) { Qt.openUrlExternally(link); return; }
+        result.citation(link, {action: sent.action, sources: sent.sources || [],
+            source_pages: sent.source_pages || [], generation: value.generation});
     }
     function focusAnswer() {
         if (!collapsibleSummary && answerLoader.item) answerLoader.item.forceActiveFocus(Qt.TabFocusReason);
@@ -104,15 +114,24 @@ ColumnLayout {
         id: answerArea
         objectName: result.answerName
         Layout.fillWidth: true
-        text: result.markupFor(result.outputText)
+        readonly property var rendered: result.renderFor(result.outputText)
+        text: rendered.text
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
-        textFormat: result.plainText ? TextEdit.PlainText : TextEdit.RichText
+        textFormat: rendered.plain ? TextEdit.PlainText : TextEdit.RichText
         Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
         Binding { target: answerArea; property: "font.pixelSize"; value: result.bodySize; when: result.inlineConversation }
         Accessible.name: result.answerAccessibleName
         Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
-        onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }
+        onLinkActivated: function(link) { result.activateLink(link); }
     }
+    }
+    Label {
+        objectName: result.answerName + "FormatWarning"
+        text: !result.collapsibleSummary && answerLoader.item && answerLoader.item.rendered
+            ? answerLoader.item.rendered.warning || "" : ""
+        visible: text.length > 0
+        Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
+        color: app.colors.textSecondary; font.pixelSize: 11
     }
     ToolButton {
         id: sources
