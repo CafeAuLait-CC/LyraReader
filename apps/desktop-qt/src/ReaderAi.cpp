@@ -310,8 +310,13 @@ void ReaderController::dismissGeneratedRegionNote() {
     emit aiStateChanged();
 }
 void ReaderController::setAiInput(const QString &key,const QVariant &value) {
-    m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     auto input=m_aiState.value(QStringLiteral("input")).toMap();
+    if(key==QStringLiteral("translationShowOriginal")) {
+        if(value.metaType()!=QMetaType::fromType<bool>() || input.value(key)==value)return;
+        // Showing a saved source is native presentation, not a new request.
+        input.insert(key,value);m_aiState.insert(QStringLiteral("input"),input);emit aiStateChanged();return;
+    }
+    m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     if(key==QStringLiteral("view")) {
         const auto view=value.toString();
         if(view!=QStringLiteral("summary") && view!=QStringLiteral("translation") && view!=QStringLiteral("chat"))return;

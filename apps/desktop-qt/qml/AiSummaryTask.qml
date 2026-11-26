@@ -89,7 +89,7 @@ AiReadingScrollView {
             Layout.fillWidth: true; Layout.minimumWidth: 0
             choices: [{title: qsTr("Whole document"), icon: "document"}, {title: qsTr("Selection"), icon: "selection"}]
             currentIndex: task.panel.selectedSummary ? 1 : 0
-            enabled: !task.panel.running && !task.panel.owner.pendingCommands
+            enabled: !task.panel.running && !task.panel.owner.loading
             Accessible.name: qsTr("Summary source")
             onActivated: function(index) { task.panel.owner.setAiInput("action", index ? 5 : 1); }
         }

@@ -1,0 +1,154 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+
+Item {
+    id: row
+    required property var app
+    required property var task
+    required property int index
+    required property string recordId
+    required property int paragraph
+    required property bool first
+    required property bool last
+    required property bool isActive
+    required property bool isExpanded
+    objectName: "aiSavedTranslationRow" + index
+    implicitHeight: content.implicitHeight + 12
+    readonly property var entry: isActive ? task.activeEntry : task.entries[recordId] || null
+    readonly property var blocks: entry ? entry.blocks || [] : []
+    readonly property var block: blocks[paragraph] || null
+    readonly property string original: block ? block.original : ""
+    readonly property string answer: block ? block.translation : entry ? entry.content || "" : ""
+    readonly property var verifiedPages: {
+        const pages = entry ? entry.source_pages || [] : [];
+        return block ? (pages.indexOf(block.page) >= 0 ? [block.page] : []) : pages;
+    }
+    readonly property int page: block ? block.page : 0
+    readonly property string originalKey: recordId + ":" + paragraph
+    readonly property bool originalExpanded: isActive || task.originalOpen[originalKey] === true
+    readonly property bool collapsed: !isActive && !isExpanded
+    readonly property bool hasMore: blocks.length > 1 || answerView.implicitHeight > previewHeight + .5
+    readonly property real previewHeight: 3 * (Math.ceil(metrics.height) + 5)
+    FontMetrics { id: metrics; font.pixelSize: 14 }
+    function focusDisclosure() { if (disclosure.visible) disclosure.forceActiveFocus(Qt.TabFocusReason); }
+    function focusAnswer() { answerView.focusAnswer(); }
+    Component.onCompleted: if (!isActive) task.needEntry(recordId)
+    onRecordIdChanged: if (!isActive) task.needEntry(recordId)
+    ColumnLayout {
+        id: content
+        x: row.task.leadingInset; y: 6; width: row.task.rowWidth
+        spacing: 8
+        Label {
+            visible: row.first && !!row.entry && row.entry.status === "sourceChanged"
+            text: qsTr("The document has changed. This result keeps its original source snapshot.")
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+            color: app.colors.warningFg; font.pixelSize: 12
+        }
+        Label {
+            visible: row.first && !!row.entry && row.entry.status === "partial"
+            text: qsTr("Partial result · stopped or interrupted")
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+            color: app.colors.textSecondary; font.pixelSize: 12
+        }
+        Label {
+            visible: row.first && !!row.entry && !!row.entry.warning
+            text: row.entry ? row.entry.warning || "" : ""
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+            color: app.colors.warningFg; font.pixelSize: 12
+        }
+        Label {
+            visible: !row.entry
+            text: row.task.entryErrors[row.recordId] || qsTr("Loading saved translation…")
+            textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+            color: row.task.entryErrors[row.recordId] ? app.colors.warningFg : app.colors.textSecondary
+            font.pixelSize: 12
+        }
+        ToolButton {
+            visible: !row.entry && !!row.task.entryErrors[row.recordId]
+            text: qsTr("Reload saved result")
+            onClicked: row.task.needEntry(row.recordId, true)
+        }
+        ColumnLayout {
+            visible: row.task.showOriginal && !!row.original
+            Layout.fillWidth: true; Layout.minimumWidth: 0
+            spacing: 2
+            Item {
+                Layout.fillWidth: true
+                implicitHeight: row.originalExpanded ? originalText.contentHeight : Math.min(originalText.contentHeight, row.previewHeight)
+                clip: true
+                TextArea {
+                    id: originalText
+                    objectName: "aiTranslationOriginal" + row.index
+                    width: parent.width
+                    text: row.original; textFormat: TextEdit.PlainText
+                    readOnly: true; selectByMouse: true; selectByKeyboard: true
+                    wrapMode: TextEdit.Wrap; padding: 0; background: null
+                    color: app.colors.textSecondary; font.pixelSize: 14
+                    Accessible.name: qsTr("Original passage")
+                    Keys.onPressed: function(event) {
+                        if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown].indexOf(event.key) >= 0 && !row.originalExpanded)
+                            row.task.setOriginalOpen(row.originalKey, true);
+                        event.accepted = false;
+                    }
+                }
+            }
+            ToolButton {
+                objectName: "aiTranslationOriginalMore" + row.index
+                visible: !row.isActive && (row.originalExpanded || originalText.contentHeight > row.previewHeight + .5)
+                text: row.originalExpanded ? qsTr("Less") : qsTr("More")
+                palette.buttonText: app.colors.accent
+                onClicked: { const closing = row.originalExpanded; row.task.setOriginalOpen(row.originalKey, !closing); if (closing) row.task.revealRecord(row.recordId); }
+            }
+        }
+        Item {
+            Layout.fillWidth: true; Layout.minimumWidth: 0
+            implicitHeight: row.collapsed ? Math.min(answerView.implicitHeight, row.previewHeight) : answerView.implicitHeight
+            visible: !!row.answer
+            clip: true
+            AiResult {
+                id: answerView
+                width: parent.width
+                app: row.app
+                value: ({output: row.answer, generation: row.task.generation, responsePlan: {source_pages: row.verifiedPages}})
+                answerName: "aiTranslationAnswer" + row.index
+                plainText: false; citationPages: row.verifiedPages
+                inlineConversation: true; bodySize: 14
+                showActions: false; showSources: false
+                viewport: row.task.viewport
+                onCitation: function(link, plan) { row.task.panel.followVerifiedPage(link, row.verifiedPages, row.task.generation); }
+                onKeyboardNavigation: if (row.collapsed) row.task.expandRecord(row.recordId, true)
+            }
+        }
+        RowLayout {
+            visible: !!row.entry
+            Layout.fillWidth: true
+            ToolButton {
+                objectName: "aiTranslationPage" + row.index
+                visible: row.page > 0
+                text: qsTr("p. %1").arg(row.page)
+                palette.buttonText: app.colors.accent
+                enabled: row.verifiedPages.indexOf(row.page) >= 0
+                onClicked: row.task.panel.followVerifiedPage("p." + row.page, row.verifiedPages, row.task.generation)
+            }
+            Item { Layout.fillWidth: true }
+            ToolButton {
+                id: disclosure
+                objectName: "aiTranslationMore" + row.index
+                visible: !row.isActive && row.last && (row.isExpanded || row.hasMore)
+                text: row.isExpanded ? qsTr("Less") : qsTr("More")
+                palette.buttonText: app.colors.accent
+                onClicked: row.task.expandRecord(row.recordId, !row.isExpanded)
+            }
+            LyraToolButton {
+                objectName: "aiTranslationRetry" + row.index
+                visible: !row.isActive && row.last
+                symbol: "rotate"; text: qsTr("Retry"); display: AbstractButton.TextBesideIcon
+                palette.buttonText: app.colors.accent; icon.color: app.colors.accent
+                enabled: !row.isActive && !!row.entry && row.entry.can_replay && row.task.canReview
+                onClicked: row.task.panel.replaySavedTranslation(row.entry, true)
+            }
+        }
+        Rectangle { Layout.fillWidth: true; height: 1; color: app.colors.separator }
+    }
+}

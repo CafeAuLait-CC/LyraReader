@@ -14,6 +14,8 @@ ColumnLayout {
     property int bodySize: 13
     property bool collapsibleSummary: false
     property bool showActions: true
+    property bool plainText: sent.kind === "reading_translation"
+    property var citationPages: undefined
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function revealCursor(area, owner, generation, target) {
@@ -56,11 +58,14 @@ ColumnLayout {
         return Number.isFinite(cached) ? qsTr("Cached input tokens: %1").arg(cached) : "";
     }
     function markupFor(text) {
-        if (sent.kind === "reading_translation") return text;
+        if (plainText) return text;
         const formulas = app.currentReader ? app.currentReader.aiMathMarkup(text) : [];
-        return Logic.answerMarkup(text, sent.action === "TranslateSelection" ? false
+        return Logic.answerMarkup(text, citationPages !== undefined ? citationPages : sent.action === "TranslateSelection" ? false
             : sent.action === "DocumentChat" ? (sent.sources || []).map(source => source.page) : sent.source_pages || [],
             formulas, String(app.colors.accent));
+    }
+    function focusAnswer() {
+        if (!collapsibleSummary && answerLoader.item) answerLoader.item.forceActiveFocus(Qt.TabFocusReason);
     }
     Label {
         objectName: result.answerName + "UnitTitle"
@@ -79,6 +84,7 @@ ColumnLayout {
         Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
     }
     Loader {
+        id: answerLoader
         Layout.fillWidth: true; Layout.minimumWidth: 0
         sourceComponent: result.collapsibleSummary ? sections : answer
     }
@@ -98,7 +104,7 @@ ColumnLayout {
         Layout.fillWidth: true
         text: result.markupFor(result.outputText)
         readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
-        textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
+        textFormat: result.plainText ? TextEdit.PlainText : TextEdit.RichText
         Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
         Binding { target: answerArea; property: "font.pixelSize"; value: result.bodySize; when: result.inlineConversation }
         Accessible.name: qsTr("AI response")

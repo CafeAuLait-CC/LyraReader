@@ -15,6 +15,7 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 pub(super) const WORKSPACE_FILE: &str = "ai-reading-workspace.json";
+pub(super) const MAX_TRANSLATION_HISTORY_BATCH: usize = 16;
 
 #[derive(Deserialize)]
 pub(super) struct ChatInput {
@@ -332,33 +333,37 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         id: &str,
     ) -> Result<Value, String> {
+        self.translation_history_entries(source, &[id])?
+            .pop()
+            .ok_or_else(|| "The saved translation is unavailable.".into())
+    }
+
+    pub(super) fn translation_history_entries(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        ids: &[&str],
+    ) -> Result<Vec<Value>, String> {
+        if ids.is_empty() || ids.len() > MAX_TRANSLATION_HISTORY_BATCH {
+            return Err("Choose between 1 and 16 saved translations per history read.".into());
+        }
+        let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+        if unique.len() != ids.len() || unique.contains("") {
+            return Err("Saved translation identities must be nonempty and distinct.".into());
+        }
         self.read_workspace(source, false, |workspace| {
-            let record = translation_record(workspace, id)?;
-            let selection = workspace.task_selection(id).is_ok_and(|range| range.is_some());
-            if record.status == "partial" || record.originals.is_empty() {
-                return Ok(json!({"id": record.id, "language": record.language, "status": record.status,
-                    "can_replay": !record.source_hash.is_empty() && record.status != "sourceChanged",
-                    "content": record.content, "blocks": [], "selection": selection}));
-            }
-            let pairs =
-                translation_blocks(&record.originals, &record.original_pages, &record.content);
-            let (rows, warning) = match pairs {
-                Ok(rows)
-                    if !rows.is_empty() && rows.iter().all(|row| !row.translation.is_empty()) =>
-                {
-                    (rows_value(&rows), None)
-                }
-                Ok(_) => (
-                    Value::Null,
-                    Some("The saved response does not translate every source paragraph.".into()),
-                ),
-                Err(error) => (Value::Null, Some(error)),
-            };
-            Ok(
-                json!({"id": record.id, "language": record.language, "status": record.status,
-                "can_replay": !record.source_hash.is_empty() && record.status != "sourceChanged",
-                "content": record.content, "blocks": rows, "warning": warning, "selection": selection}),
-            )
+            // The visible timeline requests a small batch. Decode the file and
+            // take the shared record snapshot once, not once per delegate.
+            let records = workspace.records();
+            let fingerprint = source.document_identity().sha256;
+            ids.iter()
+                .map(|id| {
+                    let record = records
+                        .iter()
+                        .find(|record| record.id == *id && record.kind == "translation")
+                        .ok_or("The saved translation is unavailable.")?;
+                    translation_entry_value(workspace, record, &fingerprint, source.page_count())
+                })
+                .collect()
         })
     }
 
@@ -578,6 +583,48 @@ impl DesktopDocument {
             Ok(json!({"modified":modified}))
         })
     }
+}
+
+fn translation_entry_value(
+    workspace: &ReadingWorkspace,
+    record: &ReadingRecord,
+    fingerprint: &str,
+    page_count: u32,
+) -> Result<Value, String> {
+    let selection = workspace
+        .task_selection(&record.id)
+        .is_ok_and(|range| range.is_some());
+    let verified = record.source_hash == fingerprint;
+    let source_pages: Vec<_> = record
+        .pages
+        .iter()
+        .copied()
+        .filter(|page| verified && *page > 0 && *page <= page_count)
+        .collect();
+    let can_replay = !record.source_hash.is_empty() && record.status != "sourceChanged";
+    if record.status == "partial" || record.originals.is_empty() {
+        return Ok(
+            json!({"id":record.id,"language":record.language,"status":record.status,
+            "can_replay":can_replay,"content":record.content,"blocks":[],
+            "selection":selection,"source_pages":source_pages}),
+        );
+    }
+    let (rows, warning) =
+        match translation_blocks(&record.originals, &record.original_pages, &record.content) {
+            Ok(rows) if !rows.is_empty() && rows.iter().all(|row| !row.translation.is_empty()) => {
+                (rows_value(&rows), None)
+            }
+            Ok(_) => (
+                Value::Null,
+                Some("The saved response does not translate every source paragraph.".into()),
+            ),
+            Err(error) => (Value::Null, Some(error)),
+        };
+    Ok(
+        json!({"id":record.id,"language":record.language,"status":record.status,
+        "can_replay":can_replay,"content":record.content,"blocks":rows,"warning":warning,
+        "selection":selection,"source_pages":source_pages}),
+    )
 }
 
 fn translation_record(workspace: &ReadingWorkspace, id: &str) -> Result<ReadingRecord, String> {

@@ -2535,7 +2535,7 @@ ApplicationWindow {
                             Layout.leftMargin: 16; Layout.rightMargin: 16
                             spacing: 8
                             LyraToolButton {
-                                symbol: root.aiPanelMode === "notes" || root.aiPanelMode === "regions" ? "note" : aiContent.workspace === "chat" ? "chat" : aiContent.workspace === "translation" ? "translation" : "document"
+                                symbol: root.aiPanelMode === "notes" || root.aiPanelMode === "regions" ? "note" : aiContent.workspace === "chat" ? "chat" : aiContent.workspace === "translation" ? "translation-panel" : "document"
                                 implicitWidth: 18; implicitHeight: 18; padding: 0; focusPolicy: Qt.NoFocus; hoverEnabled: false
                                 icon.color: theme.accent; Accessible.ignored: true; background: null
                             }
@@ -2554,8 +2554,8 @@ ApplicationWindow {
                             LyraToolButton {
                                 id: taskMoreButton
                                 objectName: "aiTaskMore"
-                                symbol: "more"; text: qsTr("More summary actions")
-                                visible: root.aiPanelMode === "assistant" && aiContent.referenceSummary && !aiContent.taskHistoryShown
+                                symbol: "more"; text: aiContent.workspace === "translation" ? qsTr("More translation actions") : qsTr("More summary actions")
+                                visible: root.aiPanelMode === "assistant" && (aiContent.referenceSummary || aiContent.referenceTranslation) && !aiContent.taskHistoryShown
                                 onClicked: aiContent.openTaskMore(taskMoreButton)
                             }
                             LyraToolButton {

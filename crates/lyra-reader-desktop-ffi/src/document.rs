@@ -1166,6 +1166,25 @@ impl DesktopDocument {
             }
             "ai_translation_history" => self.translation_history(&d, arg(&r, "selection")?),
             "ai_translation_history_entry" => self.translation_history_entry(&d, &text(&r, "id")?),
+            "ai_translation_history_entries" => {
+                let values = r["ids"]
+                    .as_array()
+                    .filter(|values| {
+                        !values.is_empty()
+                            && values.len() <= crate::reading_history::MAX_TRANSLATION_HISTORY_BATCH
+                    })
+                    .ok_or("Choose between 1 and 16 saved translations per history read.")?;
+                let ids = values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .ok_or("Saved translation identities must be strings.")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.translation_history_entries(&d, &ids).map(Value::Array)
+            }
+
             "ai_chat_sessions" => self.chat_sessions(&d),
             "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
             "ai_chat_draft" => self.save_chat_draft(&d, arg(&r, "draft")?),
@@ -2781,6 +2800,100 @@ mod tests {
             fs::read(directory.join("document-understanding-v2.previous.json")).unwrap(),
             primary_bytes
         );
+    }
+
+    #[test]
+    fn translation_entry_batches_match_single_reads_and_keep_unverified_pages_unlinked() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = doc.active().unwrap();
+        let long_id = format!("retained-{}", "x".repeat(600));
+        doc.update_reading_workspace(&source, |workspace, sha, _| {
+            for (id, fingerprint, status, original) in [
+                ("batch-current", sha, "finished", true),
+                ("batch-stale", "earlier-source", "finished", true),
+                ("batch-partial", sha, "partial", false),
+                (long_id.as_str(), "", "finished", true),
+            ] {
+                workspace.put(ReadingRecord {
+                    id: id.into(),
+                    kind: "translation".into(),
+                    source_id: "document".into(),
+                    content: "<!--lyra:0--> Synthetic translated passage [p.99].".into(),
+                    pages: vec![1, 99],
+                    source_hash: fingerprint.into(),
+                    status: status.into(),
+                    language: "Synthetic language".into(),
+                    originals: if original {
+                        vec!["Synthetic original passage.".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    original_pages: if original { vec![1] } else { Vec::new() },
+                    ..ReadingRecord::default()
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let directory = doc
+            .with_reading_cache(&source, false, |cache, _| Ok(cache.directory.clone()))
+            .unwrap();
+        let path = directory.join(crate::reading_history::WORKSPACE_FILE);
+        // The canonical writer binds a new record to its source. Model an
+        // older unbound record in this owned fixture before testing reads.
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let unbound = legacy["records"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|record| record["id"] == long_id)
+            .unwrap();
+        unbound["source_hash"] = json!("");
+        fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let ids = [
+            long_id.as_str(),
+            "batch-current",
+            "batch-partial",
+            "batch-stale",
+        ];
+        let expected: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                doc.command(json!({"op":"ai_translation_history_entry","id":id}))
+                    .unwrap()
+            })
+            .collect();
+        let batch = doc
+            .command(json!({"op":"ai_translation_history_entries","ids":ids}))
+            .unwrap();
+        assert_eq!(batch, json!(expected));
+        assert_eq!(batch[0]["source_pages"], json!([]));
+        assert_eq!(batch[0]["can_replay"], false);
+        assert_eq!(batch[1]["source_pages"], json!([1]));
+        assert_eq!(
+            batch[1]["blocks"][0]["original"],
+            "Synthetic original passage."
+        );
+        assert_eq!(batch[2]["blocks"], json!([]));
+        assert_eq!(batch[2]["source_pages"], json!([1]));
+        assert_eq!(batch[3]["source_pages"], json!([]));
+        assert_eq!(batch[3]["status"], "sourceChanged");
+        for ids in [
+            json!([]),
+            json!([true]),
+            json!([""]),
+            json!(["batch-current", "batch-current"]),
+            json!(["missing"]),
+            json!(vec!["batch-current"; 17]),
+        ] {
+            assert!(
+                doc.command(json!({"op":"ai_translation_history_entries","ids":ids}))
+                    .is_err()
+            );
+        }
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[test]
