@@ -11,6 +11,8 @@ Flickable {
     property real measuredHeight: 0
     property real surfaceWidth: width
     property bool outlined: false
+    property bool surfaceVisible: true
+    property bool showIndicator: true
     readonly property var indicator: bar
     objectName: viewName + "HorizontalViewport"
     Layout.minimumWidth: 0
@@ -34,6 +36,7 @@ Flickable {
     Rectangle {
         objectName: view.viewName + "Surface"
         parent: view; width: view.surfaceWidth; height: view.height; z: -1
+        visible: view.surfaceVisible
         radius: 4; color: app.colors.raisedBg
         border.width: view.outlined ? 0.5 : 0; border.color: app.colors.separator
     }
@@ -58,5 +61,6 @@ Flickable {
         id: bar
         objectName: view.viewName + "HorizontalBar"
         active: hovered || pressed || horizontalWheel.active || shiftedWheel.active || cursorIndicator.running
+        policy: view.showIndicator ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
     }
 }

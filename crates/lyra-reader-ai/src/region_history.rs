@@ -560,6 +560,7 @@ impl History {
                 "draft": e.draft_question.as_deref().unwrap_or("").chars().take(160).collect::<String>(),
                 "state": e.state,
                 "turns": turns,
+                "completed_turn_count": e.completed_turns().count(),
                 "has_note": !e.knowledge_note.is_empty(),
                 "has_answer": e.has_answer(),
                 "answer_preview": e.answer_preview(),
@@ -791,6 +792,11 @@ mod tests {
         .collect();
         let completed: Vec<_> = entry.completed_turns().map(|t| t.answer).collect();
         assert_eq!(completed, ["answer 0"]);
+        let mut history = History::decode(b"[]").unwrap();
+        history.put(entry).unwrap();
+        let summary = history.summaries("fixture", &sha).unwrap();
+        assert_eq!(summary["entries"][0]["turns"], 4);
+        assert_eq!(summary["entries"][0]["completed_turn_count"], 1);
     }
     #[test]
     fn source_navigation_needs_sent_turn_pages_and_the_same_capture_revision() {

@@ -2198,6 +2198,31 @@ mod tests {
         assert_eq!(fs::read(region_path(&fixture.path)).unwrap(), external);
     }
     #[test]
+    fn region_reopen_rejects_external_history_and_list_refreshes_its_revision() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let id = saved_region(&doc);
+        let snapshot = doc.command(json!({"op":"region_list"})).unwrap();
+        let path = region_path(&fixture.path);
+        let mut external = fs::read(&path).unwrap();
+        external.push(b' ');
+        fs::write(&path, &external).unwrap();
+        let Err(error) = doc.command(json!({"op":"region_reopen","id":id,
+            "expected_history_revision":snapshot["revision"]}))
+        else {
+            panic!("A stale region revision must not reopen");
+        };
+        assert!(error.contains("changed"));
+        let fresh = doc.command(json!({"op":"region_list"})).unwrap();
+        assert_ne!(fresh["revision"], snapshot["revision"]);
+        assert_eq!(fresh["entries"][0]["id"], id);
+        doc.command(
+            json!({"op":"region_reopen","id":id,"expected_history_revision":fresh["revision"]}),
+        )
+        .unwrap();
+        assert_eq!(fs::read(path).unwrap(), external);
+    }
+    #[test]
     fn region_history_reopens_without_raster_or_pdf_writes_and_retains_saved_drafts() {
         let fixture = Fixture::new("text-page.pdf");
         let original = fs::read(&fixture.path).unwrap();
@@ -3067,6 +3092,14 @@ mod tests {
         assert_eq!(notes[0]["content"], tasks[0]["content"]);
         assert_eq!(notes[0]["source_pages"], json!([1]));
         assert!(notes[0]["modified"].is_u64());
+        assert!(notes[0].get("source").is_none());
+        let detail = doc
+            .command(json!({"op":"ai_reading_note","id":"sidebar-note"}))
+            .unwrap();
+        assert!(detail["modified"].is_string());
+        assert_eq!(detail["source"]["whole_document"], true);
+        assert_eq!(detail["source"]["answer"]["content"], tasks[0]["content"]);
+        assert_eq!(detail["source"]["answer"]["source_pages"], json!([1]));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 

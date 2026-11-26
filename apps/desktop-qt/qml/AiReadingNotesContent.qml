@@ -21,10 +21,23 @@ Pane {
     property var editBaseline: ({})
     property string reviewId: ""
     property bool suggestionExpanded: false
+    property var regionContext: ({})
+    property double regionContextCommand: 0
+    property var continuationContext: null
+    property double continuationCommand: 0
+    property var sourceFocusTicket: null
     property var thoughtsFailureTicket: null
     readonly property string selectedNoteId: note ? note.id : ""
     readonly property var sourceEntry: note ? entries.find(entry => entry.id === note.id) || note : ({})
-    onSelectedNoteIdChanged: { suggestionExpanded = false; thoughtsFailureTicket = null; }
+    onSelectedNoteIdChanged: {
+        suggestionExpanded = false; thoughtsFailureTicket = null;
+        sourceDisclosure.expanded = false; conversationDisclosure.expanded = false;
+        continuationContext = null; sourceFocusTicket = null;
+    }
+    readonly property var sourceContext: note ? note.source || ({}) : ({})
+    readonly property var regionEntry: sourceContext.region_id && !regionContext.error && !regionContext.writes_blocked
+        ? (regionContext.entries || []).find(entry => entry.id === sourceContext.region_id && !entry.location_invalidated) || null : null
+    readonly property bool canUpdateDiscussion: !!regionEntry && regionEntry.completed_turn_count > sourceContext.covered_turns
     readonly property bool reviewing: reviewId.length > 0
     readonly property var reviewState: reader ? reader.aiState : ({})
     readonly property var reviewPlan: reviewing && reviewState.previewView === "note"
@@ -66,10 +79,22 @@ Pane {
         const pages = (entry.source_pages || []).map(page => qsTr("p. %1").arg(page)).join(", ");
         return kind + (pages.length ? " · " + pages : entry.status === "sourceChanged" ? " · " + qsTr("Earlier PDF revision") : "");
     }
+    function mergeNoteMetadata(value) {
+        const row = Object.assign({}, value);
+        // Only the currently opened detail owns its original answer snapshot.
+        // Visiting notes must not accumulate a second history in the list rows.
+        delete row.source;
+        entries = entries.map(entry => entry.id === row.id ? Object.assign({}, entry, row) : entry);
+    }
     signal requestUpdate(string noteId)
 
     function displayNote(value) {
+        const changed = !note || note.id !== value.id;
         noteOwner = reader; noteGeneration = generation; note = value;
+        if (changed) {
+            regionContext = ({}); regionContextCommand = 0;
+            if (sourceContext.region_id) regionContextCommand = reader.submit("region_list", {});
+        }
     }
     function finishInput() {
         inlineThoughts.finishInput();
@@ -85,6 +110,26 @@ Pane {
                     && focusItem.activeFocus && editDetails.interactionEpoch === interaction)
                 editDetails.revealItem(item);
         });
+    }
+    function revealSourceAction(item) {
+        sourceFocusTicket = {owner: reader, generation: generation, id: selectedNoteId, item: item,
+            interaction: contents.interactionEpoch, initial: true};
+        Qt.callLater(tryRevealSourceAction);
+    }
+    function tryRevealSourceAction() {
+        const ticket = sourceFocusTicket;
+        if (!ticket) return;
+        if (!current() || reader !== ticket.owner || generation !== ticket.generation || selectedNoteId !== ticket.id
+                || editing || reviewing || !ticket.item || !ticket.item.activeFocus || contents.interactionEpoch !== ticket.interaction)
+            { sourceFocusTicket = null; return; }
+        // Native control metrics and a lazy answer can settle after the parent
+        // layout's first polish. Keep the focused action visible as they finish.
+        noteFlow.ensurePolished();
+        const f = contents.contentItem, item = ticket.item;
+        const y = item.mapToItem(f, 0, 0).y;
+        if (ticket.initial || y < -.5 || y + item.height > f.height + .5) contents.revealItem(item);
+        if (sourceFocusTicket !== ticket) return;
+        ticket.interaction = contents.interactionEpoch; ticket.initial = false;
     }
     function revealThoughtsFailure() {
         thoughtsFailureTicket = {owner: reader, generation: generation, id: selectedNoteId,
@@ -117,6 +162,39 @@ Pane {
         const page = Number(match[1]);
         if ((note.source_pages || []).indexOf(page) < 0 || page < 1 || page > reader.pageCount) return;
         app.navigate(page - 1);
+    }
+    function locateSource(page) {
+        if (!current() || !note || (note.source_pages || []).indexOf(page) < 0) return;
+        finishInput();
+        app.locateReadingSource(page - 1, sourceContext.excerpt || "");
+    }
+    function continueConversation() {
+        if (!noteWriteReady || editing || reviewing || continuationCommand || reviewState.running) return;
+        finishInput();
+        const owner = reader, epoch = generation, id = selectedNoteId;
+        if (regionEntry) {
+            continuationContext = {owner: owner, generation: epoch, note: id, region: regionEntry.id};
+            continuationCommand = owner.reopenAiRegion(regionEntry.id, regionContext.revision);
+            if (!continuationCommand) {
+                continuationContext = null;
+                failure = qsTr("Save the current region or reading-note draft before continuing this conversation.");
+            }
+        } else if (sourceContext.chat_id) {
+            if (!owner.reopenAiChat(sourceContext.chat_id)) {
+                failure = qsTr("The document is busy. Try opening this conversation again."); return;
+            }
+            close();
+            if (owner === app.currentReader && epoch === owner.documentGeneration) app.openAiWorkspace("chat");
+        }
+    }
+    function finishContinue() {
+        const ticket = continuationContext; continuationContext = null;
+        if (!ticket || !current() || reader !== ticket.owner || generation !== ticket.generation || selectedNoteId !== ticket.note
+                || editing || reviewing || reader.hasUnsavedReadingNotes) return;
+        if (reader.aiRegion.history_id !== ticket.region) {
+            failure = qsTr("The saved discussion changed. Open the note again before continuing."); return;
+        }
+        close(); app.showAiPanel(false); app.openRegionTool();
     }
     function browse(source, noteId = "") {
         reader = app.currentReader;
@@ -206,7 +284,7 @@ Pane {
         command = reader.saveReadingNoteDraft();
     }
     function beginUpdate() {
-        if (!noteWriteReady || !note || !note.discussion_available || note.suggestion || editing || reviewState.running) return;
+        if (!noteWriteReady || !note || !canUpdateDiscussion || note.suggestion || editing || reviewState.running) return;
         debounce.stop();
         failure = "";
         reviewId = note.id;
@@ -233,6 +311,9 @@ Pane {
     function reset() {
         finishInput();
         thoughtsFailureTicket = null;
+        sourceFocusTicket = null;
+        regionContext = ({}); regionContextCommand = 0;
+        continuationContext = null; continuationCommand = 0;
         debounce.stop();
         reviewId = "";
         editing = false;
@@ -244,11 +325,24 @@ Pane {
         function onAiStateChanged() { if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
         function onReadingNoteAutosaveFinished(noteId, result, error) {
             if (!notes.current() || error) return;
-            notes.entries = notes.entries.map(entry => entry.id === noteId ? Object.assign({}, entry, result) : entry);
+            notes.mergeNoteMetadata(result);
             if (!notes.editing && notes.note && notes.note.id === noteId) notes.displayNote(result);
             else if (!notes.note && !notes.editing && !notes.reviewing && !notes.command) notes.refresh();
         }
         function onCommandFinished(id, operation, result, error) {
+            if (!notes.current()) return;
+            if (id === notes.regionContextCommand) {
+                notes.regionContextCommand = 0;
+                if (error) notes.failure = error;
+                else notes.regionContext = result;
+                return;
+            }
+            if (id === notes.continuationCommand) {
+                notes.continuationCommand = 0;
+                if (error) { notes.continuationContext = null; notes.failure = error; }
+                else Qt.callLater(notes.finishContinue);
+                return;
+            }
             if (id !== notes.command || !notes.current()) return;
             notes.rememberPosition();
             notes.command = 0;
@@ -264,7 +358,7 @@ Pane {
                 notes.preferred = "";
                 notes.read(picker.currentIndex);
             } else if (operation === "ai_reading_note") {
-                notes.entries = notes.entries.map(entry => entry.id === result.id ? Object.assign({}, entry, result) : entry);
+                notes.mergeNoteMetadata(result);
                 notes.displayNote(result);
                 if (notes.reader.readingNoteDraft.id === result.id && !notes.reader.readingNoteAutomatic) notes.beginEditing();
                 else if ((notes.reviewState.running && notes.reviewState.responseView === "note"
@@ -288,6 +382,17 @@ Pane {
     Connections {
         target: notes.thoughtsFailureTicket ? notes.app : null
         function onFrameSwapped() { Qt.callLater(notes.tryRevealThoughtsFailure); }
+    }
+    Connections {
+        target: notes.sourceFocusTicket ? contents.contentItem : null
+        function onContentHeightChanged() { Qt.callLater(notes.tryRevealSourceAction); }
+        function onHeightChanged() { Qt.callLater(notes.tryRevealSourceAction); }
+    }
+    Connections {
+        target: notes.sourceFocusTicket ? notes.sourceFocusTicket.item : null
+        function onActiveFocusChanged() { Qt.callLater(notes.tryRevealSourceAction); }
+        function onHeightChanged() { Qt.callLater(notes.tryRevealSourceAction); }
+        function onYChanged() { Qt.callLater(notes.tryRevealSourceAction); }
     }
     Timer { id: debounce; interval: 220; onTriggered: notes.refresh() }
 
@@ -437,6 +542,7 @@ Pane {
             visible: !notes.editing && !notes.reviewing && !!notes.note
             objectName: "aiReadingNoteDetailScroll"
             ColumnLayout {
+                id: noteFlow
                 objectName: "aiReadingNoteDetailFlow"
                 width: contents.availableWidth
                 spacing: 18
@@ -479,7 +585,7 @@ Pane {
                 }
                 Button {
                     objectName: "previewAiReadingNoteUpdate"
-                    visible: !!(notes.note && notes.note.discussion_available && !notes.note.suggestion)
+                    visible: !!(notes.note && notes.canUpdateDiscussion && !notes.note.suggestion)
                     text: qsTr("Preview update from discussion")
                     enabled: notes.noteWriteReady && !notes.reviewState.running
                     onClicked: notes.beginUpdate()
@@ -603,28 +709,126 @@ Pane {
                     textFormat: Text.PlainText; wrapMode: Text.Wrap
                     font.pixelSize: 11; color: app.colors.warningFg
                 }
-                Flow {
-                    objectName: "aiReadingNoteSourceActions"
-                    Layout.fillWidth: true; spacing: 4
-                    ComboBox {
-                        id: sources
-                        objectName: "aiReadingNotePages"
-                        model: (notes.note ? notes.note.source_pages : []).map(page => qsTr("Page %1").arg(page))
-                        visible: count > 0
-                        Accessible.name: qsTr("Source page")
+                ColumnLayout {
+                    visible: !notes.sourceContext.whole_document && !!notes.sourceContext.excerpt
+                    Layout.fillWidth: true; spacing: 8
+                    AiReadingDisclosure {
+                        id: sourceDisclosure
+                        objectName: "expandAiReadingNoteSource"
+                        app: notes.app; text: qsTr("Source")
+                        Layout.fillWidth: true
+                        onActiveFocusChanged: if (activeFocus) notes.revealSourceAction(sourceDisclosure)
                     }
-                    Button {
-                        text: qsTr("Go to source")
-                        visible: sources.count > 0
-                        enabled: notes.current() && sources.currentIndex >= 0
-                        onClicked: {
-                            const page = notes.note.source_pages[sources.currentIndex] - 1;
-                            if (notes.current() && page >= 0 && page < notes.reader.pageCount) {
-                                app.navigate(page);
-                                notes.close();
+                    TextArea {
+                        id: savedExcerpt
+                        objectName: "aiReadingNoteExcerpt"
+                        visible: sourceDisclosure.expanded
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: Math.min(implicitHeight, excerptMetrics.lineSpacing * 8)
+                        text: notes.sourceContext.excerpt || ""
+                        textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                        readOnly: true; selectByMouse: true; selectByKeyboard: true
+                        font.pixelSize: 11; padding: 0; clip: true
+                        color: app.colors.textSecondary; background: null
+                        Accessible.name: qsTr("Saved source excerpt")
+                        FontMetrics { id: excerptMetrics; font: savedExcerpt.font }
+                    }
+                }
+                AiHorizontalReadingView {
+                    id: sourcePages
+                    objectName: "aiReadingNoteSourceActions"
+                    viewName: "aiReadingNoteSources"
+                    app: notes.app; surfaceVisible: false; showIndicator: false
+                    renderer: ({viewport: contents.contentItem, scrollParent: function(dy) { contents.applyReadingWheel(0, dy); }})
+                    measuredWidth: sourceButtons.implicitWidth; measuredHeight: sourceButtons.implicitHeight
+                    visible: !!notes.sourceContext.whole_document || !!(notes.note && (notes.note.source_pages || []).length)
+                    Layout.fillWidth: true
+                    RowLayout {
+                        id: sourceButtons
+                        spacing: 4
+                        Button {
+                            id: locateWholeDocument
+                            objectName: "locateAiReadingWholeDocument"
+                            visible: !!notes.sourceContext.whole_document
+                            text: qsTr("Locate whole document")
+                            enabled: notes.current() && !!notes.sourceContext.can_locate_document
+                            onActiveFocusChanged: if (activeFocus) notes.revealSourceAction(locateWholeDocument)
+                            onClicked: if (enabled) app.navigate(0)
+                        }
+                        Repeater {
+                            model: notes.sourceContext.whole_document ? [] : notes.note ? notes.note.source_pages || [] : []
+                            LyraToolButton {
+                                id: sourcePage
+                                required property int modelData
+                                objectName: "aiReadingNoteSourcePage" + modelData
+                                display: AbstractButton.TextOnly
+                                text: qsTr("p. %1").arg(modelData)
+                                enabled: notes.current()
+                                onActiveFocusChanged: if (activeFocus) {
+                                    const x = mapToItem(sourcePages.contentItem, 0, 0).x;
+                                    if (x < sourcePages.contentX) sourcePages.contentX = x;
+                                    else if (x + width > sourcePages.contentX + sourcePages.width)
+                                        sourcePages.contentX = x + width - sourcePages.width;
+                                    notes.revealSourceAction(sourcePage);
+                                }
+                                onClicked: notes.locateSource(modelData)
                             }
                         }
                     }
+                }
+                ColumnLayout {
+                    visible: !!notes.sourceContext.question
+                    Layout.fillWidth: true; spacing: 8
+                    AiReadingDisclosure {
+                        id: conversationDisclosure
+                        objectName: "expandAiReadingNoteConversation"
+                        app: notes.app; text: qsTr("View conversation")
+                        Layout.fillWidth: true
+                        onActiveFocusChanged: if (activeFocus) notes.revealSourceAction(conversationDisclosure)
+                    }
+                    TextArea {
+                        objectName: "aiReadingNoteOriginalQuestion"
+                        visible: conversationDisclosure.expanded
+                        Layout.fillWidth: true
+                        text: notes.sourceContext.question || ""
+                        textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
+                        readOnly: true; selectByMouse: true; selectByKeyboard: true
+                        font.pixelSize: 13; padding: 0; color: app.colors.textPrimary; background: null
+                    }
+                    Loader {
+                        Layout.fillWidth: true
+                        active: conversationDisclosure.expanded && !!notes.sourceContext.answer
+                        visible: active
+                        sourceComponent: AiResult {
+                            Layout.fillWidth: true
+                            app: notes.app; answerName: "aiReadingNoteOriginalAnswer"
+                            answerAccessibleName: qsTr("Original conversation answer")
+                            value: ({output: notes.sourceContext.answer ? notes.sourceContext.answer.content : "", generation: notes.generation,
+                                responsePlan: {source_pages: notes.sourceContext.answer ? notes.sourceContext.answer.source_pages : []}})
+                            showActions: false; inlineConversation: true; viewport: contents.contentItem
+                            onCitation: function(link, plan) {
+                                if (!notes.current() || plan.generation !== notes.generation) return;
+                                const match = /^p\.(\d+)$/.exec(link);
+                                if (match && notes.sourceContext.answer && notes.sourceContext.answer.source_pages.indexOf(Number(match[1])) >= 0)
+                                    app.navigate(Number(match[1]) - 1);
+                            }
+                        }
+                    }
+                }
+                Button {
+                    id: continueNote
+                    objectName: "continueAiReadingNoteConversation"
+                    visible: !!notes.regionEntry || !!notes.sourceContext.chat_id
+                    text: notes.regionEntry ? qsTr("Continue at source") : qsTr("Continue conversation")
+                    enabled: notes.noteWriteReady && !notes.continuationCommand && !notes.reviewState.running
+                    onActiveFocusChanged: if (activeFocus) notes.revealSourceAction(continueNote)
+                    onClicked: notes.continueConversation()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: !!notes.sourceContext.region_id && (!!notes.regionContext.error || !!notes.regionContext.writes_blocked)
+                    text: notes.regionContext.error || qsTr("Saved discussions are protected. Resolve the history warning before continuing.")
+                    textFormat: Text.PlainText; wrapMode: Text.Wrap; font.pixelSize: 11; color: app.colors.warningFg
                 }
             }
         }

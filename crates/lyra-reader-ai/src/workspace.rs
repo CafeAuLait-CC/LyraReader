@@ -44,6 +44,28 @@ pub struct ReadingWorkspace {
     extra: BTreeMap<String, serde_json::Value>,
 }
 
+/// A saved note's original context, separate from its manually edited ideas.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReadingNoteSource {
+    pub kind: Option<String>,
+    pub scope: Option<String>,
+    pub whole_document: bool,
+    pub can_locate_document: bool,
+    pub excerpt: String,
+    pub question: String,
+    pub answer: Option<ReadingSourceAnswer>,
+    pub region_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub covered_turns: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReadingSourceAnswer {
+    pub content: String,
+    /// Only the original answer's actual source pages in the current PDF revision.
+    pub source_pages: Vec<u32>,
+}
+
 impl ReadingWorkspace {
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > 64 * 1024 * 1024 {
@@ -86,6 +108,57 @@ impl ReadingWorkspace {
             record.status = "sourceChanged".into();
         }
         record
+    }
+
+    /// Project local provenance without writing records or preparing an AI request.
+    /// Native adapters validate region-history revisions separately before reopening.
+    pub fn note_source(&self, note: &ReadingRecord, page_count: u32) -> ReadingNoteSource {
+        let original = self
+            .records
+            .iter()
+            .find(|record| record.id == note.source_id);
+        let current = !note.source_hash.is_empty() && note.source_hash == self.source_hash;
+        let interleaf = note.source_id.starts_with("interleaf:");
+        let region = current
+            && interleaf
+            && !note.conversation_id.is_empty()
+            && note.source_id == format!("interleaf:{}", note.conversation_id);
+        let whole_document = original
+            .is_some_and(|record| record.kind == "summary" && record.source_id == "document");
+        let chat = current
+            && !interleaf
+            && !note.conversation_id.is_empty()
+            && self.records.iter().any(|record| {
+                record.id == note.conversation_id
+                    && record.kind == "conversation"
+                    && record.source_hash == self.source_hash
+            });
+        ReadingNoteSource {
+            kind: original.map(|record| record.kind.clone()),
+            scope: original.map(|record| record.source_id.clone()),
+            whole_document,
+            can_locate_document: current && whole_document && page_count > 0,
+            excerpt: note.excerpt.clone(),
+            question: note.question.clone(),
+            answer: original
+                .filter(|_| !interleaf)
+                .map(|record| ReadingSourceAnswer {
+                    content: record.content.clone(),
+                    source_pages: if current && record.source_hash == self.source_hash {
+                        record
+                            .pages
+                            .iter()
+                            .copied()
+                            .filter(|page| *page > 0 && *page <= page_count)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                }),
+            region_id: region.then(|| note.conversation_id.clone()),
+            chat_id: chat.then(|| note.conversation_id.clone()),
+            covered_turns: note.covered_turns,
+        }
     }
 
     /// Independent task runs remain available across scopes and application launches.
@@ -613,6 +686,97 @@ mod tests {
             content: "An idea".into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn note_source_keeps_original_context_and_only_current_navigation() {
+        let mut workspace = ReadingWorkspace::default();
+        workspace.bind_source("current".into());
+        workspace
+            .put(ReadingRecord {
+                id: "chat".into(),
+                kind: "conversation".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let original = workspace
+            .put(ReadingRecord {
+                id: "answer".into(),
+                kind: "message".into(),
+                conversation_id: "chat".into(),
+                question: "Original question".into(),
+                content: "Original answer [p.99]".into(),
+                excerpt: "Source\r\nsnapshot".into(),
+                pages: vec![1, 9],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut note = workspace.keep(original, "note".into()).unwrap();
+        note.content = "My edited ideas".into();
+        let before = workspace.encode().unwrap();
+        let context = workspace.note_source(&note, 2);
+        assert_eq!(context.kind.as_deref(), Some("message"));
+        assert_eq!(context.question, "Original question");
+        assert_eq!(context.excerpt, "Source\r\nsnapshot");
+        assert_eq!(
+            context.answer.as_ref().unwrap().content,
+            "Original answer [p.99]"
+        );
+        assert_eq!(context.answer.as_ref().unwrap().source_pages, [1]);
+        assert_eq!(context.chat_id.as_deref(), Some("chat"));
+        assert!(context.region_id.is_none());
+        assert!(!context.whole_document);
+        assert_eq!(workspace.encode().unwrap(), before);
+
+        workspace.bind_source("changed".into());
+        let old = workspace.note_source(&note, 2);
+        assert!(old.chat_id.is_none());
+        assert!(old.region_id.is_none());
+        assert!(old.answer.as_ref().unwrap().source_pages.is_empty());
+        assert_eq!(old.answer.unwrap().content, "Original answer [p.99]");
+        assert_eq!(old.excerpt, context.excerpt);
+    }
+    #[test]
+    fn note_source_distinguishes_document_regions_and_missing_sessions() {
+        let mut workspace = ReadingWorkspace::default();
+        workspace.bind_source("current".into());
+        let source = workspace
+            .put(ReadingRecord {
+                source_id: "document".into(),
+                ..source()
+            })
+            .unwrap();
+        let mut note = workspace.keep(source, "note".into()).unwrap();
+        assert!(workspace.note_source(&note, 1).can_locate_document);
+        assert!(!workspace.note_source(&note, 0).can_locate_document);
+        workspace.bind_source("changed".into());
+        assert!(workspace.note_source(&note, 1).whole_document);
+        assert!(!workspace.note_source(&note, 1).can_locate_document);
+        workspace.bind_source("current".into());
+        note.source_id = "interleaf:region".into();
+        note.conversation_id = "region".into();
+        note.covered_turns = 2;
+        let region = workspace.note_source(&note, 1);
+        assert_eq!(region.region_id.as_deref(), Some("region"));
+        assert!(region.answer.is_none());
+        assert!(region.chat_id.is_none());
+        assert_eq!(region.covered_turns, 2);
+        note.source_id = "interleaf:other".into();
+        assert!(workspace.note_source(&note, 1).region_id.is_none());
+        note.source_id = "missing".into();
+        let missing = workspace.note_source(&note, 1);
+        assert!(missing.answer.is_none());
+        assert!(missing.chat_id.is_none());
+        assert!(missing.kind.is_none());
+        workspace
+            .put(ReadingRecord {
+                id: "region".into(),
+                kind: "summary".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(workspace.note_source(&note, 1).chat_id.is_none());
+        note.source_hash.clear();
+        assert!(!workspace.note_source(&note, 1).can_locate_document);
     }
     #[test]
     fn keeping_twice_preserves_edits_and_thoughts() {

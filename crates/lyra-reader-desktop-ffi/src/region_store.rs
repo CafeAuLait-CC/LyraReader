@@ -314,6 +314,14 @@ impl DesktopDocument {
             .regions
             .lock()
             .map_err(|_| "Reading-note state is unavailable")?;
+        // These are explicit local refresh/reopen operations, not a thumbnail
+        // hot path. Compare the reviewed revision with current disk bytes even
+        // when another window changed the same cache after this process loaded it.
+        if matches!(op, "region_list" | "region_reopen") {
+            let mut current = RegionStore::default();
+            current.load(cache)?;
+            *store = current;
+        }
         store.load(cache)?;
         if op == "region_list" {
             let mut state = store.history.summaries(key, &identity.sha256)?;

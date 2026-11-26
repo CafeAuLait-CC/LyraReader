@@ -358,7 +358,7 @@ impl DesktopDocument {
                 review.apply,
                 next_note_modified(note.modified)?,
             )?;
-            Ok(note_value(workspace, saved, document))
+            Ok(note_value(workspace, saved, document, true))
         })
     }
 
@@ -475,7 +475,7 @@ impl DesktopDocument {
         recent: bool,
     ) -> Result<Value, String> {
         self.read_workspace(source, false, |workspace| {
-            let records = workspace
+            let origins = workspace
                 .records()
                 .into_iter()
                 .map(|record| (record.id, (record.kind, record.source_id)))
@@ -486,14 +486,14 @@ impl DesktopDocument {
                     .into_iter()
                     .map(|note| {
                         let modified = note.modified;
-                        let origin = records.get(&note.source_id);
-                        let origin_kind = origin.map(|record| record.0.clone());
-                        let origin_scope = origin.map(|record| record.1.clone());
-                        let mut value = note_value(workspace, note, source);
+                        let origin = origins.get(&note.source_id);
+                        // Lists keep the established fields used by search/copy.
+                        // Original answers are materialized only for one opened detail.
+                        let mut value = note_value(workspace, note, source, false);
+                        value["origin_kind"] = json!(origin.map(|record| &record.0));
+                        value["origin_scope"] = json!(origin.map(|record| &record.1));
                         // Preserve the existing list wire type; the detail's edit version is a string.
                         value["modified"] = json!(modified);
-                        value["origin_kind"] = json!(origin_kind);
-                        value["origin_scope"] = json!(origin_scope);
                         value
                     })
                     .collect::<Vec<_>>()
@@ -531,7 +531,12 @@ impl DesktopDocument {
         id: &str,
     ) -> Result<Value, String> {
         self.read_workspace(source, false, |workspace| {
-            Ok(note_value(workspace, find_note(workspace, id)?, source))
+            Ok(note_value(
+                workspace,
+                find_note(workspace, id)?,
+                source,
+                true,
+            ))
         })
     }
 
@@ -564,7 +569,7 @@ impl DesktopDocument {
                     .as_ref()
                     .is_none_or(|thoughts| thoughts == &note.thoughts)
             {
-                return Ok(note_value(workspace, note, source));
+                return Ok(note_value(workspace, note, source, true));
             }
             if let Some(title) = draft.title {
                 note.title = title;
@@ -578,7 +583,7 @@ impl DesktopDocument {
             note.modified = next_note_modified(note.modified)?;
             note.status = "saved".into();
             let saved = workspace.put(note)?;
-            Ok(note_value(workspace, saved, source))
+            Ok(note_value(workspace, saved, source, true))
         })
     }
 }
@@ -628,7 +633,9 @@ fn note_value(
     workspace: &ReadingWorkspace,
     note: ReadingRecord,
     source: &LyraReaderDocument,
+    include_context: bool,
 ) -> Value {
+    let context = include_context.then(|| workspace.note_source(&note, source.page_count()));
     let verified = note.source_hash == source.document_identity().sha256;
     let suggestion = verified
         .then(|| workspace.suggestion(&note.id))
@@ -651,7 +658,13 @@ fn note_value(
     } else {
         "sourceChanged"
     };
-    json!({"id":note.id,"title":note.title,"content":note.content,"thoughts":note.thoughts,"source_id":note.source_id,
+    let mut value = json!({"id":note.id,"title":note.title,"content":note.content,"thoughts":note.thoughts,"source_id":note.source_id,
         "modified":note.modified.to_string(),"status":status,"source_pages":pages,
-        "suggestion":suggestion,"discussion_available":discussion_available})
+        "suggestion":suggestion,"discussion_available":discussion_available});
+    if let Some(context) = context {
+        value["origin_kind"] = json!(context.kind);
+        value["origin_scope"] = json!(context.scope);
+        value["source"] = json!(context);
+    }
+    value
 }
