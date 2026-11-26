@@ -3505,6 +3505,29 @@ private slots:
         QVERIFY(input.property(0).property("number").isUndefined());QCOMPARE(input.property(0).property("y_pt").toNumber(),12.);
     }
 
+    void annotationColourMenuKeepsMacExpandedFeedback_data() {
+        QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void annotationColourMenuKeepsMacExpandedFeedback() {
+        QFETCH(QString,appearance);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(1100,750);window->setProperty("appearance",appearance);window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));QVERIFY(settleReaderViewport(window));
+        auto *button=visualItem(window->contentItem(),"annotateColour");QVERIFY(button);QQmlExpression popup(QQmlEngine::contextForObject(button),button,"colours");auto *menu=popup.evaluate().value<QObject *>();QVERIFY(!popup.hasError());QVERIFY(menu);
+        auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible);QCOMPARE(accessible->text(QAccessible::Name),QString("Annotation colour and stroke options"));QVERIFY(!accessible->state().selected);
+        auto *background=button->property("background").value<QQuickItem *>();auto *colors=window->property("colors").value<QObject *>();QVERIFY(background && colors);const auto geometry=button->mapRectToScene(button->boundingRect());const auto original=window->property("brushColor");
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);button->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(button->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());QVERIFY(accessible->state().selected);
+        QCOMPARE(background->property("color").value<QColor>(),colors->property("selectedBg").value<QColor>());QCOMPARE(accessible->text(QAccessible::Description),QString("Expanded"));QCOMPARE(button->mapRectToScene(button->boundingRect()),geometry);QCOMPARE(window->property("brushColor"),original);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-colour-expanded-"+appearance+".png"));
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!menu->property("visible").toBool());QTRY_VERIFY(button->hasActiveFocus());QVERIFY(!accessible->state().selected);QCOMPARE(accessible->text(QAccessible::Description),QString("Collapsed"));QCOMPARE(window->property("brushColor"),original);
+        QTest::mouseMove(window,QPoint(5,5),20);QTest::mouseMove(window,button->mapToScene(QPointF(button->width()/2,button->height()/2)).toPoint(),20);QTRY_VERIFY(button->property("hovered").toBool());QCOMPARE(background->property("color").value<QColor>(),colors->property("hoverBg").value<QColor>());
+        button->forceActiveFocus(Qt::TabFocusReason);QTest::keyPress(window,Qt::Key_Space);QCOMPARE(background->property("color").value<QColor>(),colors->property("pressedBg").value<QColor>());QTest::keyRelease(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());
+        QVERIFY(menu->setProperty("currentIndex",1));QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!menu->property("visible").toBool());QCOMPARE(window->property("brushColor").toString(),QString("#EFA77D"));QVERIFY(!accessible->state().selected);QCOMPARE(button->mapRectToScene(button->boundingRect()),geometry);
+        auto *content=button->property("contentItem").value<QQuickItem *>();QVERIFY(content);QVERIFY(!content->childItems().isEmpty());auto *swatch=content->childItems().first();QCOMPARE(swatch->width(),17.);QCOMPARE(swatch->height(),17.);QCOMPARE(swatch->property("color").value<QColor>(),QColor("#EFA77D"));
+        button->setEnabled(false);QCOMPARE(background->property("color").value<QColor>(),QColor("transparent"));QVERIFY(!menu->property("visible").toBool());
+    }
+
     void toolbarHierarchyAndLyraToolsMatchMac() {
         QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
         NativeCorpus::Viewer view;QVERIFY(view.window);

@@ -78,11 +78,12 @@ ToolBar {
             }
         }
         Item {width:8;height:32}
-        ToolButton {
+        LyraToolButton {
             id:colourButton
             objectName:"annotateColour";width:32;height:32
-            Accessible.name:qsTr("Annotation colour and stroke options")
-            ToolTip.visible:hovered;ToolTip.text:Accessible.name
+            text:qsTr("Annotation colour and stroke options")
+            selected:colours.visible
+            Accessible.description:colours.visible ? qsTr("Expanded") : qsTr("Collapsed")
             contentItem:Item {Rectangle {anchors.centerIn:parent;width:17;height:17;radius:9;color:app.brushColor;border.width:1;border.color:app.colors.controlBorder}}
             onClicked:colours.popup(0,height)
             Menu {
