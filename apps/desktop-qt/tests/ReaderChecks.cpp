@@ -8845,6 +8845,29 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QCOMPARE(preview->model().value("kind").toString(),QString("reference"));
         QCOMPARE(preview->model().value("entries").toList().size(),6);
     }
+    void singleAndTwoAuthorNamesOpenReferenceTextOnTheFirstClick() {
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-author-year-preview.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/author-year-names.pdf",path));
+        QFile source(path);QVERIFY(source.open(QIODevice::ReadOnly));const auto before=source.readAll();source.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==2 && !reader->loading() && !reader->pendingCommands(),10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
+        reader->submit("citations",{{"page",0}});QTRY_COMPARE(reader->pendingCommands(),0);const auto citations=reader->data().value("citations").toList();QCOMPARE(citations.size(),4);
+        reader->submit("links",{{"page",0}});QTRY_COMPARE(reader->pendingCommands(),0);const auto links=reader->data().value("links").toList();QCOMPARE(links.size(),2);
+        const QList<QStringList> expected{{"Hart 1951"},{"Reed 1988"},{"Quinn 2023","Lane 2024"},{"Vale 2010"}};auto *preview=view.workspace.preview();
+        for(qsizetype i=0;i<citations.size();++i){
+            const auto hit=citations[i].toMap();const auto x=hit.value("x_pt").toDouble()+hit.value("width_pt").toDouble()/2,y=hit.value("y_pt").toDouble()+hit.value("height_pt").toDouble()/2;
+            if(i==1 || i==2){const auto link=links[int(i-1)].toMap();QVERIFY(QRectF(link.value("x_pt").toDouble(),link.value("y_pt").toDouble(),link.value("width_pt").toDouble(),link.value("height_pt").toDouble()).contains(QPointF(x,y)));QVERIFY(!link.value("navigation").toBool());}
+            // The real page-click route must prefer complete reference text to
+            // an internal PDF destination on the first click, including cold links.
+            QVERIFY(QMetaObject::invokeMethod(window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,x),Q_ARG(QVariant,y),Q_ARG(QVariant,320),Q_ARG(QVariant,200)));
+            QTRY_VERIFY_WITH_TIMEOUT(preview->visible() && !preview->loading(),10000);QCOMPARE(window->property("currentPage").toInt(),0);QCOMPARE(preview->model().value("kind").toString(),QString("reference"));
+            const auto entries=preview->model().value("entries").toList();QCOMPARE(entries.size(),expected[i].size());
+            for(qsizetype n=0;n<entries.size();++n){const auto entry=entries[n].toMap();QCOMPARE(entry.value("label").toString(),expected[i][n]);QCOMPARE(entry.value("page").toInt(),1);QVERIFY(entry.value("text").toString().contains("Example"));}
+            preview->close();QVERIFY(!preview->visible());
+        }
+        QVERIFY(!reader->hasUnsavedChanges());QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),before);
+    }
+
     void referencesFiguresAndSectionsUseRealAsynchronousPreviews() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());
         for(const auto &name:{"numeric-citations.pdf","cross-references.pdf","section-references.pdf"})
