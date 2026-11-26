@@ -1,0 +1,114 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R /Annots [8 0 R 9 0 R] >>
+endobj
+5 0 obj
+<< /Length 883 >>
+stream
+BT /F1 28 Tf 72 760 Td (Author-year citations) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (single and paired authors without et al.) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Prior work \(Hart, 1951\) describes prediction.) Tj T*
+(We compare \(Reed, 1988\) with the baseline.) Tj T*
+(See \(Quinn, 2023; Lane and Stone, 2024\).) Tj T*
+(Vale and West \(2010\) describe imitation.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 1081 >>
+stream
+BT /F1 28 Tf 72 760 Td (REFERENCES) Tj ET
+0.35 0.35 0.35 rg
+BT /F1 13 Tf 72 730 Td (Synthetic bibliography) Tj ET
+0 0 0 rg
+BT /F1 11 Tf 15 TL 72 690 Td
+(Avery E Hart. Prediction with a synthetic model. Example Journal, 1951.) Tj T*
+(Blair A. Reed. An autonomous synthetic system.) Tj T*
+(Example Conference, 1988.) Tj T*
+(Casey Quinn. Do synthetic models need observations.) Tj T*
+(Example Workshop, 2023.) Tj T*
+(Devon Lane and Ellis Stone. The limits of prediction. Example Archive, 2024.) Tj T*
+(Finley Vale and Gray West. An imitation baseline.) Tj T*
+(Example Conference, 2010.) Tj T*
+ET
+0.10 0.35 0.75 RG 2 w 72 300 451 120 re S
+0.90 0.30 0.20 rg 0.55 0.30 0.20 rg
+360 480 120 120 re f
+0.2 0.2 0.2 RG 1 w 72 200 m 523 260 l S
+0.6 0.6 0.6 RG 0.5 w
+72 150 m 102 110 l S
+102 150 m 132 110 l S
+132 150 m 162 110 l S
+162 150 m 192 110 l S
+192 150 m 222 110 l S
+222 150 m 252 110 l S
+252 150 m 282 110 l S
+282 150 m 312 110 l S
+312 150 m 342 110 l S
+342 150 m 372 110 l S
+372 150 m 402 110 l S
+402 150 m 432 110 l S
+432 150 m 462 110 l S
+462 150 m 492 110 l S
+492 150 m 522 110 l S
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 671 290 686] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 656 300 671] /Border [0 0 0] /Dest [6 0 R /Fit] /F 4 >>
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000127 00000 n 
+0000000224 00000 n 
+0000000372 00000 n 
+0000001306 00000 n 
+0000001432 00000 n 
+0000002565 00000 n 
+0000002677 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R >>
+startxref
+2789
+%%EOF

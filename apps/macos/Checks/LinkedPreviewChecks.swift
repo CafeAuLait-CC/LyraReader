@@ -169,6 +169,40 @@ extension ReaderChecks {
         }
         try await chapterPreviewChecks(root: root)
         try await navigationNoteChecks(root: root)
+        try await authorYearNamePreviewChecks(root: root)
         print("PASS: cold linked previews upgrade to entry text or transparent table crops; newer clicks, closes and document switches win")
+    }
+
+    @MainActor static func authorYearNamePreviewChecks(root: URL) async throws {
+        let engine = try RustEngine()
+        let state = AppState(engine: engine)
+        state.setViewportSize(CGSize(width: 700, height: 500))
+        require(state.open(url: root.appendingPathComponent("tests/fixtures/author-year-names.pdf")),
+                "single/two-author fixture opens")
+        let citations = try await engine.citations(0)
+        require(citations.count == 4, "all single/two-author citations are detected")
+        let expected = [["Hart 1951"], ["Reed 1988"], ["Quinn 2023", "Lane 2024"], ["Vale 2010"]]
+        for (index, citation) in citations.enumerated() {
+            let placement = state.canvasPageFrames.first!
+            let target = CGPoint(x: placement.leftPt + citation.xPt + citation.widthPt / 2,
+                                 y: placement.topPt + citation.yPt + citation.heightPt / 2)
+            if index == 1 || index == 2 {
+                try await eventually("the author-year link loads", { state.link(at: target) != nil })
+                require(state.followLink(at: target), "the linked citation follows on the first click")
+            } else {
+                _ = state.openCitation(at: target)
+            }
+            try await eventually("single/two-author click opens the matching entry text", {
+                state.referencePreview?.kind == .reference
+                    && state.referencePreview?.entries.map(\.label) == expected[index]
+            })
+            require(state.referencePreview?.entries.allSatisfy {
+                $0.page == 1 && $0.text.contains("Example")
+            } == true, "the preview contains complete entries on the bibliography page")
+            require(state.referencePreviewPages.isEmpty && !state.referencePreviewLoading,
+                    "author-year citations show entry text")
+            state.closeReferencePreview()
+        }
+        print("PASS: single/two-author citations open complete reference text with and without PDF links")
     }
 }

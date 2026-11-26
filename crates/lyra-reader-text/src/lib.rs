@@ -678,12 +678,39 @@ fn bibliography_surname(line: &str) -> Option<String> {
             return Some(trimmed.chars().take(surname_length).collect());
         }
     }
-    // Full names need an author-list delimiter, or a year immediately after a
-    // single author's name. Capitalised title lines alone are not entry starts.
+    // Full-name lists can end before the title, with the year only at the end of
+    // the entry: `Avery E. Hart. Prediction. Example Journal, 1951.`. Stop at the
+    // name's sentence boundary before looking for author-list commas; a comma in
+    // the title or venue is not an author delimiter. Initials do not end the list.
     let year = first_year(trimmed);
-    let trimmed = year
-        .as_ref()
-        .and_then(|year| trimmed.split_once(year).map(|(before, _)| before))
+    let author_end = trimmed
+        .match_indices('.')
+        .find_map(|(index, _)| {
+            let word = trimmed[..index].split_whitespace().next_back()?;
+            (word.chars().filter(|c| c.is_alphabetic()).count() > 1).then_some(index)
+        })
+        .filter(|end| {
+            // A wrapped, title-cased title can look exactly like a person's full
+            // name. Its following sentence names the venue or identifier, rather
+            // than another title (`Video Generation. arXiv:...`, for example).
+            let following = trimmed[end + 1..].trim_start();
+            !matches!(
+                following.split_whitespace().next(),
+                Some("In" | "ACM" | "IEEE" | "Proceedings" | "Journal" | "Transactions")
+            ) && !following.starts_with("arXiv:")
+                && !following.starts_with("http://")
+                && !following.starts_with("https://")
+        });
+    // An all-caps venue after a title line (`Talking Avatar Generation. ICLR.`)
+    // is not evidence of a new author list when the year is still on another line.
+    let has_title =
+        author_end.is_some_and(|end| trimmed[end + 1..].chars().any(char::is_lowercase));
+    let trimmed = author_end
+        .map(|end| &trimmed[..end])
+        .or_else(|| {
+            year.as_ref()
+                .and_then(|year| trimmed.split_once(year).map(|(before, _)| before))
+        })
         .unwrap_or(trimmed)
         .trim()
         .trim_end_matches('.');
@@ -696,7 +723,7 @@ fn bibliography_surname(line: &str) -> Option<String> {
         {
             return None;
         }
-    } else if year.is_none() {
+    } else if year.is_none() && !has_title {
         return None;
     }
     let name = trimmed.split([',', ';']).next()?.split(" and ").next()?;

@@ -2194,6 +2194,30 @@ def narrative_citation_pdf() -> bytes:
     ]})
 
 
+def author_year_names_pdf() -> bytes:
+    """Single/two-author citations with title-before-year bibliography entries."""
+    body = text_page("Author-year citations", "single and paired authors without et al.", [
+        "Prior work (Hart, 1951) describes prediction.",
+        "We compare (Reed, 1988) with the baseline.",
+        "See (Quinn, 2023; Lane and Stone, 2024).",
+        "Vale and West (2010) describe imitation.",
+    ])
+    references = text_page("REFERENCES", "Synthetic bibliography", [
+        "Avery E Hart. Prediction with a synthetic model. Example Journal, 1951.",
+        "Blair A. Reed. An autonomous synthetic system.",
+        "Example Conference, 1988.",
+        "Casey Quinn. Do synthetic models need observations.",
+        "Example Workshop, 2023.",
+        "Devon Lane and Ellis Stone. The limits of prediction. Example Archive, 2024.",
+        "Finley Vale and Gray West. An imitation baseline.",
+        "Example Conference, 2010.",
+    ])
+    return build_pdf([(body, 0), (references, 0)], annotations={0: [
+        annotation("Link", body_line_box(1, 290), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+        annotation("Link", body_line_box(2, 300), extra="/Border [0 0 0] /Dest [6 0 R /Fit]"),
+    ]})
+
+
 def chapter_previews_pdf() -> bytes:
     """Dotted/appendix figures, nested vector forms, a two-line equation, and a long citation."""
     def text(x: float, y: float, value: str, size: int = 11) -> str:
@@ -2789,6 +2813,7 @@ def main() -> int:
 
     path = out_dir / "narrative-citation.pdf"
     path.write_bytes(narrative_citation_pdf())
+    (out_dir / "author-year-names.pdf").write_bytes(author_year_names_pdf())
     (out_dir / "booktabs-bounds.pdf").write_bytes(booktabs_bounds_pdf())
     (out_dir / "chapter-previews.pdf").write_bytes(chapter_previews_pdf())
     (out_dir / "navigation-notes.pdf").write_bytes(navigation_notes_pdf())

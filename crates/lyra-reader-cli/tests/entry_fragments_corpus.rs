@@ -165,6 +165,7 @@ fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
     files.sort();
 
     let mut totals = Report::default();
+    let mut added_author_year_entries = 0;
     println!(
         "{:<44} {:>7} {:>6} {:>8} {:>6} {:>7} {:>7} {:>7}",
         "paper", "entries", "multi", "columns", "pages", "no-gut", "gutters", "cross"
@@ -184,6 +185,13 @@ fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
             .collect();
         let entries = references_of(&pages, &backend);
         let report = measure(&entries, &pages);
+        // Keep the original twelve-paper snapshot exact when the optional
+        // author-year regression sample is present alongside it.
+        if name == "2502.12465v1.pdf" {
+            assert_eq!(report.entries, 84, "the author-year sample's bibliography");
+            assert_eq!(report.fragments, 84, "each new entry stays in one fragment");
+            added_author_year_entries = report.entries;
+        }
         println!(
             "{:<44} {:>7} {:>6} {:>8} {:>6} {:>7} {:>7} {:>7}",
             name.chars().take(44).collect::<String>(),
@@ -267,7 +275,8 @@ fn fragments_are_cut_at_a_gutter_or_keep_the_box_they_had() {
         "the number of two-column pages the detector reads changed"
     );
     assert_eq!(
-        totals.entries, 769,
+        totals.entries,
+        769 + added_author_year_entries,
         "the corpus' selected bibliographies changed"
     );
     assert_eq!(

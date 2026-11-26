@@ -94,6 +94,79 @@ fn full_names_work_without_promoting_title_lines_to_authors() {
 }
 
 #[test]
+fn names_before_titles_resolve_single_and_two_author_citations() {
+    let entries = references(
+        "References\n\
+         Avery E Hart. Prediction with a synthetic model. Example Journal, 1951.\n\
+         Blair A. Reed. An autonomous synthetic system.\nExample Conference, 1988.\n\
+         Casey Quinn. Do synthetic models need observations.\nExample Workshop, 2023.\n\
+         Devon Lane and Ellis Stone. The limits of prediction. Example Archive, 2024.\n\
+         Finley Vale and Gray West. An imitation baseline.\nExample Conference, 2010.\n",
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Hart 1951",
+            "Reed 1988",
+            "Quinn 2023",
+            "Lane 2024",
+            "Vale 2010"
+        ]
+    );
+    for (written, labels, titles) in [
+        ("(Hart, 1951)", vec!["Hart 1951"], vec!["Prediction with"]),
+        ("(Reed, 1988)", vec!["Reed 1988"], vec!["An autonomous"]),
+        (
+            "(Quinn, 2023; Lane and Stone, 2024)",
+            vec!["Quinn 2023", "Lane 2024"],
+            vec!["Do synthetic models", "The limits of prediction"],
+        ),
+        (
+            "Vale and West (2010)",
+            vec!["Vale 2010"],
+            vec!["An imitation baseline"],
+        ),
+    ] {
+        let body = test_page(written);
+        let citations = find_citations(&body);
+        assert_eq!(citations.len(), 1, "{written}");
+        assert_eq!(citations[0].labels, labels, "{written}");
+        let resolved = resolve_references(&citations[0].labels, &entries);
+        assert_eq!(resolved.len(), titles.len(), "{written}");
+        for (entry, title) in resolved.iter().zip(titles) {
+            assert!(entry.text.contains(title), "{written}: {entry:?}");
+            assert_eq!(entry_label(&entry.text), entry.label);
+        }
+    }
+}
+
+#[test]
+fn title_sentences_before_venues_do_not_become_author_lists() {
+    for continuation in [
+        "Real-time Synthetic Deformation. In Proceedings of an Example Conference, 2012.",
+        "Among Multiple Images. IEEE Computer Graphics 18, 1 (1998), 58-71.",
+        "Synthetic Elastic Materials. ACM Transactions on Graphics 30, 4 (2011), 72.",
+        "Cartoon Animation Filter. ACM Transactions on Graphics 25, 3 (2006), 1169.",
+        "Video Generation. arXiv:2406.02511.",
+        "Photorealistic Avatar Agents. arXiv:2311.17465.",
+    ] {
+        assert!(
+            !looks_like_author_year_start(continuation),
+            "{continuation}"
+        );
+        let entries = references(&format!(
+            "References\nHart, A. 2020. Synthetic model.\n{continuation}\n\
+             Reed, B. 2021. Another model.\nQuinn, C. 2022. Final model.\n"
+        ));
+        assert_eq!(entries.len(), 3, "{continuation}: {entries:?}");
+        assert!(entries[0].text.contains(continuation), "{continuation}");
+    }
+}
+
+#[test]
 fn capitalized_titles_do_not_swallow_the_following_entry() {
     let entries = references(
         "References\nFeng, G. 2024. Emotion control.\nFine-grained Emotion-Controlled Talking Face Generation.\nGan, Y. 2023. Emotional adaptation.\nHe, T.; Guo, J.;\nTan, X. 2024. Zero-shot\nTalking Avatar Generation. ICLR.\nHeusel, M. 2017. Training.\n",
