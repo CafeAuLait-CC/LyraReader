@@ -98,6 +98,9 @@ ApplicationWindow {
     function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
     function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"regions");}}
     function openReadingNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
+    function showReadingNotice(message, owner) {
+        if (owner === currentReader) aiContent.showNotice(message);
+    }
     function openSavedReadingNote(id) {
         showAiPanel(true);
         if (aiPanelVisible && aiPanelMode === "assistant") aiContent.openSavedNote(id);
@@ -2587,6 +2590,12 @@ ApplicationWindow {
                             onRequestUpdate: function(noteId) { aiContent.prepareReadingNoteUpdate(noteId); }
                         }
                         RegionNotes {id:regionNotes;app:root;Layout.fillWidth:true;Layout.fillHeight:true}
+                        ReadingNotice {
+                            app: root
+                            message: aiContent.notice
+                            Layout.fillWidth: true
+                            onDismissed: aiContent.dismissNotice()
+                        }
                     }
                     Rectangle {
                         width: 1; height: parent.height; color: theme.separator

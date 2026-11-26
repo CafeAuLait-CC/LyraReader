@@ -28,7 +28,9 @@ Pane {
     signal closeRequested()
     function close() { closeRequested(); }
     function copyAll() {
-        if (app.session) app.session.copyText(entries.map(entry => "# " + entry.title + "\n\n" + entry.content + "\n\n" + entry.thoughts).join("\n\n---\n\n"));
+        if (!current() || !app.session) return;
+        app.session.copyText(entries.map(entry => "# " + entry.title + "\n\n" + entry.content + "\n\n" + entry.thoughts).join("\n\n---\n\n"));
+        app.showReadingNotice(qsTr("Copied"), reader);
     }
     function sourceLabel(entry) {
         if (entry.origin_kind === "summary" && entry.origin_scope === "document") return qsTr("Summary · Whole document");
@@ -41,6 +43,14 @@ Pane {
 
     function current() {
         return reader && reader === app.currentReader && generation === reader.documentGeneration;
+    }
+    function followCitation(link, plan) {
+        if (!current() || plan.generation !== generation || !note) return;
+        const match = /^p\.(\d+)$/.exec(link);
+        if (!match) return;
+        const page = Number(match[1]);
+        if ((note.source_pages || []).indexOf(page) < 0 || page < 1 || page > reader.pageCount) return;
+        app.navigate(page - 1);
     }
     function browse(source, noteId = "") {
         reader = app.currentReader;
@@ -168,7 +178,10 @@ Pane {
                 notes.note = result;
                 notes.editing = false;
                 if (notes.dirty) notes.beginEditing();
-                else notes.refresh();
+                else {
+                    app.showReadingNotice(qsTr("Reading note saved"), notes.reader);
+                    notes.refresh();
+                }
             } else if (operation === "ai_reading_note_review") {
                 notes.note = result;
             }
@@ -299,14 +312,16 @@ Pane {
             visible: !notes.editing && !notes.reviewing && !!notes.note
             Column {
                 width: contents.availableWidth
-                TextArea {
-                    objectName: "aiReadingNoteContent"
+                AiResult {
                     width: parent.width
-                    text: notes.note ? notes.note.content : ""
-                    readOnly: true; selectByMouse: true; selectByKeyboard: true
-                    textFormat: TextEdit.PlainText; wrapMode: Text.Wrap
-                    Accessible.name: qsTr("Saved reading note")
-                    color: app.colors.textPrimary
+                    app: notes.app
+                    answerName: "aiReadingNoteContent"
+                    answerAccessibleName: qsTr("Saved reading note")
+                    value: ({output: notes.note ? notes.note.content : "", generation: notes.generation,
+                        responsePlan: {source_pages: notes.note ? notes.note.source_pages : []}})
+                    showActions: false; inlineConversation: true
+                    viewport: contents.contentItem
+                    onCitation: function(link, plan) { notes.followCitation(link, plan); }
                 }
                 Label {
                     visible: notes.note && !!notes.note.suggestion

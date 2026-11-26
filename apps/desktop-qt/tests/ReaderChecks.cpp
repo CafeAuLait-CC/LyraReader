@@ -5680,14 +5680,28 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});
         QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
-        const QString completed="## Overview\n\nSynthetic finding from the approved source [p.1].";
+        const QString completed="## Overview\n\n**Synthetic finding** from the approved source [p.1], unverified [p.99]. \\(x_2\\).";
         server.responses.append({{MockChatServer::delta({{"content",completed}}),QByteArray("data: [DONE]\n\n")},5,200});
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);
         const auto plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());
         QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
         const auto sourceId=reader->aiState().value("summaryNoteSource").toString();QVERIFY(!sourceId.isEmpty());
-        reader->submit("ai_reading_keep",{{"id",sourceId}});QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(panel,"keepInNotes",Q_ARG(QVariant,sourceId)));QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *notice=visualItem(window->contentItem(),"aiReadingNotice");QVERIFY(notice);
+        auto *noticeText=visualItem(notice,"aiReadingNoteSavedNotice");QVERIFY(noticeText);
+        QTRY_VERIFY(notice->isVisible());QCOMPARE(noticeText->property("text").toString(),QString("Reading note saved"));
+        auto *copy=visualItem(qobject_cast<QQuickItem *>(panel),"aiAnswerTextCopy");QVERIFY(copy && copy->isVisible());
+        copy->forceActiveFocus(Qt::TabFocusReason);QVERIFY(QMetaObject::invokeMethod(copy,"clicked"));
+        QTRY_COMPARE(noticeText->property("text").toString(),QString("Copied"));QVERIFY(copy->hasActiveFocus());
+        if(QGuiApplication::platformName()=="offscreen")QCOMPARE(QGuiApplication::clipboard()->text(),completed);
+        const auto frozenPlan=reader->aiState().value("plan");
         QVERIFY(QMetaObject::invokeMethod(window,"openReadingNotes"));
+        QTRY_VERIFY(notice->isVisible());
+        auto *copyNotes=visualItem(window->contentItem(),"copyAiReadingNotes");QVERIFY(copyNotes);
+        QTRY_VERIFY(copyNotes->isEnabled());QVERIFY(QMetaObject::invokeMethod(copyNotes,"clicked"));
+        QTRY_COMPARE(noticeText->property("text").toString(),QString("Copied"));
+        QTRY_COMPARE_WITH_TIMEOUT(notice->isVisible(),false,4500);
+        QCOMPARE(reader->aiState().value("plan"),frozenPlan);
         auto *sidebar=visualItem(window->contentItem(),"readingNotesSidebar");QVERIFY(sidebar);QTRY_VERIFY(sidebar->isVisible());
         QTRY_COMPARE(sidebar->property("entries").toList().size(),1);QTRY_COMPARE(sidebar->property("command").toInt(),0);
         QVERIFY(sidebar->property("note").isNull() || !sidebar->property("note").isValid());
@@ -5702,6 +5716,23 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         if(!evidence.isEmpty()){QTest::qWait(60);QVERIFY(window->grabWindow().save(evidence+"-notes-"+QString::fromLatin1(QTest::currentDataTag())+".png"));}
         QTRY_VERIFY((row=visualItem(sidebar,"aiReadingNoteRow0")));QVERIFY(QMetaObject::invokeMethod(row,"clicked"));
         QTRY_COMPARE(sidebar->property("note").toMap().value("content").toString(),completed);
+        auto *rich=visualItem(sidebar,"aiReadingNoteContent");QVERIFY(rich);
+        auto *quickDoc=rich->property("textDocument").value<QQuickTextDocument *>();QVERIFY(quickDoc && quickDoc->textDocument());
+        const auto *document=quickDoc->textDocument();
+        QTRY_VERIFY(document->toPlainText().contains("Synthetic finding"));
+        QVERIFY(document->find("Synthetic finding").charFormat().fontWeight()>=QFont::Bold);
+        QCOMPARE(document->find("[p.1]").charFormat().anchorHref(),QString("p.1"));
+        QVERIFY(!document->find("[p.99]").charFormat().isAnchor());
+        QCOMPARE(document->find("2").charFormat().verticalAlignment(),QTextCharFormat::AlignSubScript);
+        QVERIFY(rich->property("readOnly").toBool() && rich->property("selectByKeyboard").toBool());
+        QVERIFY(QMetaObject::invokeMethod(copyNotes,"clicked"));QTRY_VERIFY(notice->isVisible());
+        const auto entry=sidebar->property("entries").toList().first().toMap();
+        if(QGuiApplication::platformName()=="offscreen")QCOMPARE(QGuiApplication::clipboard()->text(),
+            "# "+entry.value("title").toString()+"\n\n"+completed+"\n\n"+entry.value("thoughts").toString());
+        auto *dismiss=visualItem(notice,"dismissAiReadingNotice");QVERIFY(dismiss);
+        dismiss->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Return);
+        QTRY_VERIFY(!notice->isVisible());
+        if(!evidence.isEmpty()){QTest::qWait(60);QVERIFY(window->grabWindow().save(evidence+"-notes-detail-"+QString::fromLatin1(QTest::currentDataTag())+".png"));}
         auto *edit=visualItem(sidebar,"editAiReadingNote");QVERIFY(edit);QVERIFY(QMetaObject::invokeMethod(edit,"clicked"));
         QVERIFY(QMetaObject::invokeMethod(sidebar,"change",Q_ARG(QVariant,"title"),Q_ARG(QVariant,"Retained local title")));QVERIFY(reader->hasUnsavedReadingNotes());
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,false)));QTRY_VERIFY(!sidebar->isVisible());
@@ -5747,7 +5778,10 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QTRY_VERIFY(keep->property("visible").toBool() && keep->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
         QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());QVERIFY(!notes->property("visible").toBool());
         QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,panel->property("lastKeptNoteId"))));
-        QTRY_COMPARE(text->property("text").toString(),completed);QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_COMPARE(current().value("content").toString(),completed);QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *quickDoc=text->property("textDocument").value<QQuickTextDocument *>();QVERIFY(quickDoc && quickDoc->textDocument());
+        QTRY_VERIFY(quickDoc->textDocument()->toPlainText().contains("The approved source supports this note"));
+        QCOMPARE(quickDoc->textDocument()->find("[p.1]").charFormat().anchorHref(),QString("p.1"));
         const auto id=current().value("id").toString();QVERIFY(!id.isEmpty());
         QCOMPARE(current().value("title").toString(),QString("Synthetic finding"));
         QCOMPARE(notes->property("entries").toList().size(),1);QCOMPARE(pages->property("count").toInt(),1);
@@ -5767,7 +5801,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
             QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
         };
         reopen();QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));QTRY_COMPARE(current().value("id").toString(),id);
-        QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),1);
+        QCOMPARE(current().value("content").toString(),completed);QCOMPARE(pages->property("count").toInt(),1);
         const auto version=current().value("modified").toString();QVERIFY(!version.isEmpty());
         auto *titleEditor=notes->findChild<QObject *>("aiReadingNoteTitleEditor");
         auto *contentEditor=notes->findChild<QObject *>("aiReadingNoteContentEditor");
@@ -5787,7 +5821,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QCOMPARE(contentEditor->property("text").toString(),revisedContent);
         QCOMPARE(thoughtsEditor->property("text").toString(),thoughts);
         QVERIFY(QMetaObject::invokeMethod(save,"clicked"));
-        QTRY_COMPARE(text->property("text").toString(),revisedContent);QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_COMPARE(current().value("content").toString(),revisedContent);QTRY_COMPARE(reader->pendingCommands(),0);
         QVERIFY(!reader->hasUnsavedReadingNotes());QCOMPARE(current().value("title").toString(),revisedTitle);
         QCOMPARE(current().value("thoughts").toString(),thoughts);
         QVERIFY(current().value("modified").toString()!=version);
@@ -5814,7 +5848,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));const QByteArray revision("\n% Local fixture revision\n");
         QCOMPARE(source.write(revision),revision.size());source.close();
         reopen();QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));QTRY_COMPARE(current().value("id").toString(),id);
-        QCOMPARE(text->property("text").toString(),revisedContent);QCOMPARE(pages->property("count").toInt(),0);
+        QCOMPARE(current().value("content").toString(),revisedContent);QCOMPARE(pages->property("count").toInt(),0);
         QCOMPARE(current().value("status").toString(),QString("sourceChanged"));QCOMPARE(server.requests.size(),1);
         dismiss();
     }

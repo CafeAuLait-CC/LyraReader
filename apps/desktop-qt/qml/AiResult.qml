@@ -9,6 +9,7 @@ ColumnLayout {
     required property var app
     required property var value
     property string answerName: "aiAnswerText"
+    property string answerAccessibleName: qsTr("AI response")
     property bool showSources: false
     property bool inlineConversation: false
     property int bodySize: 13
@@ -108,7 +109,7 @@ ColumnLayout {
         textFormat: result.plainText ? TextEdit.PlainText : TextEdit.RichText
         Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
         Binding { target: answerArea; property: "font.pixelSize"; value: result.bodySize; when: result.inlineConversation }
-        Accessible.name: qsTr("AI response")
+        Accessible.name: result.answerAccessibleName
         Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
         onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }
     }

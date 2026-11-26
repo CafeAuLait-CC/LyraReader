@@ -190,7 +190,13 @@ AiReadingScrollView {
         RowLayout {
             visible: !task.panel.running && !!task.result.output
             Layout.fillWidth: true
-            LyraToolButton { objectName: "aiAnswerTextCopy"; symbol: "copy"; text: qsTr("Copy"); display: AbstractButton.TextBesideIcon; onClicked: if (app.session) app.session.copyText(task.result.output) }
+            LyraToolButton {
+                objectName: "aiAnswerTextCopy"; symbol: "copy"; text: qsTr("Copy"); display: AbstractButton.TextBesideIcon
+                onClicked: if (app.session) {
+                    app.session.copyText(task.result.output);
+                    app.showReadingNotice(qsTr("Copied"), task.panel.owner);
+                }
+            }
             LyraToolButton {
                 objectName: "keepAiSummaryNote"
                 symbol: "note-add"; text: qsTr("Keep in notes"); display: AbstractButton.TextBesideIcon
@@ -229,7 +235,6 @@ AiReadingScrollView {
                 onCitation: function(link, plan) { task.panel.followHistoryLink(link, plan); }
             }
         }
-        Label { visible: !!task.panel.notice; text: task.panel.notice; Layout.fillWidth: true; wrapMode: Text.Wrap; color: app.colors.textSecondary; font.pixelSize: 11 }
         Label { visible: !!text; text: task.panel.status; textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11 }
         Label { visible: !!text; text: [task.result.summaryHistoryWarning, task.panel.viewState.cacheWarning, task.store.failure].filter(value => !!value).join("\n"); textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.warningFg; font.pixelSize: 11 }
         Label { visible: !task.configured; text: qsTr("Connect an AI provider in Settings to continue."); textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 12 }

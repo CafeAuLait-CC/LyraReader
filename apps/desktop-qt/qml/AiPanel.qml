@@ -111,6 +111,13 @@ Pane {
         const command = owner.submit("ai_reading_keep", {id: source});
         if (command) keepTicket = {reader: owner, generation: ownerGeneration, command: command};
     }
+    function showNotice(message) {
+        if (notice === message) return;
+        notice = message;
+        if (message) noticeTimer.restart();
+        else noticeTimer.stop();
+    }
+    function dismissNotice() { notice = ""; noticeTimer.stop(); }
     Timer { id: noticeTimer; interval: 4000; onTriggered: aiPanel.notice = "" }
     Connections {
         target: aiPanel.owner
@@ -122,7 +129,7 @@ Pane {
             if (ticket.reader !== aiPanel.owner || ticket.generation !== aiPanel.ownerGeneration) return;
             if (error) { app.operationStatus = error; return; }
             aiPanel.lastKeptNoteId = result.id;
-            aiPanel.notice = qsTr("Reading note saved"); noticeTimer.restart();
+            aiPanel.showNotice(qsTr("Reading note saved"));
         }
     }
     property bool taskHistoryShown: false
@@ -182,7 +189,7 @@ Pane {
     }
     function resetSourceView() {
         taskHistoryShown = false; reviewTicket = null; keepTicket = null; lastKeptNoteId = "";
-        notice = ""; noticeTimer.stop();
+        dismissNotice();
         if (payload && payload.visible) payload.close();
         if (selectionSource && selectionSource.visible) selectionSource.close();
         if (translationHistory && translationHistory.visible) translationHistory.close();
@@ -856,12 +863,6 @@ Pane {
             visible: aiPanel.running && aiPanel.workspace !== "chat"
             text: aiPanel.viewState.responseView === "summary_batch" ? qsTr("Stop batch") : qsTr("Stop response"); Layout.fillWidth: true
             onClicked: aiPanel.owner.cancelAi()
-        }
-        Label {
-            objectName: "aiReadingNoteSavedNotice"
-            text: aiPanel.notice; visible: !!text
-            Layout.fillWidth: true; Layout.leftMargin: 14; Layout.rightMargin: 14
-            color: app.colors.textSecondary; font.pixelSize: 11; wrapMode: Text.Wrap
         }
         Flow {
             visible: aiPanel.workspace !== "chat"
