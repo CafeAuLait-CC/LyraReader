@@ -12,14 +12,17 @@ Item {
     property var entries: []
     property string failure: ""
     property string kind: "summary"
+    property var scopeSelection: undefined
     readonly property bool loading: command !== 0
-    function reset() { reader = null; command = 0; entries = []; failure = ""; }
+    function reset() { reader = null; command = 0; entries = []; failure = ""; scopeSelection = undefined; }
     function current() { return reader && reader === owner && generation === ownerGeneration; }
-    function reload(taskKind) {
+    function reload(taskKind, selection) {
         if (!owner.pageCount) return;
         reader = owner; generation = ownerGeneration; kind = taskKind;
-        failure = "";
-        command = reader.submit("ai_reading_tasks", {kind: taskKind});
+        failure = ""; entries = []; scopeSelection = selection;
+        const request = {kind: taskKind};
+        if (selection !== undefined) request.selection = selection;
+        command = reader.submit("ai_reading_tasks", request);
     }
     onOwnerChanged: reset()
     onOwnerGenerationChanged: reset()

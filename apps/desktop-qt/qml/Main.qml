@@ -62,7 +62,7 @@ ApplicationWindow {
     // Transient ancestors can stay active; only the focused reader owns its shortcuts.
     readonly property bool readerKeyboardEnabled: navigationController.keyboardFocus && (!dialogs.settingsDialog || !dialogs.settingsDialog.visible || !dialogs.settingsDialog.active)
     // Action equivalents keep their menu hints; direct reader keys yield to popup navigation.
-    readonly property bool documentKeysEnabled: readerKeyboardEnabled && !readerChrome.menuOpen && !mainFileMenu.visible && !mainViewMenu.visible
+    readonly property bool documentKeysEnabled: readerKeyboardEnabled && !readerChrome.menuOpen && !mainFileMenu.visible && !mainViewMenu.visible && !aiContent.taskMenuOpen
     readonly property bool readerPageNavigationEnabled: documentKeysEnabled && !textViewVisible
         && !(activeFocusItem && typeof activeFocusItem.selectedText !== "undefined")
     property bool regionSelecting: false
@@ -2550,6 +2550,13 @@ ApplicationWindow {
                                 visible: root.aiPanelMode === "assistant" && aiContent.workspace !== "translation"
                                 enabled: !aiContent.running && !root.currentReader.pendingCommands
                                 onClicked: aiContent.openHistory()
+                            }
+                            LyraToolButton {
+                                id: taskMoreButton
+                                objectName: "aiTaskMore"
+                                symbol: "more"; text: qsTr("More summary actions")
+                                visible: root.aiPanelMode === "assistant" && aiContent.referenceSummary && !aiContent.taskHistoryShown
+                                onClicked: aiContent.openTaskMore(taskMoreButton)
                             }
                             LyraToolButton {
                                 objectName: "clearAiConversation"

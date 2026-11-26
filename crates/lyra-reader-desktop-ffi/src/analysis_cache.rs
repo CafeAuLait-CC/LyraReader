@@ -225,13 +225,33 @@ impl DesktopDocument {
         language: &str,
         detail: &str,
     ) -> Result<Option<Value>, String> {
-        self.with_reading_cache(source, true, |cache, sha| {
+        let cached = self.with_reading_cache(source, true, |cache, sha| {
             let (state, _) = load(cache, &sha)?;
-            state.reusable(&sha, language, detail).map(|record| {
-                verify_pages(&record, source.page_count())?;
-                    Ok(json!({"id":record.id,"output":record.content,"title":record.title,"source_pages":record.pages}))
-            }).transpose()
-        })
+            state
+                .reusable(&sha, language, detail)
+                .map(|record| {
+                    verify_pages(&record, source.page_count())?;
+                    Ok(record)
+                })
+                .transpose()
+        })?;
+        cached
+            .map(|record| {
+                // Explicitly opening a legacy cached result publishes its existing
+                // identity to task history, as the native macOS reading store does.
+                let history_warning = self.archive_summary_task(source, record.clone()).err().map(
+                    |error| {
+                        format!(
+                            "The summary is saved, but task history could not be updated. {error}"
+                        )
+                    },
+                );
+                Ok(
+                    json!({"id":record.id,"output":record.content,"title":record.title,
+                "source_pages":record.pages,"history_warning":history_warning}),
+                )
+            })
+            .transpose()
     }
 
     pub(super) fn publish_summary(
@@ -239,10 +259,8 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         record: ReadingRecord,
         mut run: AnalysisRun,
-    ) -> Result<(DocumentReading, String), String> {
-        let context = context_record(&record);
-        let id = record.id.clone();
-        self.with_reading_cache(source, true, |cache, sha| {
+    ) -> Result<(DocumentReading, String, Option<String>), String> {
+        let published = self.with_reading_cache(source, true, |cache, sha| {
             if record.source_hash != sha || run.directory != cache.directory {
                 return Err("The PDF revision changed before saving the summary.".into());
             }
@@ -256,6 +274,10 @@ impl DesktopDocument {
             if !run.state.finish(run.token, record)? {
                 return Err("The completed summary did not match its cache record.".into());
             }
+            let published = run
+                .state
+                .record(&sha)
+                .ok_or("The saved summary has no current source snapshot.")?;
             let bytes = run.state.encode()?;
             if read_optional_bounded(&destination, MAX_BYTES as u64)? != before {
                 return Err(
@@ -270,8 +292,19 @@ impl DesktopDocument {
                     &before,
                 )?;
             }
-            atomic_write(&destination, &bytes)
+            atomic_write(&destination, &bytes)?;
+            Ok(published)
         })?;
-        Ok((context, id))
+        let context = context_record(&published);
+        let id = published.id.clone();
+        // Understanding remains authoritative and available if the secondary
+        // task-history publication fails; never misreport the first save.
+        let history_warning = self
+            .archive_summary_task(source, published)
+            .err()
+            .map(|error| {
+                format!("The summary is saved, but task history could not be updated. {error}")
+            });
+        Ok((context, id, history_warning))
     }
 }

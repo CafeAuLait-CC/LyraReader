@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || readingNotes.visible
+    readonly property bool tabTransferDialogVisible: taskMenuOpen || payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || readingNotes.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -19,6 +19,11 @@ Pane {
     readonly property bool languageMode: unitMode || batchMode
     readonly property bool selectedSummary: workspace === "summary" && action === 5 && !unitMode && !batchMode
     readonly property bool wholeSummary: workspace === "summary" && action === 1 && !unitMode && !batchMode
+    // Compute eligibility from the action atomically: combining two exclusive
+    // derived flags can briefly unload the task while switching its source.
+    readonly property bool referenceSummary: workspace === "summary" && !unitMode && !batchMode && (action === 1 || action === 5)
+    readonly property bool taskMenuOpen: !!summaryTaskLoader.item && summaryTaskLoader.item.popupVisible
+    readonly property bool payloadOpen: payload.visible
     readonly property bool translateDocument: workspace === "translation" && input.translationScope === "document"
     readonly property bool translateInPlace: workspace === "translation" && !translateDocument && !!input.inplace
     readonly property string summaryDetail: input.summaryDetail || "Standard"
@@ -45,6 +50,7 @@ Pane {
         if (reviewTicket) Qt.callLater(finishUiReview);
     }
     onVisibleChanged: if (!visible) {
+        if (summaryCatalog) summaryCatalog.close();
         if (selectionSource) selectionSource.close();
         if (translationHistory) translationHistory.close();
         if (chatHistory) chatHistory.close();
@@ -61,16 +67,16 @@ Pane {
     readonly property bool synthesisPreview: previewReady && plan.kind === "summary_synthesis"
     readonly property bool running: !!viewState.running
     readonly property bool compact: height < 500
-    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, translationHistoryWarning: viewState.translationHistoryWarning, synthesisParts: viewState.synthesisParts, summaryNoteSource: viewState.summaryNoteSource}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
+    readonly property var result: viewState.responseView === workspace ? Object.assign({output: viewState.output, reasoning: viewState.reasoning, usage: viewState.usage, responsePlan: viewState.responsePlan, generation: owner.documentGeneration, translationBlocks: viewState.translationBlocks, translationWarning: viewState.translationWarning, translationHistoryWarning: viewState.translationHistoryWarning, synthesisParts: viewState.synthesisParts, summaryNoteSource: viewState.summaryNoteSource, summaryHistoryWarning: viewState.summaryHistoryWarning}, viewState.unitTitle === undefined ? {} : {unitTitle: viewState.unitTitle, unitLanguage: viewState.unitLanguage}) : ((viewState.results || {})[workspace] || {})
     readonly property var pairedTranslation: workspace === "translation" && result.responsePlan
                                              && result.responsePlan.kind === "reading_translation"
                                              ? result.translationBlocks || [] : []
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
     // Height-dependent density must not move scope labels horizontally mid-selection.
-    leftPadding: workspace === "chat" ? 0 : 10
-    rightPadding: workspace === "chat" ? 0 : 10
-    topPadding: workspace === "chat" ? 0 : compact ? 6 : 10
-    bottomPadding: workspace === "chat" ? 0 : compact ? 6 : 10
+    leftPadding: workspace === "chat" || referenceSummary ? 0 : 10
+    rightPadding: workspace === "chat" || referenceSummary ? 0 : 10
+    topPadding: workspace === "chat" || referenceSummary ? 0 : compact ? 6 : 10
+    bottomPadding: workspace === "chat" || referenceSummary ? 0 : compact ? 6 : 10
     background: Rectangle { color: app.colors.panelBg }
     property var reviewTicket: null
     property var keepTicket: null
@@ -81,9 +87,9 @@ Pane {
         return account && account.useForChat ? account.connected && !!String(account.model || "").trim() : !!String(app.aiSettings.model || "").trim();
     }
     function prepareFromUi() {
-        if (workspace !== "chat") { prepare(); return; }
+        if (workspace !== "chat" && !referenceSummary) { prepare(); return; }
         if (running) { owner.cancelAi(); return; }
-        if (previewReady) { payload.open(); return; }
+        if (previewReady && (!referenceSummary || !selectedSummary || sameRange(preparedRange, liveRange))) { payload.open(); return; }
         reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || ""};
         prepare();
         Qt.callLater(finishUiReview);
@@ -125,6 +131,9 @@ Pane {
             if (taskHistoryShown) taskStore.reload("summary");
         }
     }
+    function inspectPayload() { payload.open(); }
+    function openSummaryCatalog() { summaryCatalog.toggle(); }
+    function openTaskMore(anchor) { if (summaryTaskLoader.item) summaryTaskLoader.item.openMore(anchor); }
     function startNewChat() {
         if (!running) { chatHistory.close(); owner.newAiChat(); }
     }
@@ -136,6 +145,7 @@ Pane {
     onWorkspaceChanged: {
         taskHistoryShown = false; reviewTicket = null;
         if (chatHistory && workspace !== "chat") chatHistory.close();
+        if (summaryCatalog && workspace !== "summary") summaryCatalog.close();
         if (payload && payload.visible) payload.close();
     }
     AiTaskStore { id: taskStore; app: aiPanel.app }
@@ -203,71 +213,7 @@ Pane {
                 aiPanel.locate(ticket.range, ticket.prepared);
         }
     }
-    component SelectionCard: Pane {
-        id: card
-        required property string title
-        required property string text
-        required property var range
-        required property bool prepared
-        required property string labelName
-        property bool partial: false
-        property bool expanded: false
-        property string fullText: ""
-        onTextChanged: { expanded = false; fullText = ""; }
-        onRangeChanged: { expanded = false; fullText = ""; }
-        Layout.fillWidth: true
-        padding: 12
-        background: Rectangle { radius: 8; color: "transparent"; border.color: app.colors.separator }
-        contentItem: ColumnLayout {
-            spacing: 8
-            RowLayout {
-                Layout.fillWidth: true
-                Label { text: card.title; color: app.colors.textPrimary; font.pixelSize: 12; Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap }
-                ToolButton {
-                    objectName: card.labelName + "Locate"
-                    text: qsTr("Locate"); palette.buttonText: app.colors.accent
-                    enabled: !!card.range
-                    Accessible.name: qsTr("Locate %1 in document").arg(card.title)
-                    onClicked: aiPanel.locate(card.range, card.prepared)
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: 10
-                Rectangle { width: 2; Layout.fillHeight: true; color: app.colors.separator }
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: 2
-                    Label {
-                        id: excerptLabel
-                        objectName: card.labelName
-                        Layout.fillWidth: true; Layout.minimumWidth: 0
-                        textFormat: Text.PlainText; wrapMode: Text.Wrap
-                        maximumLineCount: card.expanded ? 2147483647 : 3
-                        elide: card.expanded ? Text.ElideNone : Text.ElideRight
-                        text: card.fullText || card.text || qsTr("Select a passage in the document.")
-                        color: app.colors.textSecondary; font.pixelSize: 13
-                        Accessible.name: card.title
-                    }
-                    ToolButton {
-                        objectName: card.labelName + "More"
-                        visible: card.expanded || excerptLabel.truncated || card.partial
-                        text: card.expanded ? qsTr("Less") : qsTr("More")
-                        palette.buttonText: app.colors.accent
-                        Accessible.name: card.expanded ? qsTr("Collapse selected passage") : qsTr("Expand selected passage")
-                        onClicked: {
-                            if (!card.expanded && card.partial && !card.prepared && card.range) {
-                                const excerpt = app.selectedTextResult(card.range);
-                                if (excerpt.error !== undefined) { app.operationStatus = excerpt.error; return; }
-                                card.fullText = excerpt.text;
-                            }
-                            card.expanded = !card.expanded;
-                        }
-                    }
-                }
-            }
-        }
-    }
+
     function baseRequest(requestAction) {
         const settings = app.aiSettings;
         return {
@@ -328,7 +274,7 @@ Pane {
             if (accounts && !connectChatGpt(request, accounts, selectedSummary ? accounts.useForSelection : accounts.useForWholeDocument)) return;
             request.language = input.summaryLanguage || null;
             owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail,
-                force: wholeSummary && !!viewState.cachedWholeSummary});
+                force: referenceSummary && !!summaryTaskLoader.item && summaryTaskLoader.item.hasResult});
         }
         else {
             const request = baseRequest(modes[action]);
@@ -402,9 +348,16 @@ Pane {
             }
         }
     }
+    Loader {
+        id: summaryTaskLoader
+        anchors.fill: parent
+        active: aiPanel.referenceSummary
+        visible: active && !aiPanel.taskHistoryShown
+        sourceComponent: AiSummaryTask { app: aiPanel.app; panel: aiPanel }
+    }
     ColumnLayout {
         anchors.fill: parent
-        visible: !aiPanel.taskHistoryShown
+        visible: !aiPanel.taskHistoryShown && !aiPanel.referenceSummary
         spacing: aiPanel.workspace === "chat" ? 0 : aiPanel.compact ? 3 : 6
         Label {
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
@@ -432,7 +385,7 @@ Pane {
             Layout.fillWidth: true
         }
         LyraReadingSegmentedPicker {
-            objectName: "aiSummaryScope"
+            objectName: aiPanel.referenceSummary ? "legacySummaryScope" : "aiSummaryScope"
             app: aiPanel.app
             choices: [{title: qsTr("Whole document"), icon: "document"}, {title: qsTr("Selection"), icon: "selection"}]
             currentIndex: aiPanel.selectedSummary ? 1 : 0
@@ -452,7 +405,7 @@ Pane {
             onActivated: aiPanel.owner.setAiInput("action", [1, 5, 0, 2][currentIndex])
         }
         ComboBox {
-            objectName: "aiSelectedSummaryDetail"
+            objectName: aiPanel.referenceSummary ? "legacySummaryDetail" : "aiSelectedSummaryDetail"
             visible: aiPanel.selectedSummary || aiPanel.wholeSummary
             Layout.fillWidth: true
             model: [qsTr("Brief"), qsTr("Standard"), qsTr("Detailed")]
@@ -461,22 +414,26 @@ Pane {
             Accessible.name: qsTr("Summary detail")
             onActivated: aiPanel.owner.setAiInput("summaryDetail", values[currentIndex])
         }
-        SelectionCard {
+        AiSelectionExcerpt {
+            app: aiPanel.app
+            onLocateRequested: function(range, prepared) { aiPanel.locate(range, prepared); }
             visible: aiPanel.selectedSummary || (aiPanel.workspace === "translation" && !aiPanel.translateDocument)
             range: aiPanel.liveRange
             prepared: false
             title: range ? qsTr("Selected passage · p. %1").arg(range.page + 1) : qsTr("Selected passage")
             partial: !!aiPanel.currentExcerpt && aiPanel.currentExcerpt.partial
             text: aiPanel.currentExcerpt ? aiPanel.currentExcerpt.text : ""
-            labelName: "aiLiveSelection"
+            labelName: aiPanel.referenceSummary ? "legacyLiveSelection" : "aiLiveSelection"
         }
-        SelectionCard {
+        AiSelectionExcerpt {
+            app: aiPanel.app
+            onLocateRequested: function(range, prepared) { aiPanel.locate(range, prepared); }
             visible: aiPanel.previewReady && aiPanel.selectedSources.length > 0 && !aiPanel.sameRange(aiPanel.liveRange, aiPanel.preparedRange)
             range: aiPanel.preparedRange
             prepared: true
             title: qsTr("Previewed source")
             text: aiPanel.selectedSources.map(source => source.snippet).join("")
-            labelName: aiPanel.workspace === "translation" ? "aiSelectedTranslationSource" : "aiSelectedSummarySource"
+            labelName: aiPanel.referenceSummary ? "legacyPreparedSummarySource" : aiPanel.workspace === "translation" ? "aiSelectedTranslationSource" : "aiSelectedSummarySource"
         }
         ColumnLayout {
             visible: aiPanel.unitMode
@@ -650,13 +607,14 @@ Pane {
                 width: responseScroll.availableWidth
                 AiResult {
                     Layout.fillWidth: true
-                    app: aiPanel.app; value: aiPanel.result; viewport: responseScroll.contentItem
+                    app: aiPanel.app; value: aiPanel.referenceSummary ? ({}) : aiPanel.result; viewport: responseScroll.contentItem
+                    answerName: aiPanel.referenceSummary ? "legacyAiAnswer" : "aiAnswerText"
                     collapsibleSummary: (aiPanel.wholeSummary || aiPanel.selectedSummary) && !aiPanel.running && !!aiPanel.result.output
                     onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
                 }
                 ToolButton {
                     id: showPartSummaries
-                    objectName: "aiShowPartSummaries"
+                    objectName: aiPanel.referenceSummary ? "legacyShowPartSummaries" : "aiShowPartSummaries"
                     visible: aiPanel.workspace === "summary" && !!aiPanel.result.synthesisParts
                     text: checked ? qsTr("Hide part summaries") : qsTr("Show part summaries")
                     checkable: true
@@ -664,7 +622,7 @@ Pane {
                 }
                 Loader {
                     Layout.fillWidth: true
-                    active: showPartSummaries.visible && showPartSummaries.checked
+                    active: !aiPanel.referenceSummary && showPartSummaries.visible && showPartSummaries.checked
                     visible: active
                     sourceComponent: AiResult {
                         app: aiPanel.app
@@ -816,7 +774,7 @@ Pane {
             ReadingPrimaryButton {
             id: preview
             app: aiPanel.app
-            objectName: "prepareAiRequest"
+            objectName: aiPanel.referenceSummary ? "legacyPrepareSummary" : "prepareAiRequest"
             text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? (aiPanel.running ? qsTr("Stop") : qsTr("Send")) : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : aiPanel.wholeSummary && aiPanel.viewState.cachedWholeSummary ? qsTr("Preview fresh summary") : qsTr("Preview Summary")
             Layout.fillWidth: aiPanel.workspace !== "chat"
             icon.source: aiPanel.workspace === "chat" ? (aiPanel.running ? "qrc:/icons/stop.svg" : "qrc:/icons/arrow-up.svg") : ""
@@ -856,14 +814,14 @@ Pane {
             visible: aiPanel.previewReady && !aiPanel.running && aiPanel.workspace !== "chat"
             Button { text: qsTr("Inspect Payload"); Layout.fillWidth: true; onClicked: payload.open() }
             Button {
-                objectName: aiPanel.workspace === "chat" ? "legacyInlineChatSend" : "sendAiRequest"
+                objectName: aiPanel.referenceSummary ? "legacyInlineSummarySend" : aiPanel.workspace === "chat" ? "legacyInlineChatSend" : "sendAiRequest"
                 text: aiPanel.synthesisPreview ? qsTr("Send synthesis") : qsTr("Send"); Layout.fillWidth: true
                 enabled: aiPanel.owner.pendingCommands === 0
                 onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
             }
         }
         Button {
-            objectName: "cancelAiRequest"
+            objectName: aiPanel.referenceSummary ? "legacyCancelSummary" : "cancelAiRequest"
             visible: aiPanel.running && aiPanel.workspace !== "chat"
             text: aiPanel.viewState.responseView === "summary_batch" ? qsTr("Stop batch") : qsTr("Stop response"); Layout.fillWidth: true
             onClicked: aiPanel.owner.cancelAi()
@@ -892,7 +850,7 @@ Pane {
             }
             Button {objectName:"aiAuditTrail";text:qsTr("Local audit trail…");onClicked:app.showAuditTrail()}
             Button {
-                objectName: "keepAiSummaryNote"
+                objectName: aiPanel.referenceSummary ? "legacyKeepSummaryNote" : "keepAiSummaryNote"
                 text: qsTr("Keep as note")
                 visible: aiPanel.workspace === "summary" && !!aiPanel.result.summaryNoteSource
                 enabled: !aiPanel.running && aiPanel.owner.pendingCommands === 0 && !aiPanel.owner.readingNoteDraft.id
@@ -1087,9 +1045,9 @@ Pane {
             ReadingPrimaryButton {
                 app: aiPanel.app
                 objectName: aiPanel.workspace === "chat" ? "sendAiRequest" : "reviewedAiTaskSend"
-                visible: aiPanel.workspace === "chat" && aiPanel.previewReady
+                visible: (aiPanel.workspace === "chat" || aiPanel.referenceSummary) && aiPanel.previewReady
                 enabled: visible && !aiPanel.running && aiPanel.owner.pendingCommands === 0
-                text: qsTr("Send question"); icon.source: "qrc:/icons/arrow-up.svg"
+                text: aiPanel.referenceSummary ? (aiPanel.synthesisPreview ? qsTr("Send synthesis") : qsTr("Send summary")) : qsTr("Send question"); icon.source: "qrc:/icons/arrow-up.svg"
                 Layout.alignment: Qt.AlignRight
                 onClicked: { app.sendAi(aiPanel.owner, aiPanel.plan); payload.close(); }
             }

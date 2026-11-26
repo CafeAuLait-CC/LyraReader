@@ -16,6 +16,11 @@ Item {
     implicitWidth: 200
     onOwnerChanged: if (detail && detail.visible) detail.close()
     onVisibleChanged: if (!visible && detail && detail.visible) detail.close()
+    function close() { detail.close(); }
+    function toggle() {
+        if (detail.visible) { detail.close(); return; }
+        popupOwner = owner; popupOwner.setSummaryExpanded(true); detail.open();
+    }
     function openSource(row) {
         if (!popupOwner || popupOwner !== owner || state.generation !== owner.documentGeneration
                 || row.link_page === null || row.link_page < 0 || row.link_page >= owner.pageCount) return;
@@ -42,12 +47,7 @@ Item {
         selected: detail.visible
         enabled: owner.pageCount > 0 && !owner.loading && !owner.snapshotReadOnly
         Accessible.description: qsTr("Browse summary source pages and inspect text coverage locally")
-        onClicked: {
-            if (detail.visible) { detail.close(); return; }
-            root.popupOwner = root.owner;
-            root.popupOwner.setSummaryExpanded(true);
-            detail.open();
-        }
+        onClicked: root.toggle()
     }
     Connections {
         target: root.popupOwner

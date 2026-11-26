@@ -13,6 +13,7 @@ ColumnLayout {
     property bool inlineConversation: false
     property int bodySize: 13
     property bool collapsibleSummary: false
+    property bool showActions: true
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function revealCursor(area, owner, generation, target) {
@@ -44,6 +45,16 @@ ColumnLayout {
     spacing: 4
     readonly property var sent: value.responsePlan || ({})
     readonly property string outputText: value.output || ""
+    readonly property string usageSummary: {
+        const usage = result.value.usage || {};
+        const total = usage.total_tokens;
+        const cached = usage.cached_tokens;
+        if (Number.isFinite(total))
+            return Number.isFinite(cached)
+                ? qsTr("Tokens: %1 (%2 cached input)").arg(total).arg(cached)
+                : qsTr("Tokens: %1").arg(total);
+        return Number.isFinite(cached) ? qsTr("Cached input tokens: %1").arg(cached) : "";
+    }
     function markupFor(text) {
         if (sent.kind === "reading_translation") return text;
         const formulas = app.currentReader ? app.currentReader.aiMathMarkup(text) : [];
@@ -157,22 +168,13 @@ ColumnLayout {
         Keys.onPressed: function(event) { result.cursorKey(reasoningArea, event); }
     }
     RowLayout {
-        visible: !!result.value.output
-        Button { objectName: result.answerName + "Copy"; visible: !result.inlineConversation; text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
+        visible: !!result.value.output && result.showActions
+        Button { objectName: result.showActions ? result.answerName + "Copy" : ""; visible: !result.inlineConversation; text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
         Label {
-            objectName: result.answerName + "Usage"
+            objectName: result.showActions ? result.answerName + "Usage" : ""
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
             visible: text.length > 0
-            text: {
-                const usage = result.value.usage || {};
-                const total = usage.total_tokens;
-                const cached = usage.cached_tokens;
-                if (Number.isFinite(total))
-                    return Number.isFinite(cached)
-                        ? qsTr("Tokens: %1 (%2 cached input)").arg(total).arg(cached)
-                        : qsTr("Tokens: %1").arg(total);
-                return Number.isFinite(cached) ? qsTr("Cached input tokens: %1").arg(cached) : "";
-            }
+            text: result.usageSummary
             color: app.colors.textSecondary; font.pixelSize: 10
         }
     }

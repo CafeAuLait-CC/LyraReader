@@ -4524,7 +4524,7 @@ private slots:
         QTRY_COMPARE(bounds(indicator),secondRect);QCOMPARE(bounds(first),firstRect);QCOMPARE(bounds(second),secondRect);
         const auto end=reader->textPages().value("0").toMap().value("chars").toList().size()-1;
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",end}}));
-        auto *live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
+        QPointer<QQuickItem> live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
         const auto exact=reader->selectionText(0,0,int(end)).value("text").toString();
         QTRY_COMPARE(live->property("text").toString(),reader->selectionText(0,0,int(qMin<qsizetype>(end,2047))).value("text").toString());
         auto *more=visualItem(window->contentItem(),"aiLiveSelectionMore");QVERIFY(more);QTRY_VERIFY(more->isVisible());
@@ -4532,9 +4532,11 @@ private slots:
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",30},{"end",90}}));
         QTRY_COMPARE(live->property("text").toString(),reader->selectionText(0,30,90).value("text").toString());
         reader->setAiInput("view","translation");
+        QTRY_VERIFY((live=visualItem(window->contentItem(),"aiLiveSelection")));
         auto *translation=visualItem(window->contentItem(),"aiTranslationScope");QVERIFY(translation);QTRY_VERIFY(translation->isVisible());
         auto *document=visualItem(translation,"aiTranslationScopeSegment0"),*selection=visualItem(translation,"aiTranslationScopeSegment1");QVERIFY(document && selection);
-        selection->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Left);
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        selection->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(selection->hasActiveFocus());QTest::keyClick(window,Qt::Key_Left);
         QTRY_COMPARE(reader->aiState().value("input").toMap().value("translationScope").toString(),QString("document"));QTRY_VERIFY(!live->isVisible());
         QTest::keyClick(window,Qt::Key_Right);QTRY_VERIFY(live->isVisible());
         QTRY_COMPARE(live->property("text").toString(),reader->selectionText(0,30,90).value("text").toString());
@@ -4568,13 +4570,13 @@ private slots:
         reader->setAiInput("action",5);reader->setAiInput("summaryDetail","Brief");
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",end}}));
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
-        auto *live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
+        QPointer<QQuickItem> live=visualItem(window->contentItem(),"aiLiveSelection");QVERIFY(live);
         const auto excerpt=reader->selectionText(0,0,int(qMin<qsizetype>(end,2047))).value("text").toString();
         QTRY_COMPARE(live->property("text").toString(),excerpt);QVERIFY(live->isVisible());
         // The other reading tools must not retain a live excerpt behind their UI.
-        reader->setAiInput("view","chat");QVERIFY(!live->isVisible());
-        reader->setAiInput("view","translation");QTRY_VERIFY(live->isVisible());
-        reader->setAiInput("view","summary");QTRY_VERIFY(live->isVisible());
+        reader->setAiInput("view","chat");QTRY_VERIFY(!live || !live->isVisible());
+        reader->setAiInput("view","translation");QTRY_VERIFY((live=visualItem(window->contentItem(),"aiLiveSelection")) && live->isVisible());
+        reader->setAiInput("view","summary");QTRY_VERIFY((live=visualItem(window->contentItem(),"aiLiveSelection")) && live->isVisible());
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
         // Moving the canvas selection while planning must not substitute a different passage.
         QVERIFY(window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",0}}));
@@ -4608,7 +4610,9 @@ private slots:
         QVERIFY(keep && notes);
         QTRY_VERIFY(keep->property("enabled").toBool() && keep->property("visible").toBool());
         const auto sourceId=reader->aiState().value("summaryNoteSource").toString();QVERIFY(!sourceId.isEmpty());
-        QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());QVERIFY(!notes->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,panel->property("lastKeptNoteId"))));
         const auto note=[&]{return notes->property("note").toMap();};
         QTRY_COMPARE(note().value("content").toString(),QString("Synthetic selected summary"));
         QCOMPARE(note().value("source_pages").toList(),QVariantList{1});
@@ -4845,6 +4849,79 @@ private slots:
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
     }
 
+    void summaryTaskMatchesReferenceOrderAndScopeCaches_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void summaryTaskMatchesReferenceOrderAndScopeCaches() {
+        QFETCH(QString,theme);
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        const QString whole="## Overview\n\nWHOLE_SYNTHETIC finding [p.1].\n\n## Key ideas\n\nA source-preserving finding.";
+        const QString selected="## Overview\n\nSELECTION_SYNTHETIC finding [p.1].";
+        for(const auto &answer:{whole,selected})server.responses.append({{MockChatServer::delta({{"content",answer}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},10,200});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-summary-task.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        RecordingClipboardWorkspace workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);const auto close=qScopeGuard([&]{window->close();});window->resize(1050,900);window->setProperty("appearance",theme);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-task"}});QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        auto *panel=window->findChild<QObject *>("aiPanel"),*dialog=window->findChild<QObject *>("aiPayloadDialog");QVERIFY(panel && dialog);
+        QPointer<QQuickItem> task;QQuickItem *scope=nullptr,*detail=nullptr,*allPages=nullptr;
+        QTRY_VERIFY((task=visualItem(window->contentItem(),"aiSummaryTaskScroll")));
+        const auto shown=[&]{if(!task)return QVariantMap{};const auto value=task->property("result");return value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toVariant().toMap():value.toMap();};
+        QTRY_VERIFY((scope=visualItem(task,"aiSummaryScope")));QTRY_VERIFY((detail=visualItem(task,"aiSelectedSummaryDetail")));QTRY_VERIFY((allPages=visualItem(task,"aiSummaryAllPages")));
+        QVERIFY(scope->mapRectToScene(scope->boundingRect()).top()<allPages->mapRectToScene(allPages->boundingRect()).top());
+        QVERIFY(allPages->mapRectToScene(allPages->boundingRect()).top()<detail->mapRectToScene(detail->boundingRect()).top());QCOMPARE(detail->width(),qreal(98));
+        const auto sendReviewed=[&](int count) {
+            QQuickItem *primary=nullptr;QTRY_VERIFY((primary=visualItem(window->contentItem(),"prepareAiRequest")) && primary->property("enabled").toBool());
+            window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);primary->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(primary->hasActiveFocus());QTest::keyClick(window,Qt::Key_Space);
+            QTRY_VERIFY(dialog->property("opened").toBool());QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),count-1);
+            QVERIFY(QMetaObject::invokeMethod(task,"refreshMetadata"));QCOMPARE(reader->pendingCommands(),0);
+            const auto wire=window->findChild<QObject *>("aiWirePayload")->property("text").toString().toUtf8();QVERIFY(!wire.isEmpty());
+            auto *send=visualItem(window->contentItem(),"reviewedAiTaskSend");QVERIFY(send && send->isVisible() && send->property("enabled").toBool());
+            QSignalSpy sentClick(send,SIGNAL(clicked()));QVERIFY(sentClick.isValid());
+            auto *sendWindow=send->window();QVERIFY(sendWindow);sendWindow->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),sendWindow);
+            send->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(send->hasActiveFocus());QTest::keyClick(sendWindow,Qt::Key_Space);
+            QTRY_COMPARE(sentClick.size(),1);
+            const auto admission=QString("pending=%1, status=%2, operation=%3").arg(reader->pendingCommands()).arg(reader->aiState().value("status").toString(),window->property("operationStatus").toString());
+            QTRY_VERIFY2(reader->aiState().value("planSent").toBool(),qPrintable(admission));QTRY_COMPARE(server.requests.size(),count);
+            QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            QCOMPARE(server.requests.last().mid(server.requests.last().indexOf("\r\n\r\n")+4),wire);
+        };
+        sendReviewed(1);QCOMPARE(reader->aiState().value("output").toString(),whole);
+        QTRY_COMPARE(shown().value("output").toString(),whole);
+        QQuickItem *copy=nullptr;QTRY_VERIFY((copy=visualItem(task,"aiAnswerTextCopy")) && copy->isVisible());QVERIFY(QMetaObject::invokeMethod(copy,"clicked"));QCOMPARE(workspace.copied,whole);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-task-whole-"+theme+".png"));
+        reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",20}});
+        auto *selection=visualItem(window->contentItem(),"aiSummaryScopeSegment1");QVERIFY(selection);selection->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        QTRY_VERIFY(panel->property("selectedSummary").toBool());
+        QVERIFY2(task,"Changing the source must retain the task and focused segmented controls");
+        QCOMPARE(visualItem(window->contentItem(),"aiSummaryTaskScroll"),task.data());QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(shown().value("output").toString().isEmpty());QCOMPARE(server.requests.size(),1);
+        auto *excerpt=visualItem(task,"aiLiveSelection");QVERIFY(excerpt);QTRY_VERIFY(excerpt->isVisible());QVERIFY(excerpt->mapRectToScene(excerpt->boundingRect()).top()<detail->mapRectToScene(detail->boundingRect()).top());
+        sendReviewed(2);QCOMPARE(reader->aiState().value("output").toString(),selected);QTRY_COMPARE(shown().value("output").toString(),selected);
+        window->setProperty("selection",QVariantMap{{"page",0},{"start",30},{"end",50}});QTRY_VERIFY(shown().value("output").toString().isEmpty());QCOMPARE(server.requests.size(),2);
+        window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",20}});QTRY_COMPARE(shown().value("output").toString(),selected);QCOMPARE(server.requests.size(),2);
+        auto *wholeScope=visualItem(window->contentItem(),"aiSummaryScopeSegment0");QVERIFY(wholeScope);wholeScope->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        QTRY_VERIFY(panel->property("wholeSummary").toBool());QTRY_COMPARE(shown().value("output").toString(),whole);QCOMPARE(server.requests.size(),2);
+        auto *more=visualItem(window->contentItem(),"aiTaskMore");QVERIFY(more && more->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(more,"clicked"));QTRY_VERIFY(task->property("popupVisible").toBool());
+        QVERIFY(!window->property("documentKeysEnabled").toBool());QTest::keyClick(window,Qt::Key_Escape);
+        QTRY_VERIFY(!task->property("popupVisible").toBool());QCOMPARE(server.requests.size(),2);
+        window->resize(700,600);QVERIFY(settleReaderViewport(window));auto *flick=task->property("contentItem").value<QQuickItem *>();QVERIFY(flick);QTRY_VERIFY(flick->property("contentHeight").toDouble()>flick->height());
+        flick->setProperty("contentY",flick->property("contentHeight").toDouble()-flick->height());QTRY_VERIFY(flick->property("atYEnd").toBool());
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-task-narrow-"+theme+".png"));
+        QCOMPARE(server.requests.size(),2);
+        const auto beforeReopen=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));
+        QTRY_VERIFY(reader->documentGeneration()!=beforeReopen);QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        QTRY_VERIFY((task=visualItem(window->contentItem(),"aiSummaryTaskScroll")));
+        QTRY_COMPARE(shown().value("output").toString(),whole);QCOMPARE(server.requests.size(),2);
+        QQuickItem *restoredCopy=nullptr;QTRY_VERIFY((restoredCopy=visualItem(task,"aiAnswerTextCopy")) && restoredCopy->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(restoredCopy,"clicked"));QCOMPARE(workspace.copied,whole);
+    }
+
     void summarySectionsFollowMacHeadingAndLiteralBoundaries_data() {
         QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
@@ -5003,6 +5080,8 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
             const auto wire=server.requests.last();QCOMPARE(wire.mid(wire.indexOf("\r\n\r\n")+4),expected);
             QVERIFY(reader->aiState().value("chatHistoryWarning").toString().isEmpty());
             QVERIFY(reader->aiState().value("chatModified").toLongLong()>0);
+            QCOMPARE(reader->aiState().value("output").toString(),answer);
+            QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("answer").toString(),answer);
         };
         review("Where is the body text? CHAT_ALPHA");reply("First synthetic ALPHA answer [p.1]",1);
         const auto first=reader->aiState().value("chatSession").toString();QVERIFY(!first.isEmpty());
@@ -5040,7 +5119,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         };
         reopen();choose(first);QCOMPARE(server.requests.size(),2);
         QCOMPARE(reader->aiState().value("chatTurns").toList().size(),1);
-        QVERIFY(reader->aiState().value("chatTurns").toList().first().toMap().value("answer").toString().contains("ALPHA"));
+        QCOMPARE(reader->aiState().value("chatTurns").toList().first().toMap().value("answer").toString(),QString("First synthetic ALPHA answer [p.1]"));
         QVERIFY(!reader->aiState().value("chatReadOnly").toBool());
         QCOMPARE(reader->aiState().value("chatTurns").toList().first().toMap().value("note_source").toString(),firstTurn);
         auto *keep=visualItem(window->contentItem(),"keepAiChatNote0");
@@ -5510,18 +5589,22 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE(reader->pendingCommands(),0);
         QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
         QCOMPARE(server.requests.size(),1);
-        auto *keep=window->findChild<QObject *>("keepAiSummaryNote"),*browse=window->findChild<QObject *>("browseAiReadingNotes");QVERIFY(keep && browse);
+        auto *keep=window->findChild<QObject *>("keepAiSummaryNote");QVERIFY(keep);
         auto *notes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(notes);
         auto *search=notes->findChild<QObject *>("aiReadingNoteSearch"),*text=notes->findChild<QObject *>("aiReadingNoteContent");
         auto *pages=notes->findChild<QObject *>("aiReadingNotePages");QVERIFY(search && text && pages);
         const auto current=[&]{return notes->property("note").toMap();};
         const auto dismiss=[&]{QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_VERIFY(!notes->property("visible").toBool());};
-        QVERIFY(keep->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        QTRY_VERIFY(keep->property("visible").toBool() && keep->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());QVERIFY(!notes->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,panel->property("lastKeptNoteId"))));
         QTRY_COMPARE(text->property("text").toString(),completed);QTRY_COMPARE(reader->pendingCommands(),0);
         const auto id=current().value("id").toString();QVERIFY(!id.isEmpty());
         QCOMPARE(current().value("title").toString(),QString("Synthetic finding"));
         QCOMPARE(notes->property("entries").toList().size(),1);QCOMPARE(pages->property("count").toInt(),1);
-        dismiss();QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
+        dismiss();QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(panel->property("lastKeptNoteId").toString(),id);QVERIFY(!notes->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));QTRY_COMPARE(current().value("id").toString(),id);
         QCOMPARE(notes->property("entries").toList().size(),1);
         QVERIFY(search->setProperty("text","no matching phrase"));QVERIFY(QMetaObject::invokeMethod(notes,"refresh"));
         QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(notes->property("entries").toList().size(),0);
@@ -5534,7 +5617,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
             QTRY_VERIFY(reader->documentGeneration()!=generation);QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
             QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
         };
-        reopen();QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
+        reopen();QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));QTRY_COMPARE(current().value("id").toString(),id);
         QCOMPARE(text->property("text").toString(),completed);QCOMPARE(pages->property("count").toInt(),1);
         const auto version=current().value("modified").toString();QVERIFY(!version.isEmpty());
         auto *titleEditor=notes->findChild<QObject *>("aiReadingNoteTitleEditor");
@@ -5550,7 +5633,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QVERIFY(change("title",revisedTitle));QVERIFY(change("content",revisedContent));QVERIFY(change("thoughts",thoughts));
         QVERIFY(reader->hasUnsavedReadingNotes());dismiss();
         QVERIFY(!window->close());QVERIFY(window->isVisible());
-        QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_VERIFY(notes->property("editing").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));QTRY_VERIFY(notes->property("editing").toBool());
         QCOMPARE(titleEditor->property("text").toString(),revisedTitle);
         QCOMPARE(contentEditor->property("text").toString(),revisedContent);
         QCOMPARE(thoughtsEditor->property("text").toString(),thoughts);
@@ -5581,7 +5664,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),original);source.close();
         QVERIFY(source.open(QIODevice::WriteOnly|QIODevice::Append));const QByteArray revision("\n% Local fixture revision\n");
         QCOMPARE(source.write(revision),revision.size());source.close();
-        reopen();QVERIFY(QMetaObject::invokeMethod(browse,"clicked"));QTRY_COMPARE(current().value("id").toString(),id);
+        reopen();QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));QTRY_COMPARE(current().value("id").toString(),id);
         QCOMPARE(text->property("text").toString(),revisedContent);QCOMPARE(pages->property("count").toInt(),0);
         QCOMPARE(current().value("status").toString(),QString("sourceChanged"));QCOMPARE(server.requests.size(),1);
         dismiss();

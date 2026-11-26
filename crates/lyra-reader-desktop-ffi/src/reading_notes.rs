@@ -1,6 +1,6 @@
 //! Native storage adapter for the shared reading-note records.
 use crate::document::{DesktopDocument, consolidation_request};
-use lyra_reader_ai::workspace::{ReadingRecord, ReadingWorkspace};
+use lyra_reader_ai::workspace::{ReadingRecord, ReadingWorkspace, reading_scope_key};
 use lyra_reader_ffi::api::{
     AiActionRecord, AiConversationTurnRecord, AiMergePlanRequestRecord, AiPlanRecord,
     AiPlanRequestRecord, AiReadingOptionsRecord, AiWireTransport, LyraReaderDocument,
@@ -392,17 +392,23 @@ impl DesktopDocument {
         })
     }
 
-    pub(super) fn archive_selection_summary(
+    pub(super) fn archive_summary_task(
         &self,
         source: &Arc<LyraReaderDocument>,
         summary: ReadingRecord,
     ) -> Result<String, String> {
+        let selected = summary.source_id != reading_scope_key(None);
         self.update_reading_workspace(source, |workspace, sha, _| {
             if summary.source_hash != sha {
-                return Err("The selected summary no longer matches this document.".into());
+                return Err(if selected {
+                    "The selected summary no longer matches this document."
+                } else {
+                    "The document summary no longer matches this document."
+                }
+                .into());
             }
             let record = workspace.put(summary)?;
-            if workspace.task_selection(&record.id)?.is_none() {
+            if selected && workspace.task_selection(&record.id)?.is_none() {
                 return Err("The selected summary is missing its passage.".into());
             }
             Ok(record.id)

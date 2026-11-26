@@ -647,6 +647,7 @@ bool ReaderController::startAiWithCredential(const QString &key,const QVariantMa
     }else {m_aiState.remove(QStringLiteral("unitTitle"));m_aiState.remove(QStringLiteral("unitLanguage"));}
     m_aiState.insert(QStringLiteral("responsePlan"),plan);
     m_aiState.remove(QStringLiteral("summaryNoteSource"));
+    m_aiState.remove(QStringLiteral("summaryHistoryWarning"));
     m_aiState.insert(QStringLiteral("planSent"),true);
     const auto responseView=kind==QStringLiteral("reading_note_suggestion") ? QStringLiteral("note")
         : kind==QStringLiteral("region_knowledge_note") ? QStringLiteral("region_note") : aiView(action);
@@ -728,7 +729,7 @@ void ReaderController::retainAiResult(const QString &state) {
         if(state==QStringLiteral("finished") && m_aiRegion.value(QStringLiteral("question")).toString().trimmed()==question.toString())
             m_aiRegion.insert(QStringLiteral("question"),QString{});
     }
-    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","translationHistoryWarning","synthesisParts","summaryNoteSource"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
+    for(const auto *key:{"output","reasoning","usage","status","responsePlan","translationBlocks","translationWarning","translationHistoryWarning","synthesisParts","summaryNoteSource","summaryHistoryWarning"})result.insert(QLatin1String(key),m_aiState.value(QLatin1String(key)));
     if(m_aiState.contains(QStringLiteral("unitTitle")))result.insert(QStringLiteral("unitTitle"),m_aiState.value(QStringLiteral("unitTitle")));
     if(m_aiState.contains(QStringLiteral("unitLanguage")))result.insert(QStringLiteral("unitLanguage"),m_aiState.value(QStringLiteral("unitLanguage")));
     auto results=m_aiState.value(QStringLiteral("results")).toMap();results.insert(view,result);m_aiState.insert(QStringLiteral("results"),results);
@@ -913,6 +914,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                     m_aiState.remove(QLatin1String(key));
                 m_aiState.insert(QStringLiteral("cachedWholeSummary"),true);
                 m_aiState.insert(QStringLiteral("summaryNoteSource"),cached.value(QStringLiteral("id")));
+                m_aiState.insert(QStringLiteral("summaryHistoryWarning"),cached.value(QStringLiteral("history_warning")));
                 m_aiState.insert(QStringLiteral("responseView"),QStringLiteral("summary"));
                 m_aiState.insert(QStringLiteral("output"),cached.value(QStringLiteral("output")));
                 m_aiState.insert(QStringLiteral("responsePlan"),QVariantMap{
@@ -952,6 +954,8 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     const auto batch=result.toMap();
     auto understanding=batch.value(QStringLiteral("understanding")).toMap();
     const bool updatedUnderstanding=!understanding.isEmpty();
+    if(batch.contains(QStringLiteral("summary_history_warning")))
+        m_aiState.insert(QStringLiteral("summaryHistoryWarning"),batch.value(QStringLiteral("summary_history_warning")));
     if(batch.contains(QStringLiteral("summary_note_source")))
         m_aiState.insert(QStringLiteral("summaryNoteSource"),batch.value(QStringLiteral("summary_note_source")));
     if(updatedUnderstanding) {
@@ -979,9 +983,15 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         if(value.toString()==QStringLiteral("Done"))m_aiState.insert(QStringLiteral("terminalReceived"),true);
         if(event.contains(QStringLiteral("Delta")))output+=event.value(QStringLiteral("Delta")).toMap().value(QStringLiteral("text")).toString();
         if(event.contains(QStringLiteral("ReasoningDelta")))reasoning+=event.value(QStringLiteral("ReasoningDelta")).toMap().value(QStringLiteral("text")).toString();
-        // The region card and captured units already have a title. Other responses keep their part headings.
+        // Unified reading answers and document chat retain provider prose, like
+        // the shared saved workspace and the native macOS reading surfaces.
+        // Transport labels are presentation metadata, never answer content.
         if(event.contains(QStringLiteral("PartStarted"))) {
-            if(readingTranslation) {
+            const auto action=m_aiState.value(QStringLiteral("responsePlan")).toMap().value(QStringLiteral("action")).toString();
+            const bool unified=readingTranslation || responseKind==QStringLiteral("reading_summary") || responseKind==QStringLiteral("reading_summary_selection")
+                || responseKind==QStringLiteral("summary_synthesis") || responseKind==QStringLiteral("reading_note_suggestion")
+                || responseKind==QStringLiteral("region_knowledge_note") || action==QStringLiteral("DocumentChat");
+            if(unified) {
                 if(!output.isEmpty())output+=QStringLiteral("\n\n");
             } else if(!regionQuestion && m_aiState.value(QStringLiteral("unitTitle")).toString().isEmpty())output+=(output.isEmpty()?QString{}:QStringLiteral("\n\n"))+QStringLiteral("### ")+event.value(QStringLiteral("PartStarted")).toMap().value(QStringLiteral("label")).toString()+QStringLiteral("\n\n");
         }

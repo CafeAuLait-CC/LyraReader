@@ -1169,11 +1169,36 @@ impl DesktopDocument {
             "ai_chat_sessions" => self.chat_sessions(&d),
             "ai_chat_session" => self.chat_session(&d, &text(&r, "id")?),
             "ai_chat_draft" => self.save_chat_draft(&d, arg(&r, "draft")?),
-            "ai_reading_tasks" => self.reading_tasks(
-                &d,
-                &text(&r, "kind")?,
-                r.get("source_id").and_then(Value::as_str),
-            ),
+            "ai_reading_tasks" => {
+                let scope = if r.get("selection").is_some() {
+                    if r.get("source_id").is_some() {
+                        return Err(
+                            "Choose either a reading-task selection or source identity.".into()
+                        );
+                    }
+                    let selection: Option<AiSelectionRecord> = arg(&r, "selection")?;
+                    if selection.as_ref().is_some_and(|range| {
+                        range.page >= d.page_count() || range.start > range.end
+                    }) {
+                        return Err(
+                            "The saved-task selection does not match a valid page and range."
+                                .into(),
+                        );
+                    }
+                    Some(lyra_reader_ffi::ai_workspace::ai_reading_scope_key(
+                        selection,
+                    ))
+                } else {
+                    None
+                };
+                self.reading_tasks(
+                    &d,
+                    &text(&r, "kind")?,
+                    scope
+                        .as_deref()
+                        .or_else(|| r.get("source_id").and_then(Value::as_str)),
+                )
+            }
             "ai_reading_notes" => self.reading_notes(
                 &d,
                 &text(&r, "query")?,
@@ -1557,11 +1582,12 @@ impl DesktopDocument {
                             let published = record.and_then(|record| {
                                 if record.source_id == reading_scope_key(None) {
                                     let run=analysis.ok_or("The completed summary no longer owns its document analysis.")?;
-                                    let (context, id) = self.publish_summary(&d, record, run)?;
+                                    let (context, id, warning) = self.publish_summary(&d, record, run)?;
+                                    if let Some(warning) = warning { result["summary_history_warning"] = json!(warning); }
                                     result["understanding"] = self.adopt_understanding(context)?;
                                     Ok(id)
                                 } else {
-                                    self.archive_selection_summary(&d, record)
+                                    self.archive_summary_task(&d, record)
                                 }
                             });
                             match published {
@@ -2662,6 +2688,102 @@ mod tests {
     }
 
     #[test]
+    fn whole_summary_history_and_legacy_open_preserve_the_authoritative_cache() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = doc.active().unwrap();
+        let directory = doc
+            .with_reading_cache(&source, true, |cache, _| Ok(cache.directory.clone()))
+            .unwrap();
+        let run = doc
+            .with_reading_cache(&source, true, |cache, sha| {
+                AnalysisRun::begin(cache, sha, "English".into(), "Brief".into())
+            })
+            .unwrap();
+        let record = ReadingRecord {
+            id: "whole-history-source".into(),
+            kind: "summary".into(),
+            source_id: reading_scope_key(None),
+            source_hash: source.document_identity().sha256,
+            content: "## Overview\nA complete synthetic answer [p.1].".into(),
+            pages: vec![1],
+            model: "synthetic".into(),
+            language: "English".into(),
+            detail: "Brief".into(),
+            originals: vec!["Synthetic source passage.".into()],
+            original_pages: vec![1],
+            status: "finished".into(),
+            modified: 1,
+            ..ReadingRecord::default()
+        };
+        let (context, id, warning) = doc.publish_summary(&source, record.clone(), run).unwrap();
+        assert!(warning.is_none());
+        assert_eq!(id, record.id);
+        assert_eq!(context.summary, record.content);
+        let history = doc
+            .command(json!({"op":"ai_reading_tasks","kind":"summary","selection":null}))
+            .unwrap();
+        assert_eq!(history[0]["id"], record.id);
+        assert_eq!(history[0]["content"], record.content);
+        let primary = directory.join(crate::analysis_cache::FILE);
+        let primary_bytes = fs::read(&primary).unwrap();
+        let workspace = directory.join(crate::reading_history::WORKSPACE_FILE);
+        fs::remove_file(&workspace).unwrap();
+        assert!(
+            doc.command(json!({"op":"ai_reading_tasks","kind":"summary","selection":null}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!workspace.exists());
+        let opened = doc
+            .cached_document_summary(&source, "English", "Brief")
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened["output"], record.content);
+        assert!(opened["history_warning"].is_null());
+        assert_eq!(fs::read(&primary).unwrap(), primary_bytes);
+        let restored = doc
+            .command(json!({"op":"ai_reading_tasks","kind":"summary","selection":null}))
+            .unwrap();
+        assert_eq!(restored[0]["id"], record.id);
+        let damaged = b"damaged history must stay byte-identical";
+        fs::write(&workspace, damaged).unwrap();
+        let opened = doc
+            .cached_document_summary(&source, "English", "Brief")
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened["output"], record.content);
+        assert!(
+            opened["history_warning"]
+                .as_str()
+                .unwrap()
+                .contains("summary is saved")
+        );
+        assert_eq!(fs::read(&workspace).unwrap(), damaged);
+        assert_eq!(fs::read(&primary).unwrap(), primary_bytes);
+        let mut second = record;
+        second.id = "whole-history-second".into();
+        second.content = "A newer complete synthetic answer [p.1].".into();
+        second.modified = 2;
+        let run = doc
+            .with_reading_cache(&source, true, |cache, sha| {
+                AnalysisRun::begin(cache, sha, "English".into(), "Brief".into())
+            })
+            .unwrap();
+        let (context, id, warning) = doc.publish_summary(&source, second.clone(), run).unwrap();
+        assert_eq!(id, second.id);
+        assert_eq!(context.summary, second.content);
+        assert!(warning.unwrap().contains("summary is saved"));
+        assert_eq!(fs::read(&workspace).unwrap(), damaged);
+        assert_eq!(
+            fs::read(directory.join("document-understanding-v2.previous.json")).unwrap(),
+            primary_bytes
+        );
+    }
+
+    #[test]
     fn reading_sidebar_batches_note_metadata_and_task_history_without_writes() {
         let fixture = Fixture::new("text-page.pdf");
         let doc = fixture.open();
@@ -2681,6 +2803,23 @@ mod tests {
                 detail: "Brief".into(),
                 ..Default::default()
             };
+            workspace.put(ReadingRecord {
+                id: "sidebar-selection".into(),
+                kind: "summary".into(),
+                source_id: lyra_reader_ffi::ai_workspace::ai_reading_scope_key(Some(
+                    AiSelectionRecord {
+                        page: 0,
+                        start: 0,
+                        end: 3,
+                    },
+                )),
+                content: "Selected synthetic result".into(),
+                pages: vec![1],
+                source_hash: sha.into(),
+                status: "finished".into(),
+                modified: 3,
+                ..ReadingRecord::default()
+            })?;
             workspace.put(summary.clone())?;
             workspace.keep(summary, "sidebar-note".into())?;
             workspace.put(ReadingRecord {
@@ -2714,6 +2853,26 @@ mod tests {
             doc.command(json!({"op":"ai_reading_tasks","kind":"note"}))
                 .is_err()
         );
+        let whole = doc
+            .command(json!({"op":"ai_reading_tasks","kind":"summary","selection":null}))
+            .unwrap();
+        assert_eq!(whole, tasks);
+        let selected = doc.command(json!({"op":"ai_reading_tasks","kind":"summary","selection":{"page":0,"start":0,"end":3}})).unwrap();
+        assert_eq!(selected.as_array().unwrap().len(), 1);
+        assert_eq!(selected[0]["id"], "sidebar-selection");
+        for selection in [
+            json!({"page":99,"start":0,"end":3}),
+            json!({"page":0,"start":3,"end":0}),
+            json!({"page":-1,"start":0,"end":3}),
+        ] {
+            assert!(
+                doc.command(
+                    json!({"op":"ai_reading_tasks","kind":"summary","selection":selection})
+                )
+                .is_err()
+            );
+        }
+        assert!(doc.command(json!({"op":"ai_reading_tasks","kind":"summary","source_id":"document","selection":null})).is_err());
         let notes = doc
             .command(json!({"op":"ai_reading_notes","query":"Approved","recent":false}))
             .unwrap();
