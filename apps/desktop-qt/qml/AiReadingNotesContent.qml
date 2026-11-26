@@ -27,6 +27,12 @@ Pane {
     property double continuationCommand: 0
     property var sourceFocusTicket: null
     property var thoughtsFailureTicket: null
+    property bool syncWaiting: false
+    property string syncKeepSource: ""
+    property bool importedRefreshWanted: false
+    property double importedListCommand: 0
+    property double importedDetailCommand: 0
+    property var importedDetailTicket: null
     readonly property string selectedNoteId: note ? note.id : ""
     readonly property var sourceEntry: note ? entries.find(entry => entry.id === note.id) || note : ({})
     onSelectedNoteIdChanged: {
@@ -211,8 +217,24 @@ Pane {
         if (draft.id) {
             preferred = draft.id;
             refresh();
-        } else if (source) command = reader.submit("ai_reading_keep", {id: source});
+        } else {
+            syncWaiting = true; syncKeepSource = source || "";
+            if (!reader.requestReadingNotesSync()) finishSyncBrowse();
+        }
+    }
+    function finishSyncBrowse() {
+        if (!syncWaiting || !current()) return;
+        syncWaiting = false;
+        const source = syncKeepSource; syncKeepSource = "";
+        if (source) command = reader.submit("ai_reading_keep", {id: source});
         else refresh();
+    }
+    function refreshImportedNotes() {
+        if (!importedRefreshWanted || !current() || syncWaiting || command || importedListCommand || importedDetailCommand
+                || editing || reviewing || reader.pendingCommands || reader.hasUnsavedReadingNotes || inlineThoughts.inputComposing) return;
+        importedRefreshWanted = false;
+        importedListCommand = reader.submit("ai_reading_notes", {query: search.text,
+            recent: notes.inlineMode ? ordering.currentIndex === 1 : order.currentIndex === 0});
     }
     function rememberPosition() {
         if (current()) { listMemory.capturePosition(); contents.rememberPosition(); }
@@ -321,6 +343,8 @@ Pane {
         sourceFocusTicket = null;
         regionContext = ({}); regionContextCommand = 0;
         continuationContext = null; continuationCommand = 0;
+        syncWaiting = false; syncKeepSource = ""; importedRefreshWanted = false;
+        importedListCommand = 0; importedDetailCommand = 0; importedDetailTicket = null;
         debounce.stop();
         reviewId = "";
         editing = false;
@@ -329,6 +353,19 @@ Pane {
     }
     Connections {
         target: notes.reader
+        function onReadingNotesSynced(result, error) {
+            if (!notes.current()) return;
+            if (notes.syncWaiting) notes.finishSyncBrowse();
+            else if (!error && result.changed) {
+                notes.importedRefreshWanted = true;
+                Qt.callLater(notes.refreshImportedNotes);
+            }
+        }
+        function onCommandsChanged() { if (notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes); }
+        function onRegionNoteDraftChanged() { if (notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes); }
+        function onRegionHistoryChanged() {
+            if (notes.current() && notes.sourceContext.region_id) notes.regionContext = notes.reader.regionHistory;
+        }
         function onAiStateChanged() { if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
         function onReadingNoteAutosaveFinished(noteId, result, error) {
             if (!notes.current() || error) return;
@@ -338,6 +375,26 @@ Pane {
         }
         function onCommandFinished(id, operation, result, error) {
             if (!notes.current()) return;
+            if (id === notes.importedListCommand) {
+                notes.importedListCommand = 0;
+                if (error) { notes.failure = error; return; }
+                notes.entries = result;
+                if (notes.note && !notes.editing && !notes.reviewing && !notes.command && !notes.dirty && !inlineThoughts.inputComposing) {
+                    notes.importedDetailTicket = {id: notes.note.id, modified: notes.note.modified};
+                    notes.importedDetailCommand = notes.reader.submit("ai_reading_note", {id: notes.note.id});
+                }
+                return;
+            }
+            if (id === notes.importedDetailCommand) {
+                notes.importedDetailCommand = 0;
+                const ticket = notes.importedDetailTicket; notes.importedDetailTicket = null;
+                if (error) { notes.failure = error; return; }
+                if (ticket && notes.note && notes.note.id === ticket.id && notes.note.modified === ticket.modified
+                        && !notes.editing && !notes.reviewing && !notes.command && !notes.dirty && !inlineThoughts.inputComposing) {
+                    notes.mergeNoteMetadata(result); notes.displayNote(result);
+                } else notes.importedRefreshWanted = true;
+                return;
+            }
             if (id === notes.regionContextCommand) {
                 notes.regionContextCommand = 0;
                 if (error) notes.failure = error;
@@ -465,6 +522,23 @@ Pane {
                 : !notes.entries.length ? qsTr("No matching notes.")
                 : "")
             wrapMode: Text.Wrap; textFormat: Text.PlainText; color: app.colors.textSecondary
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            visible: notes.current() && !!notes.reader.readingNotesSyncWarning
+            Label {
+                objectName: "aiReadingNotesImportWarning"
+                Layout.fillWidth: true
+                text: notes.current() ? notes.reader.readingNotesSyncWarning : ""
+                wrapMode: Text.Wrap; textFormat: Text.PlainText; color: app.colors.textSecondary
+            }
+            NoteAction {
+                objectName: "retryAiReadingNotesImport"
+                text: qsTr("Retry")
+                Accessible.name: qsTr("Retry importing saved notes")
+                enabled: notes.noteWriteReady && !notes.editing && !notes.reviewing
+                onClicked: if (enabled) notes.reader.requestReadingNotesSync()
+            }
         }
         Flow {
             visible: notes.current() && !!notes.reader.readingNoteDraft.id && notes.reader.readingNoteAutomatic
@@ -679,6 +753,7 @@ Pane {
                     Layout.preferredHeight: 112
                     app: notes.app; reader: notes.noteOwner; generation: notes.noteGeneration; note: notes.note
                     wheelParent: contents
+                    onInputComposingChanged: if (!inputComposing && notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes)
                     allowInput: notes.current() && !notes.command && !notes.reader.documentRevisionPending
                         && (!notes.reader.readingNoteDraft.id || (notes.reader.readingNoteDraft.id === notes.selectedNoteId && notes.reader.readingNoteAutomatic))
                 }

@@ -66,7 +66,165 @@ pub struct ReadingSourceAnswer {
     pub source_pages: Vec<u32>,
 }
 
+/// A local, already validated Interleaf knowledge snapshot and a candidate note identity.
+pub struct InterleafImport {
+    pub source: ReadingRecord,
+    pub note_id: String,
+}
+
+#[derive(Default, Debug, Serialize)]
+pub struct InterleafImportReport {
+    pub changed: bool,
+    pub created: usize,
+    pub updated: usize,
+    pub skipped: usize,
+}
+
 impl ReadingWorkspace {
+    /// Merge generated sources while keeping the user's saved note and Thoughts intact.
+    /// A failed batch leaves the workspace unchanged. Repeated snapshots are semantic no-ops.
+    pub fn import_interleaf(
+        &mut self,
+        imports: Vec<InterleafImport>,
+    ) -> Result<InterleafImportReport, String> {
+        if imports.is_empty() {
+            return Ok(InterleafImportReport::default());
+        }
+        let mut next = self.clone();
+        let mut ids = BTreeMap::new();
+        let mut notes = BTreeMap::new();
+        for (index, record) in next.records.iter().enumerate() {
+            if ids.insert(record.id.clone(), index).is_some()
+                || (record.kind == "note"
+                    && notes.insert(record.source_id.clone(), index).is_some())
+            {
+                return Err(
+                    "The reading workspace contains duplicate identities. Its data was kept."
+                        .into(),
+                );
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut report = InterleafImportReport::default();
+        for InterleafImport {
+            mut source,
+            note_id,
+        } in imports
+        {
+            validate_record(&source)?;
+            if source.kind != "message"
+                || source.conversation_id.is_empty()
+                || source.id != format!("interleaf:{}", source.conversation_id)
+                || source.source_hash.is_empty()
+                || source.source_hash != self.source_hash
+                || source.content.is_empty()
+                || note_id.is_empty()
+                || !seen.insert(source.id.clone())
+            {
+                return Err("The Interleaf note snapshot has an invalid source identity.".into());
+            }
+            let mut changed;
+            if let Some(&index) = ids.get(&source.id) {
+                let old = &next.records[index];
+                if old.kind != "message" || old.conversation_id != source.conversation_id {
+                    return Err("An Interleaf identity belongs to another reading record. Its data was kept.".into());
+                }
+                if old.source_hash != source.source_hash {
+                    report.skipped += 1;
+                    continue;
+                }
+                let eligible = old.covered_turns <= source.covered_turns;
+                let new_content = eligible && old.content != source.content;
+                let new_coverage = eligible && old.covered_turns != source.covered_turns;
+                // Preserve source metadata unknown to this producer, including provider fields.
+                let mut merged = old.clone();
+                if new_content || new_coverage {
+                    merged.content = source.content.clone();
+                    merged.question = source.question.clone();
+                    merged.pages = source.pages.clone();
+                    merged.excerpt = source.excerpt.clone();
+                    merged.detail = source.detail.clone();
+                    merged.covered_turns = source.covered_turns;
+                    merged.modified = source.modified.max(
+                        old.modified
+                            .checked_add(1)
+                            .ok_or("The Interleaf timestamp is outside its supported range.")?,
+                    );
+                    if new_content {
+                        merged.versions.push(old.content.clone());
+                        merged.revision = old
+                            .revision
+                            .checked_add(1)
+                            .ok_or("The note has too many versions.")?;
+                    }
+                } else if old.content == source.content {
+                    // Backfill only missing provenance. This does not alter an editable version.
+                    if merged.excerpt.is_empty() {
+                        merged.excerpt = source.excerpt.clone();
+                    }
+                    if merged.question.is_empty() && old.covered_turns == source.covered_turns {
+                        merged.question = source.question.clone();
+                    }
+                } else {
+                    report.skipped += 1;
+                }
+                changed = merged != *old;
+                next.records[index] = merged;
+                source = next.records[index].clone();
+            } else {
+                if ids.contains_key(&note_id) || note_id == source.id {
+                    return Err("The new reading note identity is already in use.".into());
+                }
+                source.revision = 1;
+                ids.insert(source.id.clone(), next.records.len());
+                next.records.push(source.clone());
+                changed = true;
+            }
+            if let Some(&index) = notes.get(&source.id) {
+                let note = &mut next.records[index];
+                if note.source_hash == source.source_hash {
+                    if note.excerpt.is_empty() && !source.excerpt.is_empty() {
+                        note.excerpt = source.excerpt.clone();
+                        changed = true;
+                    }
+                    if note.question.is_empty()
+                        && note.covered_turns == source.covered_turns
+                        && note.source_revision == source.revision
+                        && !source.question.is_empty()
+                    {
+                        note.question = source.question.clone();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    report.updated += 1;
+                }
+            } else {
+                if ids.contains_key(&note_id) {
+                    return Err("The new reading note identity is already in use.".into());
+                }
+                let mut note = source.clone();
+                note.source_revision = source.revision;
+                note.source_id = source.id;
+                note.id = note_id;
+                note.kind = "note".into();
+                note.status = "saved".into();
+                note.title = note_title(&note.content, &note.title);
+                note.versions.clear();
+                note.revision = 1;
+                ids.insert(note.id.clone(), next.records.len());
+                notes.insert(note.source_id.clone(), next.records.len());
+                next.records.push(note);
+                report.created += 1;
+                changed = true;
+            }
+            report.changed |= changed;
+        }
+        if report.changed {
+            *self = next;
+        }
+        Ok(report)
+    }
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > 64 * 1024 * 1024 {
             return Err(
@@ -580,6 +738,127 @@ pub fn translation_terms(originals: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn interleaf(text: &str, covered: u32) -> InterleafImport {
+        InterleafImport {
+            note_id: "note".into(),
+            source: ReadingRecord {
+                id: "interleaf:region".into(),
+                kind: "message".into(),
+                conversation_id: "region".into(),
+                content: text.into(),
+                excerpt: "Frozen source".into(),
+                question: "Q: source\n\nA".into(),
+                pages: vec![1],
+                source_hash: "current".into(),
+                covered_turns: covered,
+                modified: 10,
+                ..Default::default()
+            },
+        }
+    }
+    #[test]
+    fn interleaf_import_is_idempotent_and_new_knowledge_only_suggests_manual_note_changes() {
+        let mut workspace = ReadingWorkspace::default();
+        workspace.bind_source("current".into());
+        assert_eq!(
+            workspace
+                .import_interleaf(vec![interleaf("Idea", 1)])
+                .unwrap()
+                .created,
+            1
+        );
+        let mut note = workspace.notes("", true).pop().unwrap();
+        note.content = "My ideas".into();
+        note.thoughts = "My Thoughts".into();
+        note.title = "Manual title".into();
+        workspace.put(note.clone()).unwrap();
+        workspace
+            .records
+            .iter_mut()
+            .find(|record| record.id == "note")
+            .unwrap()
+            .extra
+            .insert("opaque".into(), serde_json::json!({"future":1}));
+        note = workspace.notes("", true).pop().unwrap();
+        let baseline = workspace.encode().unwrap();
+        let mut repeated = interleaf("Idea", 1);
+        repeated.source.modified = 999;
+        repeated.source.question = "New discussion without new knowledge".into();
+        assert!(!workspace.import_interleaf(vec![repeated]).unwrap().changed);
+        assert_eq!(workspace.encode().unwrap(), baseline);
+        assert!(
+            workspace
+                .import_interleaf(vec![interleaf("New idea", 2)])
+                .unwrap()
+                .changed
+        );
+        let saved = workspace.notes("", true).pop().unwrap();
+        assert_eq!(saved.content, note.content);
+        assert_eq!(saved.thoughts, note.thoughts);
+        assert_eq!(saved.title, note.title);
+        assert_eq!(saved.extra, note.extra);
+        assert_eq!(workspace.suggestion("note").unwrap().content, "New idea");
+        let baseline = workspace.encode().unwrap();
+        assert_eq!(
+            workspace
+                .import_interleaf(vec![interleaf("Old idea", 0)])
+                .unwrap()
+                .skipped,
+            1
+        );
+        assert_eq!(workspace.encode().unwrap(), baseline);
+    }
+    #[test]
+    fn interleaf_backfills_missing_context_without_invalidating_an_open_edit_version() {
+        let mut workspace = ReadingWorkspace::default();
+        workspace.bind_source("current".into());
+        let mut old = interleaf("Idea", 0);
+        old.source.question.clear();
+        old.source.excerpt.clear();
+        workspace.import_interleaf(vec![old]).unwrap();
+        let before = workspace.notes("", true).pop().unwrap();
+        assert!(
+            workspace
+                .import_interleaf(vec![interleaf("Idea", 0)])
+                .unwrap()
+                .changed
+        );
+        let after = workspace.notes("", true).pop().unwrap();
+        assert_eq!(after.modified, before.modified);
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.excerpt, "Frozen source");
+        assert_eq!(after.question, "Q: source\n\nA");
+        assert!(
+            !workspace
+                .import_interleaf(vec![interleaf("Idea", 0)])
+                .unwrap()
+                .changed
+        );
+    }
+    #[test]
+    fn invalid_interleaf_batches_and_foreign_identity_collisions_leave_all_records_intact() {
+        let mut workspace = ReadingWorkspace::default();
+        workspace.bind_source("current".into());
+        let baseline = workspace.encode().unwrap();
+        let mut wrong = interleaf("Bad", 1);
+        wrong.source.source_hash = "different".into();
+        assert!(
+            workspace
+                .import_interleaf(vec![interleaf("Idea", 1), wrong])
+                .is_err()
+        );
+        assert_eq!(workspace.encode().unwrap(), baseline);
+        let mut occupied = interleaf("Idea", 1).source;
+        occupied.kind = "summary".into();
+        workspace.put(occupied).unwrap();
+        let baseline = workspace.encode().unwrap();
+        assert!(
+            workspace
+                .import_interleaf(vec![interleaf("Idea", 1)])
+                .is_err()
+        );
+        assert_eq!(workspace.encode().unwrap(), baseline);
+    }
     #[test]
     fn translation_history_retains_scopes_runs_and_original_ranges_after_relaunch() {
         let mut workspace = ReadingWorkspace::default();

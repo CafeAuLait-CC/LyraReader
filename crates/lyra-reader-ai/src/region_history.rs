@@ -3,6 +3,7 @@
 //! The legacy shape follows AIRegionHistoryEntry and Foundation's unkeyed CGRect encoding
 //! ([[x,y],[width,height]]). Dates are seconds since 2001, not Unix seconds. File I/O and
 //! DocumentId ownership stay with the host's existing document cache.
+use crate::workspace::ReadingRecord;
 use lyra_reader_edit::records::{
     normalize_uuid, parse_array_elements, render_string, swift_number,
 };
@@ -109,6 +110,10 @@ pub struct Entry {
     pub turns: Vec<Turn>,
     #[serde(default)]
     pub knowledge_note: String,
+    /// A prefix of display turns, matching the macOS cache. It is not a count
+    /// of completed request-context turns; absence means unknown coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_turn_count: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region_number: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,7 +128,46 @@ pub struct DisplayTurn<'a> {
     pub answer: &'a str,
     pub state: AnswerState,
 }
+impl DisplayTurn<'_> {
+    fn is_completed(&self) -> bool {
+        self.state == AnswerState::Finished && !self.answer.is_empty()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnowledgeCoverage {
+    RecordedPrefix,
+    /// An explicit keep approves the current snapshot, preserving the existing
+    /// native keep command's coverage contract for old captures.
+    ReviewedSnapshot,
+}
 impl Entry {
+    /// Coalesce local knowledge imports without treating streaming answers or PNGs as changes.
+    fn knowledge_revision(&self) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        for field in [
+            &self.id,
+            &self.knowledge_note,
+            &self.attachment.text,
+            self.capture_sha256.as_deref().unwrap_or(""),
+        ] {
+            let length =
+                u64::try_from(field.len()).map_err(|_| "The knowledge snapshot is too large.")?;
+            digest.update(length.to_le_bytes());
+            digest.update(field.as_bytes());
+        }
+        digest.update(self.attachment.page.to_le_bytes());
+        digest.update([
+            u8::from(self.location_invalidated == Some(true)),
+            u8::from(self.note_turn_count.is_some()),
+        ]);
+        digest.update(self.note_turn_count.unwrap_or(0).to_le_bytes());
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
     /// The legacy producer stored one turn in the top-level fields, without a turns array.
     pub fn display_turns(&self) -> impl Iterator<Item = DisplayTurn<'_>> {
         let legacy = (self.turns.is_empty() && !self.question.is_empty()).then_some(DisplayTurn {
@@ -184,8 +228,77 @@ impl Entry {
     }
     /// Completed exchanges are eligible request context; partial/error records remain readable.
     pub fn completed_turns(&self) -> impl Iterator<Item = DisplayTurn<'_>> {
-        self.display_turns()
-            .filter(|turn| turn.state == AnswerState::Finished && !turn.answer.is_empty())
+        self.display_turns().filter(DisplayTurn::is_completed)
+    }
+    /// Project the saved knowledge and source snapshot without copying the PNG,
+    /// rasterizing the PDF, or preparing a provider request.
+    pub fn reading_source(
+        &self,
+        sha: &str,
+        page_count: u32,
+        modified: u64,
+        coverage: KnowledgeCoverage,
+    ) -> Result<ReadingRecord, String> {
+        self.validate()?;
+        self.validate_reopen(page_count, sha)?;
+        if self.knowledge_note.is_empty() {
+            return Err("This region has no saved knowledge note.".into());
+        }
+        let page = self
+            .attachment
+            .page
+            .checked_add(1)
+            .ok_or("The saved region page is outside the supported range.")?;
+        let prefix = match self.note_turn_count {
+            Some(count) => usize::try_from(count)
+                .map_err(|_| "The saved knowledge coverage is outside the supported range.")?,
+            // Missing metadata must not claim that a note covers later discussion.
+            None => 0,
+        };
+        let covered = match coverage {
+            KnowledgeCoverage::RecordedPrefix => self
+                .display_turns()
+                .take(prefix)
+                .filter(DisplayTurn::is_completed)
+                .count(),
+            KnowledgeCoverage::ReviewedSnapshot => self.completed_turns().count(),
+        };
+        let capacity = self
+            .display_turns()
+            .try_fold(0usize, |size, turn| {
+                size.checked_add(turn.question.len())?
+                    .checked_add(turn.answer.len())?
+                    .checked_add(7)
+            })
+            .filter(|size| *size <= MAX_TEXT_BYTES)
+            .ok_or("The saved discussion is too large for a reading-note source snapshot.")?;
+        let mut question = String::with_capacity(capacity);
+        for turn in self.display_turns() {
+            if !question.is_empty() {
+                question.push_str("\n\n");
+            }
+            question.push_str("Q: ");
+            question.push_str(turn.question);
+            question.push_str("\n\n");
+            question.push_str(turn.answer);
+        }
+        Ok(ReadingRecord {
+            id: format!("interleaf:{}", self.id),
+            kind: "message".into(),
+            title: format!("Interleaf · page {page}"),
+            content: self.knowledge_note.clone(),
+            conversation_id: self.id.clone(),
+            question,
+            pages: vec![page],
+            excerpt: self.attachment.text.clone(),
+            detail: format!("Interleaf · {} rounds", self.display_turns().count()),
+            source_hash: sha.into(),
+            status: "finished".into(),
+            modified,
+            covered_turns: u32::try_from(covered)
+                .map_err(|_| "The saved discussion has too many completed turns.")?,
+            ..ReadingRecord::default()
+        })
     }
     pub fn validate_reopen(&self, page_count: u32, sha: &str) -> Result<(), String> {
         if self.location_invalidated == Some(true) || self.capture_sha256.as_deref() != Some(sha) {
@@ -218,6 +331,9 @@ impl Entry {
             || self.document_key.len() > 4096
             || self.region_number == Some(0)
             || self.turns.len() > MAX_TURNS
+            || self.note_turn_count.is_some_and(|count| {
+                usize::try_from(count).map_or(true, |count| count > self.display_turns().count())
+            })
         {
             return Err("Invalid region identity, time or conversation count".into());
         }
@@ -551,7 +667,7 @@ impl History {
         let entries = entries.into_iter().map(|e| {
             // Legacy single-turn records have no turns array, matching the producer's allTurns.
             let turns = e.display_turns().count();
-            json!({
+            Ok(json!({
                 "id": e.id,
                 "page": e.attachment.page,
                 "number": e.region_number,
@@ -562,12 +678,13 @@ impl History {
                 "turns": turns,
                 "completed_turn_count": e.completed_turns().count(),
                 "has_note": !e.knowledge_note.is_empty(),
+                "knowledge_revision": e.knowledge_revision()?,
                 "has_answer": e.has_answer(),
                 "answer_preview": e.answer_preview(),
                 "location_invalidated": e.location_invalidated == Some(true)
                     || e.capture_sha256.as_deref().is_some_and(|s| s != sha)
-            })
-        }).collect::<Vec<_>>();
+            }))
+        }).collect::<Result<Vec<_>, String>>()?;
         Ok(
             json!({"entries":entries,"foreign_count":self.foreign_count(),"warnings":self.warnings,"writes_blocked":self.writes_blocked}),
         )
@@ -625,6 +742,7 @@ fn has_foreign_fields(v: &Value) -> bool {
             "createdAt",
             "turns",
             "knowledgeNote",
+            "noteTurnCount",
             "regionNumber",
             "draftQuestion",
             "locationInvalidated",
@@ -689,6 +807,105 @@ mod tests {
             .next()
             .unwrap()
             .clone()
+    }
+    #[test]
+    fn knowledge_source_preserves_text_and_converts_the_recorded_turn_prefix() {
+        let mut entry = sample();
+        let sha = "a".repeat(64);
+        entry.capture_sha256 = Some(sha.clone());
+        entry.knowledge_note = "  Ideas\r\n\u{a0}".into();
+        entry.attachment.text = "Source\r\n\u{a0}".into();
+        entry.turns = [
+            AnswerState::Finished,
+            AnswerState::Cancelled,
+            AnswerState::Finished,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, state)| Turn {
+            id: format!("00000000-0000-4000-8000-{i:012}"),
+            question: format!("q{i}"),
+            answer: format!("a{i}"),
+            state,
+            error: None,
+            created_at: i as f64,
+            source_pages: None,
+        })
+        .collect();
+        entry.note_turn_count = Some(2);
+        let source = entry
+            .reading_source(&sha, 1, 20, KnowledgeCoverage::RecordedPrefix)
+            .unwrap();
+        assert_eq!(source.content, entry.knowledge_note);
+        assert_eq!(source.excerpt, entry.attachment.text);
+        assert_eq!(source.question, "Q: q0\n\na0\n\nQ: q1\n\na1\n\nQ: q2\n\na2");
+        assert_eq!(source.covered_turns, 1);
+        assert_eq!(
+            entry
+                .reading_source(&sha, 1, 20, KnowledgeCoverage::ReviewedSnapshot)
+                .unwrap()
+                .covered_turns,
+            2
+        );
+        entry.note_turn_count = None;
+        assert_eq!(
+            entry
+                .reading_source(&sha, 1, 20, KnowledgeCoverage::RecordedPrefix)
+                .unwrap()
+                .covered_turns,
+            0
+        );
+        assert!(
+            entry
+                .reading_source(&"b".repeat(64), 1, 20, KnowledgeCoverage::RecordedPrefix)
+                .is_err()
+        );
+        entry.note_turn_count = Some(4);
+        assert!(entry.validate().is_err());
+    }
+    #[test]
+    fn knowledge_coverage_roundtrips_without_rewriting_legacy_slots() {
+        let raw = fixture();
+        let history = History::decode(&raw).unwrap();
+        assert_eq!(history.encode().unwrap(), raw[..raw.len() - 1]);
+        let mut entry = sample();
+        entry.note_turn_count = Some(1);
+        let mut history = History::default();
+        history.put(entry).unwrap();
+        let bytes = history.encode().unwrap();
+        assert_eq!(
+            History::decode(&bytes)
+                .unwrap()
+                .entries()
+                .next()
+                .unwrap()
+                .note_turn_count,
+            Some(1)
+        );
+        let mut value: Value = serde_json::from_slice(&bytes).unwrap();
+        for invalid in [json!(-1), json!(4294967296u64), json!(2)] {
+            value[0]["noteTurnCount"] = invalid;
+            assert!(
+                History::decode(&serde_json::to_vec(&value).unwrap())
+                    .unwrap()
+                    .writes_blocked
+            );
+        }
+    }
+    #[test]
+    fn source_snapshot_checks_aggregate_size_before_allocating_it() {
+        let mut entry = sample();
+        entry.capture_sha256 = Some("a".repeat(64));
+        entry.knowledge_note = "Idea".into();
+        entry.question = "q".repeat(MAX_TEXT_BYTES / 2);
+        entry.answer = "a".repeat(MAX_TEXT_BYTES / 2);
+        assert!(entry.validate().is_ok());
+        assert!(
+            entry
+                .reading_source(&"a".repeat(64), 1, 1, KnowledgeCoverage::RecordedPrefix)
+                .unwrap_err()
+                .contains("too large")
+        );
     }
     #[test]
     fn region_preview_prefers_the_note_then_the_latest_answer_and_bounds_unicode() {

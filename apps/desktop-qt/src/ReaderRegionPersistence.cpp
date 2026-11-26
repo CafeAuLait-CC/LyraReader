@@ -15,8 +15,21 @@ void ReaderController::initRegionPersistence() {
     // History consumers may enqueue local reads while a saved snapshot is
     // published. Continue only after those commands drain, outside their signals.
     connect(this,&ReaderController::commandsChanged,this,[this] {
+        if(m_readingSyncWanted && !m_pendingCommands)
+            QMetaObject::invokeMethod(this,&ReaderController::syncReadingNotesWhenIdle,Qt::QueuedConnection);
         if(m_regionContinuationPending && !m_pendingCommands)
             QMetaObject::invokeMethod(this,&ReaderController::resumeAiRegionPreview,Qt::QueuedConnection);
+    });
+    connect(this,&ReaderController::regionHistoryChanged,this,[this] {
+        const auto signature=readingNotesSyncSignature();
+        if(!signature.isEmpty() && signature!=m_readingSyncSignature && signature!=m_readingSyncInFlight) {
+            m_readingSyncWanted=true;
+            QMetaObject::invokeMethod(this,&ReaderController::syncReadingNotesWhenIdle,Qt::QueuedConnection);
+        }
+    });
+    connect(this,&ReaderController::regionNoteDraftChanged,this,[this] {
+        if(m_readingSyncWanted)
+            QMetaObject::invokeMethod(this,&ReaderController::syncReadingNotesWhenIdle,Qt::QueuedConnection);
     });
     m_regionSaveTimer.setSingleShot(true);m_regionSaveTimer.setInterval(750);
     connect(&m_regionSaveTimer,&QTimer::timeout,this,[this]{
@@ -25,6 +38,27 @@ void ReaderController::initRegionPersistence() {
         else if(!m_aiRegionSaveId && !regionRequestRunning()){m_regionFlushRequested=false;finishDeferredRegionAction();}
         emit regionNoteDraftChanged();
     });
+}
+QString ReaderController::readingNotesSyncSignature()const {
+    QStringList entries;
+    for(const auto &value:m_regionHistory.value(QStringLiteral("entries")).toList()) {
+        const auto entry=value.toMap();
+        if(entry.value(QStringLiteral("has_note")).toBool())
+            entries.append(entry.value(QStringLiteral("id")).toString()+QLatin1Char(':')+entry.value(QStringLiteral("knowledge_revision")).toString());
+    }
+    entries.sort();return entries.join(QLatin1Char('|'));
+}
+bool ReaderController::requestReadingNotesSync() {
+    if(!m_document || m_loading || m_snapshotMode)return false;
+    m_readingSyncWanted=true;
+    QMetaObject::invokeMethod(this,&ReaderController::syncReadingNotesWhenIdle,Qt::QueuedConnection);
+    return true;
+}
+void ReaderController::syncReadingNotesWhenIdle() {
+    if(!m_readingSyncWanted || m_readingSyncId || !m_document || m_loading || m_snapshotMode
+        || m_pendingCommands || hasUnsavedReadingNotes() || regionPersistencePending())return;
+    m_readingSyncWanted=false;m_readingSyncInFlight=readingNotesSyncSignature();
+    m_readingSyncId=submit(QStringLiteral("ai_reading_sync_regions"));
 }
 void ReaderController::resetRegionPersistence() {
     m_regionSaveTimer.stop();m_regionRevision=0;m_regionSnapshotRevision=0;

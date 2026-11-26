@@ -1218,6 +1218,7 @@ impl DesktopDocument {
                         .or_else(|| r.get("source_id").and_then(Value::as_str)),
                 )
             }
+            "ai_reading_sync_regions" => self.sync_region_reading_notes(&d),
             "ai_reading_notes" => self.reading_notes(
                 &d,
                 &text(&r, "query")?,
@@ -1957,6 +1958,134 @@ mod tests {
             .parent()
             .unwrap()
             .join("region-conversations-v1.json")
+    }
+    #[test]
+    fn interleaf_sync_keeps_manual_notes_and_is_a_byte_preserving_local_noop() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let path = cache_path(&fixture.path).with_file_name("ai-reading-workspace.json");
+        let pdf = fs::read(&fixture.path).unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"ai_reading_sync_regions"}))
+                .unwrap()["changed"],
+            false
+        );
+        assert!(!path.exists());
+        let region = saved_region(&doc);
+        doc.command(json!({"op":"region_note","id":region,"text":"Original knowledge"}))
+            .unwrap();
+        let history_path = region_path(&fixture.path);
+        let history = fs::read(&history_path).unwrap();
+        let report = doc
+            .command(json!({"op":"ai_reading_sync_regions"}))
+            .unwrap();
+        assert_eq!(report["created"], 1);
+        assert_eq!(fs::read(&history_path).unwrap(), history);
+        let list = doc
+            .command(json!({"op":"ai_reading_notes","query":"","recent":false}))
+            .unwrap();
+        let id = list[0]["id"].as_str().unwrap();
+        let mut note = doc
+            .command(json!({"op":"ai_reading_note","id":id}))
+            .unwrap();
+        assert!(!note["source"]["excerpt"].as_str().unwrap().is_empty());
+        note = doc.command(json!({"op":"ai_reading_note_update","draft":{"id":id,
+            "expected_modified":note["modified"],"title":"My title","content":"My edited ideas","thoughts":"Private thoughts"}})).unwrap();
+        // Preserve an externally formatted but valid file exactly on a semantic no-op.
+        let pretty = serde_json::to_vec_pretty(
+            &serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(&path, &pretty).unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"ai_reading_sync_regions"}))
+                .unwrap()["changed"],
+            false
+        );
+        assert_eq!(fs::read(&path).unwrap(), pretty);
+        doc.command(json!({"op":"region_note","id":region,"text":"New generated ideas"}))
+            .unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"ai_reading_sync_regions"}))
+                .unwrap()["updated"],
+            1
+        );
+        let after = doc
+            .command(json!({"op":"ai_reading_note","id":id}))
+            .unwrap();
+        for field in ["id", "title", "content", "thoughts", "modified"] {
+            assert_eq!(after[field], note[field], "{field}");
+        }
+        assert_eq!(after["suggestion"]["content"], "New generated ideas");
+        // An already open Thoughts draft still uses its original edit version.
+        doc.command(json!({"op":"ai_reading_note_update","draft":{"id":id,
+            "expected_modified":note["modified"],"thoughts":"Late thoughts"}}))
+            .unwrap();
+        assert_eq!(
+            doc.command(json!({"op":"ai_reading_notes","query":"","recent":false}))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), pdf);
+    }
+    #[test]
+    fn interleaf_sync_protects_unknown_revisions_corruption_and_busy_history() {
+        use fs2::FileExt;
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let region = saved_region(&doc);
+        doc.command(json!({"op":"region_note","id":region,"text":"Saved ideas"}))
+            .unwrap();
+        doc.command(json!({"op":"ai_reading_sync_regions"}))
+            .unwrap();
+        let workspace_path = cache_path(&fixture.path).with_file_name("ai-reading-workspace.json");
+        let workspace = fs::read(&workspace_path).unwrap();
+        let path = region_path(&fixture.path);
+        let raw = fs::read(&path).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_file_name(".region-conversations.lock"))
+            .unwrap();
+        FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(
+            doc.command(json!({"op":"ai_reading_sync_regions"}))
+                .unwrap_err()
+                .contains("Another window")
+        );
+        drop(lock);
+        for corrupt in [b"not JSON".to_vec(), {
+            let mut value: Value = serde_json::from_slice(&raw).unwrap();
+            let duplicate = value[0].clone();
+            value.as_array_mut().unwrap().push(duplicate);
+            serde_json::to_vec(&value).unwrap()
+        }] {
+            fs::write(&path, &corrupt).unwrap();
+            assert!(
+                doc.command(json!({"op":"ai_reading_sync_regions"}))
+                    .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), corrupt);
+            assert_eq!(fs::read(&workspace_path).unwrap(), workspace);
+        }
+        let mut unverified: Value = serde_json::from_slice(&raw).unwrap();
+        unverified[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("captureSha256");
+        let bytes = serde_json::to_vec(&unverified).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let report = doc
+            .command(json!({"op":"ai_reading_sync_regions"}))
+            .unwrap();
+        assert_eq!(report["changed"], false);
+        assert_eq!(report["skipped"], 1);
+        assert!(!report["warning"].as_str().unwrap().is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(&workspace_path).unwrap(), workspace);
     }
     #[test]
     fn legacy_region_append_preserves_the_top_level_answer_before_a_new_turn() {

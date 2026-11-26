@@ -19,6 +19,7 @@ Rectangle {
     property bool seeding: false
     property bool syncing: false
     property bool initialized: false
+    readonly property bool inputComposing: input.inputMethodComposing
     readonly property bool ownsInput: !!editOwner && editGeneration === editOwner.documentGeneration && !!editId
     implicitHeight: 112
     color: app.colors.noteBg; radius: 8

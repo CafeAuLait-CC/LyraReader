@@ -55,6 +55,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(bool regionPersistencePending READ regionPersistencePending NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QString regionPersistenceError READ regionPersistenceError NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QVariantMap regionHistory READ regionHistory NOTIFY regionHistoryChanged)
+    Q_PROPERTY(QString readingNotesSyncWarning READ readingNotesSyncWarning NOTIFY regionNoteDraftChanged)
     Q_PROPERTY(QUrl aiRegionImage READ aiRegionImage NOTIFY aiRegionImageChanged)
     Q_PROPERTY(QVariantMap editDrafts READ editDrafts NOTIFY editDraftsChanged)
     Q_PROPERTY(bool hasEditDrafts READ hasEditDrafts NOTIFY editDraftsChanged)
@@ -142,6 +143,8 @@ public:
     Q_INVOKABLE quint64 saveReadingNoteDraft();
     Q_INVOKABLE bool isSavingRegionNote()const{return m_regionNoteSaveId!=0;}
     QVariantMap regionHistory()const{return m_regionHistory;}
+    QString readingNotesSyncWarning()const{return m_readingSyncWarning;}
+    Q_INVOKABLE bool requestReadingNotesSync();
     Q_INVOKABLE quint64 saveAiRegionNote();
     Q_INVOKABLE quint64 reopenAiRegion(const QString &id,const QString &revision);
     QUrl aiRegionImage()const{return m_aiRegionImage;}
@@ -262,6 +265,7 @@ signals:
     void regionHistoryChanged();
     void regionNoteDraftChanged();
     void readingNoteAutosaveFinished(const QString &noteId,const QVariantMap &note,const QString &error);
+    void readingNotesSynced(const QVariantMap &result,const QString &error);
     void textPagesChanged();
     void noteMarkersReady(quint64 request, int page, const QVariantList &markers, const QString &error);
     void commandsChanged();
@@ -324,6 +328,11 @@ private:
     quint64 m_summaryCatalogId=0,m_summaryInspectId=0,m_summaryCacheId=0,m_summaryActionEpoch=0;
     QString m_summaryExpectedId;
     void initRegionPersistence();
+    void syncReadingNotesWhenIdle();
+    QString readingNotesSyncSignature()const;
+    quint64 m_readingSyncId=0;
+    bool m_readingSyncWanted=false;
+    QString m_readingSyncSignature,m_readingSyncInFlight,m_readingSyncWarning;
     void resetRegionPersistence();
     void resetAiRegion();
     void markRegionDirty(bool localInput=false);

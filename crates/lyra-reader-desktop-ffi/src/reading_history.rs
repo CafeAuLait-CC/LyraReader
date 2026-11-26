@@ -276,12 +276,26 @@ impl DesktopDocument {
         source: &Arc<LyraReaderDocument>,
         update: impl FnOnce(&mut ReadingWorkspace, &str, &DocumentCache) -> Result<T, String>,
     ) -> Result<T, String> {
+        self.change_reading_workspace(source, |workspace, sha, cache| {
+            update(workspace, sha, cache).map(|result| (result, true))
+        })
+    }
+
+    /// Derived local imports can be true no-ops, preserving even the original JSON bytes.
+    pub(super) fn change_reading_workspace<T>(
+        &self,
+        source: &Arc<LyraReaderDocument>,
+        update: impl FnOnce(&mut ReadingWorkspace, &str, &DocumentCache) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
         self.with_reading_cache(source, true, |cache, sha| {
             let _lease = lock_reading_workspace(&cache.directory)?;
             let path = cache.directory.join(WORKSPACE_FILE);
             let previous = read_optional(&path)?;
             let mut workspace = workspace(previous.as_deref(), sha.clone())?;
-            let output = update(&mut workspace, &sha, cache)?;
+            let (output, changed) = update(&mut workspace, &sha, cache)?;
+            if !changed {
+                return Ok(output);
+            }
             let bytes = workspace.encode()?;
             if read_optional(&path)? != previous {
                 return Err(

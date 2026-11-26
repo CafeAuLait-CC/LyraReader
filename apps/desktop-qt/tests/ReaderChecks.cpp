@@ -8420,10 +8420,14 @@ ListView {
         QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->aiRegion().value("knowledge_note").toString().isEmpty());
 
         ReaderController other;other.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(other.pageCount(),1);QTRY_COMPARE(other.pendingCommands(),0);
+        const auto completed=[](const QSignalSpy &spy,quint64 id) {
+            for(const auto &row:spy)if(row[0].toULongLong()==id)return row;
+            return QVariantList{};
+        };
         QSignalSpy otherFinished(&other,&ReaderController::commandFinished);
         const auto localEdit=other.submit("region_note",{{"id",region},{"text","Newer local knowledge note."}});
-        QTRY_COMPARE(otherFinished.size(),1);QCOMPARE(otherFinished.at(0).at(0).toULongLong(),localEdit);
-        QVERIFY(otherFinished.at(0).at(3).toString().isEmpty());
+        QTRY_VERIFY(!completed(otherFinished,localEdit).isEmpty());
+        QVERIFY(completed(otherFinished,localEdit)[3].toString().isEmpty());
         QVERIFY(QMetaObject::invokeMethod(save,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
         QTRY_VERIFY(reader->aiState().value("status").toString().contains("changed"));
         QCOMPARE(candidate().value("content").toString(),QString("A generated draft."));
@@ -8444,8 +8448,8 @@ ListView {
         const auto longNote=QStringLiteral("Synthetic prior note paragraph. ").repeated(8400);
         QSignalSpy saveLong(reader,&ReaderController::commandFinished);
         const auto accepted=reader->submit("region_note",{{"id",region},{"text",longNote}});
-        QTRY_COMPARE(saveLong.size(),1);QCOMPARE(saveLong.at(0).at(0).toULongLong(),accepted);
-        QVERIFY(saveLong.at(0).at(3).toString().isEmpty());
+        QTRY_VERIFY(!completed(saveLong,accepted).isEmpty());
+        QVERIFY(completed(saveLong,accepted)[3].toString().isEmpty());
         QTRY_VERIFY(preview->property("enabled").toBool());
         QVERIFY(QMetaObject::invokeMethod(preview,"clicked"));
         QTRY_VERIFY(plan().value("parts").toList().size()>1);QTRY_COMPARE(reader->pendingCommands(),0);
@@ -8476,8 +8480,8 @@ ListView {
         QCOMPARE(finalRequest.mid(finalRequest.indexOf("\r\n\r\n")+4),finalBody);
         QSignalSpy readBeforeSave(reader,&ReaderController::commandFinished);
         const auto pending=reader->submit("region_get",{{"id",region}});
-        QTRY_COMPARE(readBeforeSave.size(),1);QCOMPARE(readBeforeSave.at(0).at(0).toULongLong(),pending);
-        QCOMPARE(readBeforeSave.at(0).at(2).toMap().value("knowledgeNote").toString(),longNote);
+        QTRY_VERIFY(!completed(readBeforeSave,pending).isEmpty());
+        QCOMPARE(completed(readBeforeSave,pending)[2].toMap().value("knowledgeNote").toString(),longNote);
     }
 
     void readingThoughtsAutosaveBelongsToTheReaderAndKeepsLateNativeInput() {
@@ -8666,6 +8670,97 @@ ListView {
         QVERIFY(parts.first().toMap().value("wire_body").toString().contains(question));
         QVERIFY(!reader->aiState().value("running").toBool() && !reader->aiState().value("planSent").toBool());
         disconnect(connection);
+    }
+
+    void interleafKnowledgeImportsWithoutSendingAndDefersToNativeNoteEdits_data() {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("wide-light")<<false;QTest::newRow("narrow-dark")<<true;
+    }
+    void interleafKnowledgeImportsWithoutSendingAndDefersToNativeNoteEdits() {
+        QFETCH(bool,dark);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Required property|Unable to assign).*"));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("interleaf-import.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([previous]{if(previous.isNull())qunsetenv("LYRA_READER_DOCUMENT_CACHE_DIR");else qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        const auto size=dark?QSize(700,600):QSize(1200,820);window->setMaximumSize(size);window->resize(size);
+        window->setProperty("appearance",dark?"dark":"light");
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QSignalSpy imported(reader,&ReaderController::readingNotesSynced),commands(reader,&ReaderController::commandFinished);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
+        QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->regionPersistencePending() && !reader->pendingCommands());
+        const auto region=reader->aiRegion().value("history_id").toString();QVERIFY(!region.isEmpty());
+        QVERIFY(reader->setRegionNoteDraft(region,"Original Interleaf ideas."));QVERIFY(reader->saveRegionNoteDraft());
+        QTRY_VERIFY(!imported.isEmpty() && !reader->pendingCommands());
+        QCOMPARE(imported.last()[0].toMap().value("created").toInt(),1);QVERIFY(imported.last()[1].toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(window,"openReadingNotes"));auto *notes=visualItem(window->contentItem(),"readingNotesSidebar");QVERIFY(notes);
+        QTRY_COMPARE(notes->property("entries").toList().size(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(notes,"read",Q_ARG(QVariant,0)));
+        QTRY_VERIFY(!notes->property("note").toMap().value("id").toString().isEmpty());
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        auto note=notes->property("note").toMap();const auto id=note.value("id").toString();
+        QCOMPARE(note.value("content").toString(),QString("Original Interleaf ideas."));
+        QVERIFY(!note.value("source").toMap().value("excerpt").toString().isEmpty());
+        QVERIFY(reader->setReadingNoteThoughts(id,note.value("modified").toString(),"Personal thoughts stay here."));
+        reader->flushReadingNoteThoughts();
+        QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands());
+        QTRY_COMPARE(notes->property("note").toMap().value("thoughts").toString(),QString("Personal thoughts stay here."));
+        auto *sourceDisclosure=visualItem(notes,"expandAiReadingNoteSource");QVERIFY(sourceDisclosure);
+        QVERIFY(QMetaObject::invokeMethod(sourceDisclosure,"clicked"));QVERIFY(sourceDisclosure->property("expanded").toBool());
+        sourceDisclosure->forceActiveFocus();
+        const auto beforeLive=imported.size();
+        QVERIFY(reader->setRegionNoteDraft(region,"An intermediate knowledge update."));QVERIFY(reader->saveRegionNoteDraft());
+        QTRY_VERIFY(imported.size()>beforeLive && !reader->pendingCommands());
+        QTRY_COMPARE(notes->property("note").toMap().value("suggestion").toMap().value("content").toString(),QString("An intermediate knowledge update."));
+        QCOMPARE(notes->property("note").toMap().value("id").toString(),id);
+        QVERIFY(sourceDisclosure->property("expanded").toBool());QVERIFY(sourceDisclosure->hasActiveFocus());
+        const auto beforeDraftOnly=imported.size();reader->setAiRegionQuestion("Unsent draft only");
+        reader->flushAiRegionNote();QTRY_VERIFY(!reader->regionPersistencePending() && !reader->pendingCommands());QTest::qWait(80);
+        QCOMPARE(imported.size(),beforeDraftOnly);
+        QVERIFY(QMetaObject::invokeMethod(notes,"beginEditing"));QVERIFY(notes->property("editing").toBool());
+        auto *editor=visualItem(notes,"aiReadingNoteContentEditor");QVERIFY(editor);
+        editor->forceActiveFocus();QTRY_VERIFY(editor->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);
+        for(const char key:QByteArray("Unfinished manual ideas"))QTest::keyClick(window,key);
+        QTRY_VERIFY(reader->hasUnsavedReadingNotes());
+        const auto count=imported.size();
+        QVERIFY(reader->setRegionNoteDraft(region,"New saved knowledge for review."));QVERIFY(reader->saveRegionNoteDraft());
+        QTRY_COMPARE(reader->pendingCommands(),0);QTest::qWait(80);
+        QCOMPARE(imported.size(),count);QCOMPARE(editor->property("text").toString(),QString("Unfinished manual ideas"));
+        QVERIFY(QMetaObject::invokeMethod(notes,"cancelEditing"));
+        QTRY_VERIFY(imported.size()>count && !reader->pendingCommands());
+        QTRY_COMPARE(notes->property("entries").toList().size(),1);
+        QTRY_VERIFY(!notes->property("command").toULongLong());
+        if(notes->property("note").toMap().isEmpty())QVERIFY(QMetaObject::invokeMethod(notes,"read",Q_ARG(QVariant,0)));
+        QTRY_COMPARE(notes->property("note").toMap().value("suggestion").toMap().value("content").toString(),QString("New saved knowledge for review."));
+        note=notes->property("note").toMap();
+        QCOMPARE(note.value("id").toString(),id);QCOMPARE(note.value("content").toString(),QString("Original Interleaf ideas."));
+        QCOMPARE(note.value("thoughts").toString(),QString("Personal thoughts stay here."));
+        QString historyPath;QDirIterator files(scratch.filePath("cache"),{"region-conversations-v1.json"},QDir::Files,QDirIterator::Subdirectories);
+        if(files.hasNext())historyPath=files.next();QVERIFY(!historyPath.isEmpty());
+        QByteArray history;{QFile file(historyPath);QVERIFY(file.open(QIODevice::ReadOnly));history=file.readAll();}
+        const auto beforeError=imported.size();
+        {QSaveFile file(historyPath);QVERIFY(file.open(QIODevice::WriteOnly));QVERIFY(file.write("invalid synthetic history")>0);QVERIFY(file.commit());}
+        QVERIFY(reader->requestReadingNotesSync());QTRY_VERIFY(imported.size()>beforeError && !reader->pendingCommands());
+        QVERIFY(!imported.last()[1].toString().isEmpty());
+        auto *warning=visualItem(notes,"aiReadingNotesImportWarning");QVERIFY(warning && warning->isVisible());
+        QCOMPARE(notes->property("note").toMap().value("thoughts").toString(),QString("Personal thoughts stay here."));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+(dark?"-import-dark-warning.png":"-import-light-warning.png")));
+        {QSaveFile file(historyPath);QVERIFY(file.open(QIODevice::WriteOnly));QCOMPARE(file.write(history),history.size());QVERIFY(file.commit());}
+        const auto beforeRetry=imported.size();auto *retry=visualItem(notes,"retryAiReadingNotesImport");QVERIFY(retry && retry->isEnabled());
+        QVERIFY(QMetaObject::invokeMethod(retry,"clicked"));
+        QTRY_VERIFY(imported.size()>beforeRetry && !reader->pendingCommands());
+        QVERIFY(imported.last()[1].toString().isEmpty());QVERIFY(reader->readingNotesSyncWarning().isEmpty());
+        for(const auto &row:commands) {
+            const auto operation=row[1].toString();
+            QVERIFY(operation!="ai_start" && operation!="ai_note_start" && operation!="ai_prepare" && operation!="ai_region_prepare");
+        }
     }
 
     void readingNoteSourcesRestoreOnlyVerifiedLocalConversations_data() {

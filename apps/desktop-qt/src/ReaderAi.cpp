@@ -56,6 +56,8 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     ++m_aiPreviewEpoch;m_aiSummaryPreviewUnitId.clear();m_aiSummaryPreviewLanguage.clear();
     resetSummaryCatalog();
     resetRegionPersistence();
+    m_readingSyncId=0;m_readingSyncWanted=false;
+    m_readingSyncSignature.clear();m_readingSyncInFlight.clear();m_readingSyncWarning.clear();
     m_aiRegionRestoreId=0;m_regionContinuationPending=false;m_regionContinuationSettings.clear();
     clearAiRegionPaper();
     resetDocumentReading();
@@ -851,6 +853,14 @@ quint64 ReaderController::saveReadingNoteDraft() {
     return id;
 }
 void ReaderController::handleAiCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
+    if(operation==QStringLiteral("ai_reading_sync_regions") && id==m_readingSyncId) {
+        m_readingSyncId=0;m_readingSyncSignature=m_readingSyncInFlight;m_readingSyncInFlight.clear();
+        m_readingSyncWarning=error.isEmpty()?result.toMap().value(QStringLiteral("warning")).toString():error;
+        QPointer<ReaderController> alive(this);const auto generation=m_generation;
+        emit readingNotesSynced(result.toMap(),error);
+        if(!alive || generation!=m_generation)return;
+        emit regionNoteDraftChanged();return;
+    }
     if(operation==QStringLiteral("region_save_generated_note") && id==m_generatedRegionNoteSaveId) {
         m_generatedRegionNoteSaveId=0;
         m_aiState.insert(QStringLiteral("statusView"),QStringLiteral("region_note"));

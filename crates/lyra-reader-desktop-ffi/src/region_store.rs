@@ -3,8 +3,10 @@
 use crate::document::DesktopDocument;
 use crate::document_cache::{DocumentCache, atomic_write, read_optional};
 use fs2::FileExt;
-use lyra_reader_ai::region_history::{AnswerState, Attachment, Entry, History, Turn};
-use lyra_reader_ai::workspace::ReadingRecord;
+use lyra_reader_ai::region_history::{
+    AnswerState, Attachment, Entry, History, KnowledgeCoverage, Turn,
+};
+use lyra_reader_ai::workspace::{InterleafImport, ReadingRecord};
 use lyra_reader_ffi::api::{
     AiActionRecord, AiConversationTurnRecord, AiPlanRequestRecord, LyraReaderDocument,
 };
@@ -68,6 +70,21 @@ pub(super) fn track_request(
 }
 
 const FILE: &str = "region-conversations-v1.json";
+fn lock_history(cache: &DocumentCache) -> Result<fs::File, String> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(cache.directory.join(".region-conversations.lock"))
+        .map_err(|error| error.to_string())?;
+    FileExt::try_lock_exclusive(&lock)
+        .map_err(|error| format!("Another window is saving reading notes. Try again: {error}"))?;
+    Ok(lock)
+}
 #[derive(Default)]
 pub(super) struct RegionStore {
     path: Option<PathBuf>,
@@ -109,18 +126,8 @@ impl RegionStore {
             return Err(error.clone());
         }
         let path = self.path.as_ref().ok_or("Reading notes are not loaded")?;
-        let lock_path = cache.directory.join(".region-conversations.lock");
-        let mut options = fs::OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(lock_path).map_err(|e| e.to_string())?;
         // Waiting on another process must not hang a native document command indefinitely.
-        FileExt::try_lock_exclusive(&lock)
-            .map_err(|e| format!("Another window is saving reading notes. Try again: {e}"))?;
+        let _lock = lock_history(cache)?;
         if read_optional(path)? != self.baseline {
             return Err("Reading notes changed outside this window. Reopen before editing; original data was kept".into());
         }
@@ -177,23 +184,14 @@ pub(super) fn reading_note_source(
             if region.knowledge_note.trim().is_empty() {
                 return Err("Save a knowledge note for this region first.".into());
             }
-            let page = region.attachment.page + 1;
             let modified = u64::try_from(chrono::Utc::now().timestamp_millis())
                 .map_err(|_| "The local clock cannot date the reading note.")?;
-            Ok(ReadingRecord {
-                id: format!("interleaf:{}", region.id),
-                kind: "message".into(),
-                title: format!("Interleaf · page {page}"),
-                content: region.knowledge_note.clone(),
-                conversation_id: region.id.clone(),
-                pages: vec![page],
-                source_hash: sha.into(),
-                status: "finished".into(),
+            region.reading_source(
+                sha,
+                document.page_count(),
                 modified,
-                covered_turns: u32::try_from(region.completed_turns().count())
-                    .map_err(|_| "The saved region has too many exchanges.")?,
-                ..ReadingRecord::default()
-            })
+                KnowledgeCoverage::ReviewedSnapshot,
+            )
         },
     )
 }
@@ -225,6 +223,45 @@ pub(super) fn with_current_region<T>(
 }
 
 impl DesktopDocument {
+    /// Explicit local derived-cache synchronization. Merely listing notes remains read-only.
+    pub(super) fn sync_region_reading_notes(
+        &self,
+        document: &Arc<LyraReaderDocument>,
+    ) -> Result<Value, String> {
+        self.change_reading_workspace(document, |workspace, sha, cache| {
+            // Workspace -> region is the only two-file lock order. Keep this lease in the
+            // returned value until the workspace has been checked and atomically published.
+            let lease = lock_history(cache)?;
+            let bytes = read_optional(&cache.directory.join(FILE))?;
+            let history = bytes.as_deref().map_or_else(|| Ok(History::default()), History::decode)?;
+            if history.writes_blocked {
+                return Err("Saved regions are protected. Their original data and reading notes were kept.".into());
+            }
+            let modified = u64::try_from(chrono::Utc::now().timestamp_millis())
+                .map_err(|_| "The local clock cannot date the reading note.")?;
+            let mut imports = Vec::new(); let mut skipped = 0usize;
+            for entry in history.entries().filter(|entry| !entry.knowledge_note.is_empty()) {
+                if entry.validate_reopen(document.page_count(), sha).is_err() {
+                    skipped += 1; continue;
+                }
+                imports.push(InterleafImport {
+                    source: entry.reading_source(sha, document.page_count(), modified, KnowledgeCoverage::RecordedPrefix)?,
+                    note_id: crate::marks::uuid()?,
+                });
+            }
+            let report = workspace.import_interleaf(imports)?;
+            let warning = if skipped > 0 {
+                "Some saved regions have no verified location in this PDF revision. Their original history was kept."
+            } else if !history.warnings.is_empty() {
+                "Some saved regions belong to another version and were kept without importing."
+            } else { "" };
+            let result = json!({"changed": report.changed, "created": report.created,
+                "updated": report.updated, "skipped": report.skipped + skipped,
+                "warning": warning});
+            Ok(((result, lease), report.changed))
+        }).map(|(result, _lease)| result)
+    }
+
     /// Use the stored snapshot and completed context at the same boundary as request planning.
     pub(super) fn enrich_region_history(
         &self,
@@ -537,6 +574,7 @@ impl DesktopDocument {
                     created_at: now(),
                     turns: Vec::new(),
                     knowledge_note: String::new(),
+                    note_turn_count: None,
                     region_number: Some(number),
                     draft_question: None,
                     location_invalidated: None,
@@ -599,6 +637,10 @@ impl DesktopDocument {
                 "region_save_generated_note" => {
                     entry.validate_reopen(active.page_count(), &identity.sha256)?;
                     entry.knowledge_note = field(r, "text")?.into();
+                    entry.note_turn_count = Some(
+                        u32::try_from(entry.display_turns().count())
+                            .map_err(|_| "The saved discussion has too many turns.")?,
+                    );
                 }
                 _ => return Err("Unknown reading-note operation".into()),
             }
