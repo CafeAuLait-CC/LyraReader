@@ -18,7 +18,12 @@ struct MathRun { QString marker, source, wrapped, rendered; };
 struct InlineRun { QString text, rendered; };
 struct InlineMath { qsizetype end; QString markup; };
 struct ListItem { int indent; QString number, text; };
-struct NativeBlock { QString kind, text, language; QVector<NativeBlock> children; };
+struct NativeTable { QVector<QStringList> rows; QStringList alignments; };
+struct NativeBlock {
+    QString kind, text, language;
+    QVector<NativeBlock> children;
+    std::optional<NativeTable> table = std::nullopt;
+};
 class Formatter {
 public:
     Formatter(ReaderController *reader, const QString &source, const QVariantList &pages,
@@ -46,7 +51,7 @@ public:
         return expand(html);
     }
     QVariantList nativeBlocks(int bodySize) {
-        if (!m_hasCode) return {};
+        if (m_limited || !m_hasNativeBlocks) return {};
         return expandBlocks(m_blocks, bodySize);
     }
 private:
@@ -58,6 +63,18 @@ private:
                 block["text"] = QStringLiteral("<div style=\"font-size:") + QString::number(bodySize)
                     + QStringLiteral("px\">") + expand(value.text) + QStringLiteral("</div>");
             else if (value.kind == "quote") block["children"] = expandBlocks(value.children, bodySize);
+            else if (value.kind == "table" && value.table) {
+                QVariantList rows;
+                for (const auto &row : value.table->rows) {
+                    QVariantList cells;
+                    for (qsizetype column = 0; column < row.size(); ++column)
+                        cells.append(QVariantMap{{"text", QStringLiteral("<div style=\"font-size:12px\">") + expand(row[column]) + QStringLiteral("</div>")},
+                            {"alignment", value.table->alignments[column]}});
+                    rows.append(QVariant::fromValue(cells));
+                }
+                block["rows"] = rows;
+                block["columns"] = value.table->alignments.size();
+            }
             else { block["text"] = value.text; block["language"] = value.language; }
             result.append(block);
         }
@@ -291,7 +308,7 @@ private:
             // entire accumulated paragraph string on every small paragraph.
             append(blocks.last().text, block.text);
         } else {
-            if (++m_blockCount > 512) { m_limited = true; return; }
+            if (++m_blockCount + m_nativeCells > 512) { m_limited = true; return; }
             blocks.append(std::move(block));
         }
     }
@@ -311,7 +328,7 @@ private:
                 while (index < lines.size() && !lines[index].trimmed().startsWith(marker) && work()) code += lines[index++];
                 if (index < lines.size()) ++index;
                 native = {"code", code.join('\n'), language, {}};
-                m_hasCode = true;
+                m_hasNativeBlocks = true;
                 if (!language.isEmpty()) append(output, QStringLiteral("<p style=\"margin:0;font-size:9px;color:") + colour("textSecondary") + QStringLiteral("\">") + escape(language) + QStringLiteral("</p>"));
                 append(output, QStringLiteral("<pre style=\"margin-top:0;margin-bottom:8px;padding:7px;white-space:pre-wrap;font-size:12px;background-color:") + colour("raisedBg") + QStringLiteral("\">") + code.join('\n').toHtmlEscaped() + QStringLiteral("</pre>")); continue;
             }
@@ -322,14 +339,38 @@ private:
                 else { if (!rest.isEmpty()) body += rest; while (index < lines.size() && work()) { auto next = lines[index++]; end = next.indexOf(closer); body += end < 0 ? next : next.left(end); if (end >= 0) break; } }
                 const auto source = body.join('\n').trimmed(); append(output, QStringLiteral("<div align=\"center\" style=\"margin-top:4px;margin-bottom:8px\">") + math(source, opener + source + closer) + QStringLiteral("</div>")); continue;
             }
-            if (const int level = heading(line)) { const auto size = level == 1 ? QStringLiteral("17") : level == 2 ? QStringLiteral("14.5") : QStringLiteral("13"); append(output, QStringLiteral("<p style=\"margin-top:4px;margin-bottom:8px;font-size:") + size + QStringLiteral("px;font-weight:600\">") + inlineText(line.mid(level).trimmed(), 0) + QStringLiteral("</p>")); ++index; indents.clear(); continue; }
+            if (const int level = heading(line)) { const auto size = level == 1 ? QStringLiteral("17") : level == 2 ? QStringLiteral("14.5") : QStringLiteral("13"); append(output, QStringLiteral("<p style=\"margin-top:4px;margin-bottom:8px;font-size:") + size + QStringLiteral("px;font-weight:") + (level <= 2 ? QStringLiteral("700") : QStringLiteral("600")) + QStringLiteral("\">") + inlineText(line.mid(level).trimmed(), 0) + QStringLiteral("</p>")); ++index; indents.clear(); continue; }
             if (divider(line)) { append(output, QStringLiteral("<hr/>")); ++index; indents.clear(); continue; }
             if (line.contains('|')) {
                 QVector<QStringList> rows; qsizetype columns = 0;
                 while (index < lines.size() && !lines[index].trimmed().isEmpty() && lines[index].contains('|') && work()) { auto row = cells(lines[index++].trimmed()); columns = qMax(columns, row.size()); rows.append(std::move(row)); if (columns && rows.size() > maximumCells / columns) { m_limited = true; return {}; } }
                 QStringList alignment; if (rows.size() > 1 && separator(rows[1])) { alignment = rows[1]; rows.remove(1); }
+                // Row/column bounds above limit this product to maximumCells.
+                // Bound native text controls before constructing their model.
+                const auto count = rows.size() * columns;
+                // Each cell has a hidden intrinsic-measurement document too.
+                // The product above is <=4096, so doubling cannot overflow.
+                const auto controls = count * 2;
+                if (controls > 512 - m_blockCount - m_nativeCells - 1) { m_limited = true; return {}; }
+                NativeTable table;
+                for (qsizetype column = 0; column < columns; ++column) {
+                    const auto align = column < alignment.size() ? alignment[column] : QString{};
+                    table.alignments.append(align.startsWith(':') && align.endsWith(':') ? QStringLiteral("center") : align.endsWith(':') ? QStringLiteral("right") : QStringLiteral("left"));
+                }
                 append(output, QStringLiteral("<table border=\"1\" cellspacing=\"0\" cellpadding=\"5\" width=\"100%\" style=\"margin-bottom:8px;border-color:") + colour("separator") + QStringLiteral("\">"));
-                for (qsizetype row = 0; row < rows.size(); ++row) { append(output, QStringLiteral("<tr>")); for (qsizetype column = 0; column < columns; ++column) { const auto align = column < alignment.size() ? alignment[column] : QString{}; const auto position = align.startsWith(':') && align.endsWith(':') ? QStringLiteral("center") : align.endsWith(':') ? QStringLiteral("right") : QStringLiteral("left"); const auto tag = row == 0 ? QStringLiteral("th") : QStringLiteral("td"); append(output, QLatin1Char('<') + tag + QStringLiteral(" align=\"") + position + QStringLiteral("\">") + (column < rows[row].size() ? inlineText(rows[row][column], 0) : QString{}) + QStringLiteral("</") + tag + QLatin1Char('>')); } append(output, QStringLiteral("</tr>")); }
+                for (qsizetype row = 0; row < rows.size(); ++row) {
+                    QStringList cells; append(output, QStringLiteral("<tr>"));
+                    for (qsizetype column = 0; column < columns; ++column) {
+                        const auto text = column < rows[row].size() ? inlineText(rows[row][column], 0) : QString{};
+                        cells.append(text); const auto tag = row == 0 ? QStringLiteral("th") : QStringLiteral("td");
+                        append(output, QLatin1Char('<') + tag + QStringLiteral(" align=\"") + table.alignments[column] + QStringLiteral("\">") + text + QStringLiteral("</") + tag + QLatin1Char('>'));
+                    }
+                    table.rows.append(std::move(cells)); append(output, QStringLiteral("</tr>"));
+                }
+                if (columns > 0) {
+                    m_nativeCells += int(controls); m_hasNativeBlocks = true;
+                    native.kind = "table"; native.table = std::move(table);
+                }
                 append(output, QStringLiteral("</table>")); indents.clear(); continue;
             }
             if (line.startsWith('>')) {
@@ -367,7 +408,8 @@ private:
     bool m_renderingInline = false;
     QVector<NativeBlock> m_blocks;
     int m_blockCount = 0;
-    bool m_hasCode = false;
+    int m_nativeCells = 0;
+    bool m_hasNativeBlocks = false;
     qsizetype m_work = 2 * 1024 * 1024;
     bool m_limited = false;
 };

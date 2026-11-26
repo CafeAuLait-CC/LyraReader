@@ -23,8 +23,15 @@ ColumnLayout {
             readonly property var block: document.blocks[index] || ({})
             readonly property string textName: index === 0 ? document.answerName : document.answerName + "Block" + index
             Layout.fillWidth: true; Layout.minimumWidth: 0
-            Layout.bottomMargin: block.kind === "code" ? 8 : 0
-            sourceComponent: block.kind === "code" ? code : block.kind === "quote" ? quote : prose
+            Layout.bottomMargin: block.kind === "code" || block.kind === "table" ? 8 : 0
+            sourceComponent: block.kind === "code" ? code : block.kind === "table" ? table : block.kind === "quote" ? quote : prose
+            Component {
+                id: table
+                AiTableBlock {
+                    app: document.app; renderer: document.renderer
+                    rows: row.block.rows || []; columns: row.block.columns || 1; textName: row.textName
+                }
+            }
             Component {
                 id: code
                 AiCodeBlock {

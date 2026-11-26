@@ -6265,7 +6265,8 @@ ListView {
         QTextDocument document; document.setHtml(markup); const auto text = document.toPlainText();
         QVERIFY(!text.contains("# Findings") && !text.contains("## Detail") && !text.contains("```"));
         QCOMPARE(document.find("Findings").charFormat().font().pixelSize(), 17);
-        QVERIFY(document.find("Findings").charFormat().fontWeight() >= QFont::DemiBold);
+        QCOMPARE(document.find("Findings").charFormat().fontWeight(), QFont::Bold);
+        QCOMPARE(document.find("Detail").charFormat().fontWeight(), QFont::Bold);
         QVERIFY(document.find("bold").charFormat().fontWeight() >= QFont::Bold);
         QVERIFY(document.find("italic").charFormat().fontItalic());
         QVERIFY(document.find("removed").charFormat().fontStrikeOut());
@@ -6361,6 +6362,34 @@ ListView {
         QVERIFY(!paragraphs.value("plain").toBool()); QCOMPARE(paragraphs.value("blocks").toList().size(), 2);
     }
 
+    void readingMarkdownTablesExposeNativeCellsWithinTheSharedBudget() {
+        ReadingMarkdown formatter; ReaderController reader;
+        const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
+            {"raisedBg", QColor("#FFFDFA")}, {"textSecondary", QColor("#635B50")}, {"warningFg", QColor("#88611B")}};
+        const auto render = [&](const QString &text) { return formatter.render(text, &reader, {1}, 1, 13, colours); };
+        const auto result = render("| A | B | C |\n| :--- | :---: | ---: |\n| $x^2$ [p.1] | <b>literal</b> | 7 |\n| short | tail |\n");
+        QVERIFY(!result.value("plain").toBool()); const auto blocks = result.value("blocks").toList(); QCOMPARE(blocks.size(), 1);
+        const auto table = blocks.first().toMap(); QCOMPARE(table.value("kind").toString(), QString("table")); QCOMPARE(table.value("columns").toInt(), 3);
+        const auto rows = table.value("rows").toList(); QCOMPARE(rows.size(), 3);
+        const auto cells = rows[1].toList(); QCOMPARE(cells.size(), 3);
+        QCOMPARE(cells[0].toMap().value("alignment").toString(), QString("left"));
+        QCOMPARE(cells[1].toMap().value("alignment").toString(), QString("center"));
+        QCOMPARE(cells[2].toMap().value("alignment").toString(), QString("right"));
+        QTextDocument first; first.setHtml(cells[0].toMap().value("text").toString());
+        QVERIFY(first.toPlainText().contains("x2")); QCOMPARE(first.find("[p.1]").charFormat().anchorHref(), QString("p.1"));
+        QTextDocument literal; literal.setHtml(cells[1].toMap().value("text").toString()); QCOMPARE(literal.toPlainText(), QString("<b>literal</b>"));
+        QTextDocument padded; padded.setHtml(rows[2].toList()[2].toMap().value("text").toString()); QVERIFY(padded.toPlainText().isEmpty());
+        QVERIFY(render("|").value("blocks").toList().isEmpty());
+        const auto many = (QString("|x").repeated(32) + "|\n").repeated(17);
+        const auto fallback = render(many); QVERIFY(fallback.value("plain").toBool()); QCOMPARE(fallback.value("text").toString(), many);
+        QVERIFY(!fallback.value("warning").toString().isEmpty()); QVERIFY(fallback.value("blocks").toList().isEmpty());
+        const auto row = QString("|x").repeated(16) + "|\n";
+        QVERIFY(!render(row.repeated(8)).value("plain").toBool());
+        // Budget includes the intrinsic-measurement document, not just the
+        // selectable cell, before any Qt model/control allocation.
+        QVERIFY(render(row.repeated(16)).value("plain").toBool());
+    }
+
     void readingMathFallbackExplainsOnlyUnrenderedDisplayExpressions() {
         ReadingMarkdown formatter; ReaderController reader;
         const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
@@ -6399,13 +6428,16 @@ ListView {
         QFETCH(QString, theme);
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
         MockChatServer server; QVERIFY(server.listen());
+        QStringList wideHeaders, wideValues;
+        for (int index = 0; index < 12; ++index) { wideHeaders.append(QString("wide%1").arg(index)); wideValues.append(QString::number(index)); }
+        const QString wide = "\r\n|" + wideHeaders.join('|') + "|\r\n" + QString("|---").repeated(12) + "|\r\n|" + wideValues.join('|') + "|\r\n";
         const QString response = "# Native heading\r\n\r\n**Bold answer** with *emphasis* [p.1], untrusted [p.99].\r\n\r\n"
             "- first idea\r\n  - nested idea\r\n\r\n> A quoted answer.\r\n> ```text\r\n> quoted_code\r\n> ```\r\n\r\n"
             "```cpp\r\nconst auto literal = \"<img src=never-requested-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>\";\r\n```\r\n\r\n"
-            "| Name | Value |\r\n| --- | --- |\r\n| alpha row | 1 |\r\n\r\n"
+            "| Name | Value |\r\n| --- | ---: |\r\n| alpha row | 1 |\r\n\r\n"
             "$$\r\n\\unsupported{<img src=never-rendered>}\r\n$$\r\n\r\n"
             "![remote image](http://127.0.0.1:1/never-requested) <b>literal HTML</b>\r\n"
-            + QString("\r\nA trailing synthetic paragraph for outer scrolling.\r\n").repeated(30);
+            + wide + QString("\r\nA trailing synthetic paragraph for outer scrolling.\r\n").repeated(30);
         server.responses.append({{MockChatServer::delta({{"content", response.left(response.size()/2)}}),
             MockChatServer::delta({{"content", response.mid(response.size()/2)}}), QByteArray("data: [DONE]\n\n")}, 12, 200});
         QTemporaryDir scratch; QVERIFY(scratch.isValid()); const auto path = scratch.filePath("synthetic-markdown.pdf");
@@ -6434,7 +6466,8 @@ ListView {
         QVERIFY(document->find("emphasis").charFormat().fontItalic());
         QCOMPARE(document->find("[p.1]").charFormat().anchorHref(), QString("p.1"));
         QVERIFY(!document->find("[p.99]").charFormat().isAnchor());
-        QQuickItem *codeArea = nullptr; const QTextDocument *tableDocument = nullptr;
+        QQuickItem *codeArea = nullptr, *alphaCell = nullptr, *numberCell = nullptr, *headingCell = nullptr, *valueHeading = nullptr, *wideHeading = nullptr;
+        const QTextDocument *diagnosticDocument = nullptr;
         QList<QQuickItem *> nativeItems;
         const std::function<void(QQuickItem *)> collect = [&](QQuickItem *item) {
             nativeItems.append(item); for (auto *child : item->childItems()) collect(child);
@@ -6444,18 +6477,50 @@ ListView {
             if (!candidate->objectName().startsWith("aiAnswerText")) continue;
             const auto *quick = candidate->property("textDocument").value<QQuickTextDocument *>();
             if (!quick) continue;
-            if (quick->textDocument()->toPlainText().contains("alpha row")) tableDocument = quick->textDocument();
+            const auto plain = quick->textDocument()->toPlainText();
+            if (plain == "alpha row") alphaCell = candidate;
+            if (plain == "1" && candidate->property("horizontalAlignment").toInt() == Qt::AlignRight) numberCell = candidate;
+            if (plain == "Name") headingCell = candidate;
+            if (plain == "Value") valueHeading = candidate;
+            if (plain == "wide0") wideHeading = candidate;
+            if (plain.contains("Could not render this expression.")) diagnosticDocument = quick->textDocument();
             if (candidate->property("text").toString().startsWith("const auto literal")) codeArea = candidate;
         }
-        QVERIFY(tableDocument); const auto *table = tableDocument->find("alpha row").currentTable(); QVERIFY(table); QCOMPARE(table->rows(), 2);
+        QVERIFY(alphaCell && headingCell && valueHeading && numberCell && wideHeading && diagnosticDocument);
+        QCOMPARE(headingCell->property("font").value<QFont>().weight(), QFont::DemiBold);
+        QCOMPARE(alphaCell->property("font").value<QFont>().weight(), QFont::Normal);
+        QTest::qWait(40);
+        for (const auto &role : {qMakePair("body", alphaCell), qMakePair("header", headingCell), qMakePair("value", valueHeading), qMakePair("wide", wideHeading)}) {
+            auto *measure = visualItem(role.second, "aiTableIntrinsicMeasure"); QVERIFY(measure);
+            const auto *native = measure->property("textDocument").value<QQuickTextDocument *>(); QVERIFY(native);
+            const auto *doc = native->textDocument(); QVERIFY(doc);
+            qInfo() << "native-table geometry" << role.first << "width/preferred/measure-implicit"
+                << role.second->width() << role.second->property("preferredWidth") << measure->implicitWidth()
+                << "doc-ideal/margin/textWidth/font/wrap" << doc->idealWidth() << doc->documentMargin() << doc->textWidth()
+                << doc->defaultFont().pixelSize() << doc->defaultFont().weight() << doc->defaultTextOption().wrapMode();
+        }
+        QTRY_COMPARE(headingCell->property("lineCount").toInt(), 1);
+        QTRY_COMPARE(alphaCell->property("lineCount").toInt(), 1);
+        QTRY_COMPARE(valueHeading->property("lineCount").toInt(), 1);
+        QTRY_COMPARE(wideHeading->property("lineCount").toInt(), 1);
+        const auto tableView = [](QQuickItem *cell) {
+            for (auto *item = cell; item; item = item->parentItem()) if (item->objectName().endsWith("TableHorizontalViewport")) return item;
+            return static_cast<QQuickItem *>(nullptr);
+        };
+        auto *smallTable = tableView(alphaCell); auto *wideTable = tableView(wideHeading); QVERIFY(smallTable && wideTable);
+        QTRY_COMPARE(smallTable->property("contentWidth").toDouble(), smallTable->width());
+        QTRY_VERIFY(wideTable->property("contentWidth").toDouble() > wideTable->width());
+        auto *grid = visualItem(smallTable, smallTable->property("textName").toString() + "TableGrid"); QVERIFY(grid);
+        QCOMPARE(grid->property("columnSpacing").toDouble(), 14.0); QCOMPARE(grid->property("rowSpacing").toDouble(), 5.0);
+        auto *rule = visualItem(grid, smallTable->property("textName").toString() + "TableHeaderRule"); QVERIFY(rule); QCOMPARE(rule->height(), .5);
         QVERIFY(codeArea); QVERIFY(codeArea->property("text").toString().contains("<img src=never-requested"));
         QCOMPARE(codeArea->property("wrapMode").toInt(), 0);
         auto *palette = window->property("colors").value<QObject *>(); QVERIFY(palette);
         auto *surface = visualItem(window->contentItem(), codeArea->objectName() + "Surface"); QVERIFY(surface);
         QCOMPARE(surface->property("color").value<QColor>(), palette->property("raisedBg").value<QColor>());
-        const auto diagnostic = tableDocument->find("Could not render this expression."); QVERIFY(!diagnostic.isNull());
+        const auto diagnostic = diagnosticDocument->find("Could not render this expression."); QVERIFY(!diagnostic.isNull());
         QCOMPARE(diagnostic.charFormat().foreground().color(), palette->property("warningFg").value<QColor>());
-        QVERIFY(tableDocument->toPlainText().contains("\\unsupported{<img src=never-rendered>}"));
+        QVERIFY(diagnosticDocument->toPlainText().contains("\\unsupported{<img src=never-rendered>}"));
         QVERIFY(area->property("readOnly").toBool() && area->property("selectByKeyboard").toBool());
         auto *horizontal = visualItem(window->contentItem(), codeArea->objectName() + "HorizontalViewport"); QVERIFY(horizontal);
         QTRY_VERIFY(horizontal->property("contentWidth").toDouble() > horizontal->width());
@@ -6470,6 +6535,8 @@ ListView {
         };
         const auto outerBefore = viewport->property("contentY").toDouble();
         wheel(QPoint(-120, 0)); QTRY_VERIFY(horizontal->property("contentX").toDouble() > 0);
+        auto *bar = visualItem(horizontal, codeArea->objectName() + "HorizontalBar"); QVERIFY(bar);
+        QVERIFY(bar->isVisible()); QTRY_VERIFY(bar->property("active").toBool());
         QCOMPARE(viewport->property("contentY").toDouble(), outerBefore);
         const auto firstHorizontal = horizontal->property("contentX").toDouble();
         wheel(QPoint(0, -120), Qt::ShiftModifier); QTRY_VERIFY(horizontal->property("contentX").toDouble() > firstHorizontal);
@@ -6483,6 +6550,14 @@ ListView {
         QTest::keyClick(window, Qt::Key_A, Qt::ControlModifier); QTest::keyClick(window, Qt::Key_C, Qt::ControlModifier);
         QCOMPARE(QGuiApplication::clipboard()->text(), codeArea->property("text").toString());
         QVERIFY(QMetaObject::invokeMethod(codeArea, "deselect"));
+        QTest::mouseMove(window, QPoint(2, 2)); QTest::qWait(850); QTRY_VERIFY(!bar->property("active").toBool());
+        auto *scrollContent = qobject_cast<QQuickItem *>(viewport->property("contentItem").value<QObject *>()); QVERIFY(scrollContent);
+        const auto widePoint = wideTable->mapToItem(scrollContent, QPointF());
+        viewport->setProperty("contentY", qBound(0.0, widePoint.y() - 20, viewport->property("contentHeight").toDouble() - viewport->height()));
+        const auto point = wideTable->mapToScene(QPointF(wideTable->width()/2, 12));
+        QWheelEvent tableWheel(point, window->mapToGlobal(point.toPoint()), QPoint(), QPoint(-120,0), Qt::NoButton, Qt::NoModifier, Qt::NoScrollPhase, false);
+        QCoreApplication::sendEvent(window, &tableWheel); QTRY_VERIFY(wideTable->property("contentX").toDouble() > 0);
+        viewport->setProperty("contentY", 0);
         const auto raw = reader->aiState().value("output").toString(); QVERIFY(raw.endsWith(response));
         auto *copy = window->findChild<QObject *>("aiAnswerTextCopy"); QVERIFY(copy);
         QVERIFY(QMetaObject::invokeMethod(copy, "clicked")); QCOMPARE(workspace.copied, raw);
