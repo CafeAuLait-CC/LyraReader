@@ -6247,7 +6247,7 @@ ListView {
     void readingMarkdownKeepsNativeBlocksAndSafeInlineSemantics() {
         ReadingMarkdown formatter; ReaderController reader;
         const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
-                                  {"raisedBg", QColor("#F7F4EF")}, {"textSecondary", QColor("#635B50")}};
+                                  {"raisedBg", QColor("#F7F4EF")}, {"textSecondary", QColor("#635B50")}, {"warningFg", QColor("#88611B")}};
         const QString source = QString::fromUtf8(
             "# Findings\r\n\r\nInline **bold**, *italic*, ~~removed~~, `code $x^2$`, 🧪 é 中文.\r\n"
             "Soft break  \r\nHard break. Money $5, then $x^2$. [p.1] [p.99]\r\n\r\n"
@@ -6314,7 +6314,7 @@ ListView {
     void readingMarkdownKeepsFormulaContextsIndependent() {
         ReadingMarkdown formatter; ReaderController reader;
         const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
-                                  {"raisedBg", QColor("#FFFDFA")}, {"textSecondary", QColor("#635B50")}};
+                                  {"raisedBg", QColor("#FFFDFA")}, {"textSecondary", QColor("#635B50")}, {"warningFg", QColor("#88611B")}};
         const auto render = [&](const QString &source) { return formatter.render(source, &reader, {1}, 1, 13, colours); };
         const auto value = render("An `unfinished inline code\n\n$x^2$ after code.");
         QVERIFY(!value.value("plain").toBool()); QTextDocument document; document.setHtml(value.value("text").toString());
@@ -6328,6 +6328,37 @@ ListView {
         QCOMPARE(paragraphs.toPlainText().count("x2"), 128);
     }
 
+    void readingMathFallbackExplainsOnlyUnrenderedDisplayExpressions() {
+        ReadingMarkdown formatter; ReaderController reader;
+        const QVariantMap colours{{"accent", QColor("#88611B")}, {"separator", QColor("#C7BDAE")},
+            {"raisedBg", QColor("#FFFDFA")}, {"textSecondary", QColor("#635B50")}, {"warningFg", QColor("#88611B")}};
+        const QString source = "$$\n\\unsupported{<img src=x>}\n$$\n\n$$\nx^2\n$$\n\n"
+            "```latex\n\\unsupported{literal code}\n```\n\nInline \\(\\unsupported{inline}\\), money $5.";
+        const auto render = [&](const QString &text, ReaderController *owner) { return formatter.render(text, owner, {}, 1, 13, colours); };
+        const auto result = render(source, &reader); QVERIFY(!result.value("plain").toBool());
+        QTextDocument document; document.setHtml(result.value("text").toString());
+        const auto text = document.toPlainText(); const QString warning = "Could not render this expression.";
+        QCOMPARE(text.count(warning), 1);
+        QVERIFY(text.contains("\\unsupported{<img src=x>}") && text.contains("x2"));
+        QVERIFY(text.contains("\\unsupported{literal code}") && text.contains("\\unsupported{inline}"));
+        QVERIFY(text.contains("money $5"));
+        QCOMPARE(document.find(warning).charFormat().foreground().color(), colours.value("warningFg").value<QColor>());
+        QCOMPARE(document.find(warning).blockFormat().alignment(), Qt::AlignLeft | Qt::AlignAbsolute);
+        QCOMPARE(document.find("\\unsupported{<img src=x>}").blockFormat().alignment(), Qt::AlignLeft | Qt::AlignAbsolute);
+        QVERIFY(!result.value("text").toString().contains("<img"));
+        for (qsizetype length = 0; length <= 43; ++length) {
+            const auto prefix = render(source.left(length), &reader); QVERIFY(!prefix.value("plain").toBool());
+            QVERIFY(!prefix.value("text").toString().contains("LYRA-MATH-"));
+        }
+        const auto unavailable = render("$$x^2$$", nullptr); QVERIFY(!unavailable.value("plain").toBool());
+        QTextDocument fallback; fallback.setHtml(unavailable.value("text").toString());
+        QVERIFY(fallback.toPlainText().contains(warning)); QVERIFY(fallback.toPlainText().contains("x^2"));
+        const auto bounded = render("$$" + QString(2200, QLatin1Char('x')) + "$$", &reader);
+        QTextDocument large; large.setHtml(bounded.value("text").toString());
+        QVERIFY(large.toPlainText().contains(warning));
+        QVERIFY(large.toPlainText().contains(QString(2200, QLatin1Char('x'))));
+    }
+
     void readingMarkdownUsesRealNativeResultControls_data() {
         QTest::addColumn<QString>("theme"); QTest::newRow("light") << QString("light"); QTest::newRow("dark") << QString("dark");
     }
@@ -6339,6 +6370,7 @@ ListView {
             "- first idea\r\n  - nested idea\r\n\r\n> A quoted answer.\r\n\r\n"
             "```cpp\r\nconst auto literal = \"<img src=never-requested>\";\r\n```\r\n\r\n"
             "| Name | Value |\r\n| --- | --- |\r\n| alpha row | 1 |\r\n\r\n"
+            "$$\r\n\\unsupported{<img src=never-rendered>}\r\n$$\r\n\r\n"
             "![remote image](http://127.0.0.1:1/never-requested) <b>literal HTML</b>\r\n";
         server.responses.append({{MockChatServer::delta({{"content", response.left(response.size()/2)}}),
             MockChatServer::delta({{"content", response.mid(response.size()/2)}}), QByteArray("data: [DONE]\n\n")}, 12, 200});
@@ -6372,6 +6404,9 @@ ListView {
         auto *palette = window->property("colors").value<QObject *>(); QVERIFY(palette);
         const auto raised = palette->property("raisedBg").value<QColor>().name(QColor::HexRgb);
         QVERIFY(area->property("text").toString().contains("background-color:" + raised));
+        const auto diagnostic = document->find("Could not render this expression."); QVERIFY(!diagnostic.isNull());
+        QCOMPARE(diagnostic.charFormat().foreground().color(), palette->property("warningFg").value<QColor>());
+        QVERIFY(document->toPlainText().contains("\\unsupported{<img src=never-rendered>}"));
         QVERIFY(area->property("readOnly").toBool() && area->property("selectByKeyboard").toBool());
         const auto raw = reader->aiState().value("output").toString(); QVERIFY(raw.endsWith(response));
         auto *copy = window->findChild<QObject *>("aiAnswerTextCopy"); QVERIFY(copy);

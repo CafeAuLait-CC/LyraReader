@@ -67,7 +67,8 @@ ColumnLayout {
         return markdown.render(text, app.currentReader, pages || [],
             app.currentReader ? app.currentReader.pageCount : 0, bodySize, {
                 accent: app.colors.accent, separator: app.colors.separator,
-                raisedBg: app.colors.raisedBg, textSecondary: app.colors.textSecondary
+                raisedBg: app.colors.raisedBg, textSecondary: app.colors.textSecondary,
+                warningFg: app.colors.warningFg
             });
     }
     function activateLink(link) {

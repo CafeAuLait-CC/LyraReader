@@ -11,6 +11,10 @@ struct MarkupSpan {
     start: usize,
     end: usize,
     markup: String,
+    // Presentation metadata only; existing UTF-16 ranges and markup remain
+    // unchanged. Callers must not infer parse success from displayed text.
+    rendered: bool,
+    display: bool,
 }
 
 fn spans(text: &str) -> Vec<MarkupSpan> {
@@ -27,6 +31,7 @@ fn spans(text: &str) -> Vec<MarkupSpan> {
             let end = start + source.encode_utf16().count();
             previous_byte = formula.range.end;
             previous_utf16 = end;
+            let rendered = formula.expression.is_some();
             let mut markup = String::new();
             if let Some(expression) = formula.expression {
                 if formula.display {
@@ -39,7 +44,13 @@ fn spans(text: &str) -> Vec<MarkupSpan> {
                     escape(ch, &mut markup);
                 }
             }
-            MarkupSpan { start, end, markup }
+            MarkupSpan {
+                start,
+                end,
+                markup,
+                rendered,
+                display: formula.display,
+            }
         })
         .collect()
 }
@@ -298,6 +309,26 @@ mod tests {
             String::from_utf16(&original[spans[0].start..spans[0].end]).unwrap(),
             r"\(\mathcal J_{fit}=\frac{\alpha}{\beta}\)"
         );
+    }
+
+    #[test]
+    fn presentation_status_is_explicit_without_changing_fallback_bytes() {
+        let text = "🙂 \\(x^2\\) \\[\\unsupported{<img src=x>}\\] \\(\\unsupported{a}\\)";
+        let value = serde_json::to_value(spans(text)).unwrap();
+        let values = value.as_array().unwrap();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0]["rendered"], true);
+        assert_eq!(values[0]["display"], false);
+        assert_eq!(values[1]["rendered"], false);
+        assert_eq!(values[1]["display"], true);
+        assert_eq!(values[2]["rendered"], false);
+        assert_eq!(values[2]["display"], false);
+        assert_eq!(values[1]["markup"], r"\[\unsupported{&lt;img src=x&gt;}\]");
+        assert_eq!(values[1]["start"], 11);
+        // Equal-looking text cannot serve as a success discriminator.
+        let identity = serde_json::to_value(spans(r"\(x\)")).unwrap();
+        assert_eq!(identity[0]["rendered"], true);
+        assert_eq!(identity[0]["markup"], "x");
     }
 
     #[test]

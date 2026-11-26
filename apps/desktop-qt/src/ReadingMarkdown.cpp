@@ -23,7 +23,7 @@ public:
               int pageCount, const QVariantMap &colours)
         : m_reader(reader) {
         for (const auto &page : pages) { bool ok = false; const int value = page.toInt(&ok); if (ok && value > 0 && value <= pageCount) m_pages.insert(value); }
-        for (const auto &name : {"accent", "separator", "raisedBg", "textSecondary"}) {
+        for (const auto &name : {"accent", "separator", "raisedBg", "textSecondary", "warningFg"}) {
             const auto value = colours.value(QString::fromLatin1(name));
             const QColor colour = value.canConvert<QColor>() ? value.value<QColor>() : QColor{};
             if (!colour.isValid()) { m_limited = true; return; }
@@ -85,6 +85,15 @@ private:
         m_math.append({marker, std::move(source), std::move(wrapped), {}});
         return marker;
     }
+    QString mathFallback(const QString &source) const {
+        // The shared parser reports success explicitly, but not a detailed
+        // failure category. Do not invent a reason from its escaped markup.
+        return QStringLiteral("<p align=\"left\" style=\"margin-top:0;margin-bottom:3px;font-size:11px;color:")
+            + colour("warningFg") + QStringLiteral("\">")
+            + ReadingMarkdown::tr("Could not render this expression. The original source is shown below.").toHtmlEscaped()
+            + QStringLiteral("</p><pre align=\"left\" style=\"margin-top:0;margin-bottom:8px;padding:7px;white-space:pre-wrap;font-size:12px;background-color:")
+            + colour("raisedBg") + QStringLiteral("\">") + source.toHtmlEscaped() + QStringLiteral("</pre>");
+    }
     void formatMath() {
         // One bounded Rust call per batch, never one FFI call per character/run.
         for (qsizetype first = 0; first < m_math.size();) {
@@ -103,10 +112,15 @@ private:
                     const auto span = value.toMap(); return span.value("start").toLongLong() == range.first && span.value("end").toLongLong() == range.second;
                 });
                 if (!run.rendered.isEmpty()) continue;
-                run.rendered = QStringLiteral("<code>") + escape(run.source) + QStringLiteral("</code>");
+                run.rendered = mathFallback(run.source);
                 if (found != spans.cend()) {
-                    const auto markup = found->toMap().value("markup").toString();
-                    if (!markup.isEmpty() && markup != run.wrapped.toHtmlEscaped()) run.rendered = markup;
+                    const auto span = found->toMap();
+                    const auto markup = span.value("markup").toString();
+                    if (span.value("rendered").metaType().id() != QMetaType::Bool
+                        || span.value("display").metaType().id() != QMetaType::Bool || markup.isEmpty()) {
+                        m_limited = true; return;
+                    }
+                    if (span.value("rendered").toBool()) run.rendered = markup;
                 }
             }
             first = next;
@@ -149,7 +163,9 @@ private:
                 const auto end = span.value("end").toLongLong(&endOk);
                 const auto markup = span.value("markup").toString();
                 if (!startOk || !endOk || start < previous || end <= start
-                    || end > run.text.size() || markup.isEmpty()) { m_limited = true; return; }
+                    || end > run.text.size() || markup.isEmpty()
+                    || span.value("rendered").metaType().id() != QMetaType::Bool
+                    || span.value("display").metaType().id() != QMetaType::Bool) { m_limited = true; return; }
                 m_inlineMath.insert(start, {end, markup}); previous = end;
             }
             run.rendered = inlineText(run.text, 0);
