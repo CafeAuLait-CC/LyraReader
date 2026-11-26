@@ -4439,8 +4439,9 @@ private slots:
         QVERIFY(prepare("Which page contains body text? FAIL_QUESTION_ONLY"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);auto plan=reader->aiState().value("plan").toMap();QVERIFY(plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("Synthetic cancelled partial"));QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(reader->aiState().value("chatTurns").toList().last().toMap().value("state").toString(),QString("failed"));
         QVERIFY(prepare("Which page contains body text? NEXT_QUESTION"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("FAIL_QUESTION_ONLY"));QCOMPARE(server.requests.size(),9);
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));QTRY_VERIFY(visualItem(view.window->contentItem(),"aiConversationHistory")->isVisible());
-        auto *retry=visualItem(view.window->contentItem(),"retryAiRequest");auto *panelItem=qobject_cast<QQuickItem *>(panel);QVERIFY(retry && panelItem);
-        QTRY_VERIFY(retry->mapRectToItem(panelItem,retry->boundingRect()).bottom()<=panelItem->height());
+        const auto lastTurn=reader->aiState().value("chatTurns").toList().size()-1;
+        auto *retry=visualItem(view.window->contentItem(),QString("retryAiChatTurn%1").arg(lastTurn));QVERIFY(retry);
+        QVERIFY(!retry->property("enabled").toBool()); // A newer preview cannot replay an older failed exchange.
         auto *answer=visualItem(view.window->contentItem(),"aiHistoryAnswer0");QVERIFY(answer);QVERIFY(answer->property("text").toString().contains("Synthetic answer"));
         const auto capture=qEnvironmentVariable("LYRA_READER_AI_HISTORY_SNAPSHOT");if(!capture.isEmpty()){QTest::qWait(80);QVERIFY(view.window->grabWindow().save(capture));}
         const auto oldest=reader->aiState().value("chatTurns").toList().first().toMap();const auto source=oldest.value("sources").toList().first().toMap();
@@ -4844,6 +4845,72 @@ private slots:
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
     }
 
+    void documentChatReferenceControlsReviewBeforeSending_data() {
+        QTest::addColumn<QString>("theme");
+        QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void documentChatReferenceControlsReviewBeforeSending() {
+        QFETCH(QString,theme);
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-chat-layout.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        RecordingClipboardWorkspace workspace;QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const auto close=qScopeGuard([&]{window->close();});window->resize(900,700);window->setProperty("appearance",theme);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
+        QTRY_COMPARE(reader->pageCount(),3);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-chat-layout"}});
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"chat")));
+        auto *panel=window->findChild<QObject *>("aiPanel"),*dialog=window->findChild<QObject *>("aiPayloadDialog");QVERIFY(panel && dialog);
+        auto *composer=visualItem(window->contentItem(),"aiComposerScroll"),*question=visualItem(window->contentItem(),"aiQuestion"),*prepare=visualItem(window->contentItem(),"prepareAiRequest");QVERIFY(composer && question && prepare);
+        auto *banner=visualItem(window->contentItem(),"aiChatDocumentBanner");QVERIFY(banner);
+        QTRY_COMPARE(composer->height(),qreal(96));QCOMPARE(banner->property("text").toString(),QString("Current document · 3 pages"));
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);question->forceActiveFocus(Qt::TabFocusReason);
+        QInputMethodEvent committed;committed.setCommitString("Which page contains body text and caching?");QCoreApplication::sendEvent(question,&committed);
+        QTest::keyClick(window,Qt::Key_Return,Qt::ShiftModifier);
+        QTRY_VERIFY(question->property("text").toString().contains('\n'));QVERIFY(reader->aiState().value("plan").toMap().isEmpty());QCOMPARE(server.requests.size(),0);
+        QInputMethodEvent composing(QString::fromUtf8("中"),{});QCoreApplication::sendEvent(question,&composing);
+        QVERIFY(question->property("inputMethodComposing").toBool());
+        QTest::keyClick(window,Qt::Key_Return);QVERIFY(reader->aiState().value("plan").toMap().isEmpty());QCOMPARE(server.requests.size(),0);
+        QInputMethodEvent ended;QCoreApplication::sendEvent(question,&ended);
+        QTRY_VERIFY(!question->property("inputMethodComposing").toBool());
+        QTest::keyClick(window,Qt::Key_Return);
+        QTRY_VERIFY(dialog->property("visible").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());
+        const auto body=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();QVERIFY(!body.isEmpty());
+        QCOMPARE(window->findChild<QObject *>("aiWirePayload")->property("text").toString().toUtf8(),body);QCOMPARE(server.requests.size(),0);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-chat-review-"+theme+".png"));
+        const QString answer="**Synthetic answer** [p.1] invented [p.99]. <script>untrusted</script>\n\n"+QString("A saved paragraph remains selectable.\n\n").repeated(18);
+        server.responses.append({{MockChatServer::delta({{"reasoning_content","Separate synthetic reasoning"}}),MockChatServer::delta({{"content",answer}}),MockChatServer::usage(2),QByteArray("data: [DONE]\n\n")},20,200});
+        auto *send=visualItem(window->contentItem(),"sendAiRequest");QVERIFY(send && send->isVisible());send->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
+        QTRY_COMPARE(server.requests.size(),1);QTRY_VERIFY(!dialog->property("visible").toBool());
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),body);
+        QQuickItem *response=nullptr,*bubbleText=nullptr;QTRY_VERIFY((response=visualItem(window->contentItem(),"aiHistoryAnswer0")));
+        QTRY_VERIFY((bubbleText=visualItem(window->contentItem(),"aiChatQuestion0")));
+        auto *bubble=bubbleText->parentItem();QVERIFY(bubble);
+        auto *history=visualItem(window->contentItem(),"aiConversationHistory");QVERIFY(history);
+        QTRY_VERIFY(bubble->width()>50 && bubble->width()<=history->property("availableWidth").toDouble()+.5);
+        QVERIFY(bubbleText->property("readOnly").toBool());QVERIFY(bubbleText->property("selectByMouse").toBool());
+        const auto markup=response->property("text").toString();QVERIFY(markup.contains("href=\"p.1\""));QVERIFY(!markup.contains("href=\"p.99\""));QVERIFY(!markup.contains("<script>"));QVERIFY(markup.contains("&lt;script&gt;"));
+        auto *sources=visualItem(window->contentItem(),"aiHistoryAnswer0Sources");QVERIFY(sources);
+        QVERIFY(sources->mapRectToScene(sources->boundingRect()).top()>=response->mapRectToScene(response->boundingRect()).bottom()-.5);
+        auto *copy=visualItem(window->contentItem(),"copyAiChatAnswer0");QVERIFY(copy);QVERIFY(QMetaObject::invokeMethod(copy,"clicked"));QCOMPARE(workspace.copied,reader->aiState().value("chatTurns").toList().first().toMap().value("answer").toString());QVERIFY(workspace.copied.contains(answer));QCOMPARE(workspace.copies,1);
+        auto *keep=visualItem(window->contentItem(),"keepAiChatNote0");QVERIFY(keep);QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());QVERIFY(!window->findChild<QObject *>("aiReadingNotes")->property("visible").toBool());
+        QTRY_COMPARE(composer->height(),qreal(96));QCOMPARE(server.requests.size(),1);
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-chat-answer-"+theme+".png"));
+        window->resize(700,600);QTRY_COMPARE(composer->height(),qreal(96));
+        QTRY_VERIFY(prepare->mapRectToScene(prepare->boundingRect()).bottom()<=window->height());
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-chat-narrow-"+theme+".png"));
+        reader->setAiInput("question","A new unsent draft");question->forceActiveFocus();QTest::keyClick(window,Qt::Key_Return);
+        QTRY_VERIFY(dialog->property("visible").toBool());QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+        QTRY_VERIFY(!dialog->property("visible").toBool());QCOMPARE(server.requests.size(),1);
+    }
+
     void documentChatReopensSeparateLocalConversations() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
         MockChatServer server;QVERIFY(server.listen());
@@ -4893,16 +4960,19 @@ private slots:
         };
         auto *history=window->findChild<QObject *>("aiChatHistory");QVERIFY(history);
         auto *historyButton=window->findChild<QObject *>("openAiChatHistory");QVERIFY(historyButton);
-        auto *picker=history->findChild<QObject *>("aiSavedChatChoice");QVERIFY(picker);
-        auto *restoreChat=history->findChild<QObject *>("restoreAiChat");QVERIFY(restoreChat);
         const auto choose=[&](const QString &id) {
             QVERIFY(QMetaObject::invokeMethod(historyButton,"clicked"));
             QTRY_COMPARE(history->property("sessions").toList().size(),2);
             QTRY_COMPARE(reader->pendingCommands(),0);
             const auto sessions=history->property("sessions").toList();
             int index=0;for(;index<sessions.size();++index)if(sessions[index].toMap().value("id")==id)break;
-            QVERIFY(index<sessions.size());QVERIFY(picker->setProperty("currentIndex",index));
-            QVERIFY(QMetaObject::invokeMethod(restoreChat,"clicked"));
+            QVERIFY(index<sessions.size());
+            auto *list=visualItem(window->contentItem(),"aiChatSessions");QVERIFY(list);
+            QVERIFY(QMetaObject::invokeMethod(list,"positionViewAtIndex",Q_ARG(int,index),Q_ARG(int,0)));
+            QQuickItem *row=nullptr;QTRY_VERIFY((row=visualItem(list,QString("aiSavedChatRow%1").arg(index))));
+            QCOMPARE(row->property("conversationId").toString(),id);
+            QVERIFY(qobject_cast<QQuickItem *>(history)->height()<=180);
+            QVERIFY(QMetaObject::invokeMethod(row,"clicked"));
             QTRY_COMPARE(reader->aiState().value("chatSession").toString(),id);QTRY_COMPARE(reader->pendingCommands(),0);
         };
         reopen();choose(first);QCOMPARE(server.requests.size(),2);
@@ -4913,13 +4983,19 @@ private slots:
         auto *keep=visualItem(window->contentItem(),"keepAiChatNote0");
         auto *notes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(keep && notes);
         QVERIFY(keep->isVisible());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY(!panel->property("lastKeptNoteId").toString().isEmpty());
+        QVERIFY(!notes->property("visible").toBool());
+        QVERIFY(!panel->property("notice").toString().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,panel->property("lastKeptNoteId"))));
         const auto note=[&]{return notes->property("note").toMap();};
         QTRY_COMPARE(note().value("content").toString(),QString("First synthetic ALPHA answer [p.1]"));
         QCOMPARE(note().value("source_pages").toList(),QVariantList{1});
         QTRY_COMPARE(reader->pendingCommands(),0);const auto savedNote=note().value("id").toString();QVERIFY(!savedNote.isEmpty());
         QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_VERIFY(!notes->property("visible").toBool());
-        QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(note().value("id").toString(),savedNote);
-        QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_VERIFY(!notes->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(panel->property("lastKeptNoteId").toString(),savedNote);
+        QVERIFY(!notes->property("visible").toBool());
         QCOMPARE(server.requests.size(),2);
         review("Which page contains BODY_TEXT? CHAT_CONTINUE");
         QVERIFY(payload().contains("First synthetic ALPHA answer"));QVERIFY(!payload().contains("Second synthetic BETA answer"));

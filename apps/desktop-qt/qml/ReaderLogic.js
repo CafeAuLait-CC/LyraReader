@@ -222,7 +222,7 @@ function annotationUnsupportedReason(a) {
 
 // Provider text is escaped before adding our formatting and local page links.
 // Image syntax and external URLs remain text; they cannot load resources.
-function answerMarkup(text, citations, formulas) {
+function answerMarkup(text, citations, formulas, linkColor) {
     let raw=String(text || "")
     formulas=formulas || []
     // Isolate trusted native formula markup while formatting surrounding emphasis.
@@ -239,9 +239,10 @@ function answerMarkup(text, citations, formulas) {
     }
     const escaped=raw.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
     const marked=escaped.replace(/^### (.+)$/gm,"<b>$1</b>").replace(/\*\*([^*]+)\*\*/g,"<b>$1</b>")
+    const linkStyle = typeof linkColor === "string" && /^#[0-9a-fA-F]{6}$/.test(linkColor) ? ' style="color:'+linkColor+'"' : ""
     const linked=citations===false ? marked : marked.replace(/\[p\.(\d+)\]/g,function(label,page) {
         // Qt's typed sequences support indexOf but are not JavaScript Arrays.
-        return citations!==undefined && citations!==true && citations.indexOf(Number(page))<0 ? label : '<a href="p.'+page+'">'+label+'</a>'
+        return citations!==undefined && citations!==true && citations.indexOf(Number(page))<0 ? label : '<a href="p.'+page+'"'+linkStyle+'>'+label+'</a>'
     })
     const lines=linked.replace(/\n/g,"<br/>")
     const rendered=formulas.length ? lines.replace(/\u0000M(\d+)\u0000/g,function(_,index) {

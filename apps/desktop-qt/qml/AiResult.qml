@@ -10,6 +10,7 @@ ColumnLayout {
     property string answerName: "aiAnswerText"
     property bool showSources: false
     property bool inlineConversation: false
+    property int bodySize: 13
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function revealCursor(area, owner, generation, target) {
@@ -59,11 +60,28 @@ ColumnLayout {
         Accessible.description: text
         Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11
     }
+    TextArea {
+        id: answerArea
+        objectName: result.answerName
+        Layout.fillWidth: true
+        text: result.sent.kind === "reading_translation" ? result.outputText
+              : Logic.answerMarkup(result.outputText,
+                  result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat"
+                      ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []),
+                  result.formulaMarkup, String(app.colors.accent))
+        readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
+        textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
+        Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
+        Binding { target: answerArea; property: "font.pixelSize"; value: result.bodySize; when: result.inlineConversation }
+        Accessible.name: qsTr("AI response")
+        Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
+        onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }
+    }
     ToolButton {
         id: sources
         objectName: result.answerName + "Sources"
         visible: result.showSources && (result.sent.sources || []).length > 0
-        text: qsTr("Sources (%1)").arg((result.sent.sources || []).length) + (checked ? " ▴" : " ▾")
+        text: qsTr("Sources · %1").arg(Array.from(new Set((result.sent.sources || []).map(source => "p." + source.page))).join(", ")) + (checked ? " ▾" : " ▸")
         checkable: true
         Accessible.name: qsTr("Show passages actually sent with this answer")
     }
@@ -72,14 +90,33 @@ ColumnLayout {
         Layout.fillWidth: true
         Repeater {
             model: result.sent.sources || []
-            ColumnLayout {
+            Button {
+                id: sourceChip
                 required property var modelData
                 Layout.fillWidth: true
-                Button {
-                    text: qsTr("Page %1").arg(modelData.page)
-                    onClicked: result.citation("p." + modelData.page, {action: result.sent.action, sources: result.sent.sources, source_pages: result.sent.source_pages, generation: result.value.generation})
+                padding: 5
+                Accessible.name: qsTr("Source page %1").arg(modelData.page)
+                Accessible.description: qsTr("Jump to the page and briefly highlight the passage sent with this answer.")
+                contentItem: RowLayout {
+                    spacing: 6
+                    Rectangle {
+                        radius: height / 2
+                        color: Qt.rgba(app.colors.accent.r, app.colors.accent.g, app.colors.accent.b, 0.12)
+                        Layout.alignment: Qt.AlignTop
+                        implicitWidth: pageLabel.implicitWidth + 10; implicitHeight: pageLabel.implicitHeight + 2
+                        Label { id: pageLabel; anchors.centerIn: parent; text: "p." + sourceChip.modelData.page; color: app.colors.accent; font.pixelSize: 11; font.weight: Font.DemiBold }
+                    }
+                    Label {
+                        text: sourceChip.modelData.snippet || qsTr("Passage sent from page %1").arg(sourceChip.modelData.page)
+                        textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true
+                        color: app.colors.textSecondary; font.pixelSize: 11
+                    }
                 }
-                Label { text: modelData.snippet || ""; textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11 }
+                background: Rectangle {
+                    radius: 5; color: sourceChip.down ? app.colors.pressedBg : sourceChip.hovered ? app.colors.hoverBg : app.colors.fieldBg
+                    border.width: sourceChip.visualFocus ? 2 : 0; border.color: app.colors.focusRing
+                }
+                onClicked: result.citation("p." + modelData.page, {action: result.sent.action, sources: result.sent.sources, source_pages: result.sent.source_pages, generation: result.value.generation})
             }
         }
     }
@@ -101,26 +138,9 @@ ColumnLayout {
         font.pixelSize: 11
         Keys.onPressed: function(event) { result.cursorKey(reasoningArea, event); }
     }
-    TextArea {
-        id: answerArea
-        objectName: result.answerName
-        Layout.fillWidth: true
-        text: result.sent.kind === "reading_translation" ? result.outputText
-              : Logic.answerMarkup(result.outputText,
-                  result.sent.action === "TranslateSelection" ? false : result.sent.action === "DocumentChat"
-                      ? (result.sent.sources || []).map(source => source.page) : (result.sent.source_pages || []),
-                  result.formulaMarkup)
-        readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.Wrap; background: null
-        textFormat: result.sent.kind === "reading_translation" ? TextEdit.PlainText : TextEdit.RichText
-        Binding { target: answerArea; property: "padding"; value: 0; when: result.inlineConversation }
-        Binding { target: answerArea; property: "font.pixelSize"; value: 13; when: result.inlineConversation }
-        Accessible.name: qsTr("AI response")
-        Keys.onPressed: function(event) { result.cursorKey(answerArea, event); }
-        onLinkActivated: function(link) { result.citation(link, {action: result.sent.action, sources: result.sent.sources || [], source_pages: result.sent.source_pages || [], generation: result.value.generation}); }
-    }
     RowLayout {
-        visible: !!result.value.output && !result.inlineConversation
-        Button { text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
+        visible: !!result.value.output
+        Button { visible: !result.inlineConversation; text: qsTr("Copy answer"); onClicked: if (app.session) app.session.copyText(result.value.output) }
         Label {
             objectName: result.answerName + "Usage"
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText

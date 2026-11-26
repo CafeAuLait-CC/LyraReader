@@ -2553,7 +2553,7 @@ ApplicationWindow {
                             }
                             LyraToolButton {
                                 objectName: "clearAiConversation"
-                                symbol: "free-text"; text: qsTr("New conversation")
+                                symbol: "new-conversation"; text: qsTr("New conversation")
                                 visible: root.aiPanelMode === "assistant" && aiContent.workspace === "chat"
                                 enabled: !aiContent.running && (!!aiContent.viewState.chatSession || !!aiContent.input.chatQuestion)
                                 onClicked: aiContent.startNewChat()

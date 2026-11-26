@@ -6,7 +6,7 @@ Pane {
     id: aiPanel
     objectName: "aiPanel"
     required property var app
-    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || chatHistory.visible || readingNotes.visible
+    readonly property bool tabTransferDialogVisible: payload.visible || summaryCatalog.popupVisible || selectionSource.visible || translationHistory.visible || readingNotes.visible
     readonly property var owner: app.currentReader
     readonly property var viewState: owner.aiState
     readonly property var input: viewState.input || ({})
@@ -41,6 +41,8 @@ Pane {
     onPlanChanged: {
         if (selectionSource && selectionSource.snapshot && selectionSource.snapshot.prepared) selectionSource.close();
         if (pendingLocate && pendingLocate.prepared) pendingLocate = null;
+        if (!plan && payload && payload.visible) payload.close();
+        if (reviewTicket) Qt.callLater(finishUiReview);
     }
     onVisibleChanged: if (!visible) {
         if (selectionSource) selectionSource.close();
@@ -65,11 +67,56 @@ Pane {
                                              ? result.translationBlocks || [] : []
     readonly property string status: viewState.statusView === workspace ? viewState.status || "" : (((viewState.results || {})[workspace] || {}).status || "")
     // Height-dependent density must not move scope labels horizontally mid-selection.
-    leftPadding: 10
-    rightPadding: 10
-    topPadding: compact ? 6 : 10
-    bottomPadding: compact ? 6 : 10
+    leftPadding: workspace === "chat" ? 0 : 10
+    rightPadding: workspace === "chat" ? 0 : 10
+    topPadding: workspace === "chat" ? 0 : compact ? 6 : 10
+    bottomPadding: workspace === "chat" ? 0 : compact ? 6 : 10
     background: Rectangle { color: app.colors.panelBg }
+    property var reviewTicket: null
+    property var keepTicket: null
+    property string lastKeptNoteId: ""
+    property string notice: ""
+    readonly property bool chatConfigured: {
+        const account = app.session ? app.session.chatGptAccounts : null;
+        return account && account.useForChat ? account.connected && !!String(account.model || "").trim() : !!String(app.aiSettings.model || "").trim();
+    }
+    function prepareFromUi() {
+        if (workspace !== "chat") { prepare(); return; }
+        if (running) { owner.cancelAi(); return; }
+        if (previewReady) { payload.open(); return; }
+        reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || ""};
+        prepare();
+        Qt.callLater(finishUiReview);
+    }
+    function finishUiReview() {
+        const ticket = reviewTicket;
+        if (!ticket) return;
+        if (ticket.reader !== owner || ticket.generation !== ownerGeneration || ticket.view !== workspace || ticket.question !== (input.question || "")) {
+            reviewTicket = null; return;
+        }
+        if (owner.pendingCommands) return;
+        reviewTicket = null;
+        if (previewReady) payload.open();
+    }
+    function keepInNotes(source) {
+        if (!source || keepTicket || owner.pendingCommands || owner.readingNoteDraft.id) return;
+        const command = owner.submit("ai_reading_keep", {id: source});
+        if (command) keepTicket = {reader: owner, generation: ownerGeneration, command: command};
+    }
+    Timer { id: noticeTimer; interval: 4000; onTriggered: aiPanel.notice = "" }
+    Connections {
+        target: aiPanel.owner
+        function onCommandsChanged() { if (aiPanel.reviewTicket) Qt.callLater(aiPanel.finishUiReview); }
+        function onCommandFinished(id, operation, result, error) {
+            const ticket = aiPanel.keepTicket;
+            if (!ticket || ticket.command !== id || operation !== "ai_reading_keep") return;
+            aiPanel.keepTicket = null;
+            if (ticket.reader !== aiPanel.owner || ticket.generation !== aiPanel.ownerGeneration) return;
+            if (error) { app.operationStatus = error; return; }
+            aiPanel.lastKeptNoteId = result.id;
+            aiPanel.notice = qsTr("Reading note saved"); noticeTimer.restart();
+        }
+    }
     property bool taskHistoryShown: false
     function openHistory() {
         if (workspace === "chat") chatHistory.browse();
@@ -86,7 +133,11 @@ Pane {
         request.language = input.summaryLanguage || null;
         owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
     }
-    onWorkspaceChanged: taskHistoryShown = false
+    onWorkspaceChanged: {
+        taskHistoryShown = false; reviewTicket = null;
+        if (chatHistory && workspace !== "chat") chatHistory.close();
+        if (payload && payload.visible) payload.close();
+    }
     AiTaskStore { id: taskStore; app: aiPanel.app }
     AiTaskHistory {
         app: aiPanel.app; store: taskStore
@@ -104,7 +155,8 @@ Pane {
         return !!a && !!b && a.page === b.page && a.start === b.start && a.end === b.end;
     }
     function resetSourceView() {
-        taskHistoryShown = false;
+        taskHistoryShown = false; reviewTicket = null; keepTicket = null; lastKeptNoteId = "";
+        notice = ""; noticeTimer.stop();
         if (payload && payload.visible) payload.close();
         if (selectionSource && selectionSource.visible) selectionSource.close();
         if (translationHistory && translationHistory.visible) translationHistory.close();
@@ -353,16 +405,17 @@ Pane {
     ColumnLayout {
         anchors.fill: parent
         visible: !aiPanel.taskHistoryShown
-        spacing: aiPanel.compact ? 3 : 6
+        spacing: aiPanel.workspace === "chat" ? 0 : aiPanel.compact ? 3 : 6
         Label {
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
             // Short unit drawers reserve space for the answer. Setup and receiving states remain visible.
-            visible: !aiPanel.compact || !aiPanel.languageMode || aiPanel.running || !app.aiSettings.model
+            visible: aiPanel.workspace !== "chat" && (!aiPanel.compact || !aiPanel.languageMode || aiPanel.running || !app.aiSettings.model)
             text: aiPanel.running ? qsTr("Receiving: %1 · %2").arg(aiPanel.viewState.activeModel || "").arg(aiPanel.viewState.activeHost || "") : (app.aiSettings.model || qsTr("Choose an AI model in Settings"))
             color: app.colors.textSecondary; font.pixelSize: 11
         }
         RowLayout {
             Layout.fillWidth:true
+            visible: aiPanel.workspace !== "chat" || !!aiPanel.owner.documentReading.choice_pending
             Button {objectName:"openDocumentReading";text:aiPanel.owner.documentReading.choice_pending ? qsTr("Read document (optional)…") : qsTr("Document Reading…");Layout.fillWidth:true;enabled:!aiPanel.owner.snapshotReadOnly;onClicked:app.openDocumentReading()}
             ToolButton {objectName:"skipDocumentReadingChoice";text:qsTr("Skip");visible:!!aiPanel.owner.documentReading.choice_pending;Accessible.name:qsTr("Continue without document reading");onClicked:aiPanel.owner.dismissDocumentReadingChoice()}
         }
@@ -640,13 +693,28 @@ Pane {
             Accessible.description: text
             Layout.fillWidth: true; font.pixelSize: 11; color: app.colors.textSecondary
         }
+        Label {
+            objectName: "aiChatDocumentBanner"
+            visible: aiPanel.workspace === "chat"
+            text: qsTr("Current document · %1 pages").arg(aiPanel.owner.pageCount)
+            font.pixelSize: 12; color: app.colors.textPrimary; horizontalAlignment: Text.AlignHCenter
+            Layout.fillWidth: true; Layout.preferredHeight: 36; verticalAlignment: Text.AlignVCenter
+        }
+        AiChatHistory {
+            id: chatHistory
+            app: aiPanel.app
+            Layout.fillWidth: true; Layout.preferredHeight: implicitHeight; Layout.maximumHeight: 180
+        }
         AiConversation {
             id: conversation
             app: aiPanel.app; viewState: aiPanel.viewState
+            statusMessage: aiPanel.status
+            Layout.leftMargin: 10; Layout.rightMargin: 10
             visible: aiPanel.workspace === "chat"
             Layout.fillWidth: true; Layout.fillHeight: true; Layout.minimumHeight: 24
             onCitation: function(link, responsePlan) { aiPanel.followHistoryLink(link, responsePlan); }
-            onKeepNote: function(source) { readingNotes.browse(source); }
+            onKeepNote: function(source) { aiPanel.keepInNotes(source); }
+            onRetry: if (aiPanel.plan) app.sendAi(aiPanel.owner, aiPanel.plan)
         }
         Label {
             visible: aiPanel.workspace === "chat" && !!aiPanel.viewState.conversationLimited
@@ -688,7 +756,13 @@ Pane {
             PanelWheelHandler { viewport: composerScroll.contentItem }
             objectName: "aiComposerScroll"
             visible: (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) || aiPanel.workspace === "chat"
-            Layout.fillWidth: true; Layout.preferredHeight: 64; Layout.maximumHeight: 64
+            Layout.fillWidth: true
+            Layout.preferredHeight: aiPanel.workspace === "chat" ? 96 : 64
+            Layout.maximumHeight: Layout.preferredHeight
+            Layout.leftMargin: aiPanel.workspace === "chat" ? 14 : 0
+            Layout.rightMargin: aiPanel.workspace === "chat" ? 14 : 0
+            Layout.topMargin: aiPanel.workspace === "chat" ? 14 : 0
+            background: Rectangle { radius: 7; color: app.colors.fieldBg; border.color: question.activeFocus ? app.colors.focusRing : app.colors.controlBorder; border.width: question.activeFocus ? 2 : 1 }
             contentWidth: availableWidth
             clip: true
             TextArea {
@@ -706,6 +780,7 @@ Pane {
                 onModelTextChanged:syncModelText()
                 Component.onCompleted:syncModelText()
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
+                padding: 10; background: null; font.pixelSize: 14
                 readOnly: aiPanel.workspace === "chat" && (!!aiPanel.viewState.chatReadOnly || aiPanel.owner.documentRevisionPending)
                 placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
                 Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
@@ -713,22 +788,45 @@ Pane {
                 // may replace the model's original text or invalidate its preview.
                 onTextChanged: if (activeFocus && !applyingModel) aiPanel.owner.setAiInput("question", text)
                 Keys.onPressed: function(event) {
-                    if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && (event.modifiers & Qt.ControlModifier) && preview.enabled) { aiPanel.prepare(); event.accepted = true; }
+                    if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !question.inputMethodComposing
+                            && !(event.modifiers & Qt.ShiftModifier) && !event.isAutoRepeat && preview.enabled
+                            && (aiPanel.workspace === "chat" || (event.modifiers & Qt.ControlModifier))) {
+                        aiPanel.prepareFromUi(); event.accepted = true;
+                    }
                 }
             }
         }
-        Button {
-            id: preview
-            objectName: "prepareAiRequest"
-            text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? qsTr("Preview Question") : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : aiPanel.wholeSummary && aiPanel.viewState.cachedWholeSummary ? qsTr("Preview fresh summary") : qsTr("Preview Summary")
+        RowLayout {
+            id: composerActions
             Layout.fillWidth: true
-            enabled: !aiPanel.running && (aiPanel.workspace !== "chat" || !aiPanel.viewState.chatReadOnly)
+            Layout.leftMargin: aiPanel.workspace === "chat" ? 14 : 0
+            Layout.rightMargin: aiPanel.workspace === "chat" ? 14 : 0
+            Layout.topMargin: aiPanel.workspace === "chat" ? 5 : 0
+            Layout.bottomMargin: aiPanel.workspace === "chat" ? 14 : 0
+            spacing: 6
+            TextMetrics { id: shortcutSize; text: shortcut.text; font: shortcut.font }
+            Label {
+                id: shortcut
+                text: qsTr("Return to send · Shift+Return for a new line")
+                font.pixelSize: 10; color: app.colors.textSecondary
+                visible: aiPanel.workspace === "chat" && shortcutSize.width + preview.implicitWidth + 10 <= composerActions.width
+            }
+            Item { visible: aiPanel.workspace === "chat"; Layout.fillWidth: true }
+            ReadingPrimaryButton {
+            id: preview
+            app: aiPanel.app
+            objectName: "prepareAiRequest"
+            text: aiPanel.batchMode ? qsTr("Preview batch") : aiPanel.workspace === "chat" ? (aiPanel.running ? qsTr("Stop") : qsTr("Send")) : aiPanel.workspace === "translation" ? qsTr("Preview Translation") : (!aiPanel.unitMode && !aiPanel.batchMode && aiPanel.action === 2) ? qsTr("Preview Question") : aiPanel.wholeSummary && aiPanel.viewState.cachedWholeSummary ? qsTr("Preview fresh summary") : qsTr("Preview Summary")
+            Layout.fillWidth: aiPanel.workspace !== "chat"
+            icon.source: aiPanel.workspace === "chat" ? (aiPanel.running ? "qrc:/icons/stop.svg" : "qrc:/icons/arrow-up.svg") : ""
+            enabled: aiPanel.workspace === "chat" && aiPanel.running || !aiPanel.running && (aiPanel.workspace !== "chat" || aiPanel.chatConfigured && !aiPanel.viewState.chatReadOnly)
                      && aiPanel.owner.pageCount > 0 && aiPanel.owner.pendingCommands === 0 && (aiPanel.batchMode || aiPanel.unitMode || ((aiPanel.action !== 2 && aiPanel.action !== 4) || !!question.text.trim()) && (aiPanel.action !== 3 || aiPanel.input.language === undefined || !!aiPanel.input.language.trim()) && ([2,3,5].indexOf(aiPanel.action) < 0 || aiPanel.translateDocument || !!app.selection))
-            onClicked: aiPanel.prepare()
+            onClicked: aiPanel.prepareFromUi()
+        }
         }
         Label {
             text: aiPanel.status
-            visible: text.length > 0
+            visible: text.length > 0 && aiPanel.workspace !== "chat"
             wrapMode: Text.Wrap; textFormat: Text.PlainText; Layout.fillWidth: true
             color: app.colors.textSecondary; font.pixelSize: 11
             Accessible.role: Accessible.StaticText
@@ -742,7 +840,7 @@ Pane {
             Accessible.description: text
         }
         Label {
-            visible: aiPanel.previewReady
+            visible: aiPanel.previewReady && aiPanel.workspace !== "chat"
             Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
             text: {
                 const plan = aiPanel.plan;
@@ -754,10 +852,10 @@ Pane {
             color: app.colors.infoFg; font.pixelSize: 11
         }
         RowLayout {
-            visible: aiPanel.previewReady && !aiPanel.running
+            visible: aiPanel.previewReady && !aiPanel.running && aiPanel.workspace !== "chat"
             Button { text: qsTr("Inspect Payload"); Layout.fillWidth: true; onClicked: payload.open() }
             Button {
-                objectName: "sendAiRequest"
+                objectName: aiPanel.workspace === "chat" ? "legacyInlineChatSend" : "sendAiRequest"
                 text: aiPanel.synthesisPreview ? qsTr("Send synthesis") : qsTr("Send"); Layout.fillWidth: true
                 enabled: aiPanel.owner.pendingCommands === 0
                 onClicked: app.sendAi(aiPanel.owner, aiPanel.plan)
@@ -765,11 +863,18 @@ Pane {
         }
         Button {
             objectName: "cancelAiRequest"
-            visible: aiPanel.running
+            visible: aiPanel.running && aiPanel.workspace !== "chat"
             text: aiPanel.viewState.responseView === "summary_batch" ? qsTr("Stop batch") : qsTr("Stop response"); Layout.fillWidth: true
             onClicked: aiPanel.owner.cancelAi()
         }
+        Label {
+            objectName: "aiReadingNoteSavedNotice"
+            text: aiPanel.notice; visible: !!text
+            Layout.fillWidth: true; Layout.leftMargin: 14; Layout.rightMargin: 14
+            color: app.colors.textSecondary; font.pixelSize: 11; wrapMode: Text.Wrap
+        }
         Flow {
+            visible: aiPanel.workspace !== "chat"
             Layout.fillWidth: true; Layout.minimumWidth: 0
             spacing: 4
             LyraToolButton {
@@ -805,63 +910,6 @@ Pane {
         app: aiPanel.app
         onRequestUpdate: function(noteId) {
             aiPanel.prepareReadingNoteUpdate(noteId);
-        }
-    }
-    Dialog {
-        id: chatHistory
-        objectName: "aiChatHistory"
-        property var reader: null
-        property double generation: 0
-        property double command: 0
-        property var sessions: []
-        property string error: ""
-        title: qsTr("Past chats for this PDF")
-        modal: true
-        anchors.centerIn: Overlay.overlay
-        width: Math.max(230, Math.min(460, app.width - 48))
-        standardButtons: Dialog.Cancel
-        function current() { return reader && reader === aiPanel.owner && generation === aiPanel.ownerGeneration; }
-        function browse() {
-            reader = aiPanel.owner;
-            generation = aiPanel.ownerGeneration;
-            open();
-            command = reader.submit("ai_chat_sessions", {});
-        }
-        onClosed: { reader = null; command = 0; sessions = []; error = ""; }
-        Connections {
-            target: chatHistory.reader
-            function onCommandFinished(id, operation, result, error) {
-                if (!chatHistory.current() || id !== chatHistory.command || operation !== "ai_chat_sessions") return;
-                chatHistory.command = 0;
-                chatHistory.error = error;
-                if (!error) chatHistory.sessions = result;
-            }
-        }
-        contentItem: ColumnLayout {
-            ComboBox {
-                id: savedChat
-                objectName: "aiSavedChatChoice"
-                Layout.fillWidth: true
-                model: chatHistory.sessions
-                textRole: "title"
-                enabled: count > 0
-                Accessible.name: qsTr("Saved chats")
-            }
-            Label {
-                text: chatHistory.error || (chatHistory.command ? qsTr("Loading chats…") : !savedChat.count ? qsTr("No saved chats.") : "")
-                visible: !!text
-                Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
-            }
-            Button {
-                objectName: "restoreAiChat"
-                text: qsTr("Open chat")
-                enabled: chatHistory.current() && savedChat.currentIndex >= 0 && !chatHistory.command
-                         && aiPanel.owner.pendingCommands === 0 && !aiPanel.running
-                onClicked: {
-                    if (chatHistory.reader.reopenAiChat(chatHistory.sessions[savedChat.currentIndex].id))
-                        chatHistory.close();
-                }
-            }
         }
     }
     Dialog {
@@ -1002,9 +1050,15 @@ Pane {
         modal: true
         width: Math.min(680, app.width - 60); height: Math.min(550, app.height - 60)
         parent: Overlay.overlay; anchors.centerIn: parent
-        standardButtons: Dialog.Close
+        standardButtons: aiPanel.workspace === "chat" && !aiPanel.viewState.planSent ? Dialog.Cancel : Dialog.Close
         ColumnLayout {
             anchors.fill: parent
+            Label {
+                visible: aiPanel.workspace === "chat" && aiPanel.previewReady
+                Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap
+                text: aiPanel.plan ? qsTr("%1 · %2 · %3 request(s). Nothing has been sent yet.").arg(aiPanel.plan.host).arg(aiPanel.plan.model).arg(aiPanel.plan.parts.length) : ""
+                color: app.colors.textSecondary
+            }
             ComboBox {
                 id: payloadRow
                 objectName: "summaryBatchPayloadRow"
@@ -1028,6 +1082,15 @@ Pane {
                     }
                     readOnly: true; selectByMouse: true; wrapMode: TextEdit.WrapAnywhere; textFormat: TextEdit.PlainText; font.family: "monospace"
                 }
+            }
+            ReadingPrimaryButton {
+                app: aiPanel.app
+                objectName: aiPanel.workspace === "chat" ? "sendAiRequest" : "reviewedAiTaskSend"
+                visible: aiPanel.workspace === "chat" && aiPanel.previewReady
+                enabled: visible && !aiPanel.running && aiPanel.owner.pendingCommands === 0
+                text: qsTr("Send question"); icon.source: "qrc:/icons/arrow-up.svg"
+                Layout.alignment: Qt.AlignRight
+                onClicked: { app.sendAi(aiPanel.owner, aiPanel.plan); payload.close(); }
             }
         }
     }

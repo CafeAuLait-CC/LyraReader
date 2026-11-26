@@ -13,6 +13,8 @@ AiReadingScrollView {
     readonly property bool active: !!viewState.running && viewState.responseView === "chat"
     signal citation(string link, var plan)
     signal keepNote(string source)
+    signal retry()
+    property string statusMessage: ""
     clip: true
     function followAnswer() {
         if (!visible || !followTail) return;
@@ -47,64 +49,113 @@ AiReadingScrollView {
         if (verticalBarPressed) followTail = false;
         else if (contentItem && contentItem.atYEnd) followTail = true;
     }
+    component QuestionBubble: Rectangle {
+        required property string questionText
+        required property string labelName
+        Layout.alignment: Qt.AlignRight
+        Layout.preferredWidth: Math.min(conversation.availableWidth - 18, question.implicitWidth + 20)
+        implicitHeight: question.implicitHeight + 20
+        radius: 10; color: app.colors.selectedBg
+        TextArea {
+            id: question
+            objectName: parent.labelName
+            x: 10; y: 10; width: parent.width - 20
+            text: parent.questionText
+            textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
+            readOnly: true; selectByMouse: true; selectByKeyboard: true
+            activeFocusOnTab: false
+            padding: 0; background: null; color: app.colors.selectedFg; font.pixelSize: 14
+            Accessible.name: qsTr("Question")
+        }
+    }
     ColumnLayout {
         width: conversation.availableWidth
-        spacing: 12
+        spacing: 16
         Repeater {
             model: conversation.viewState.chatTurns || []
             ColumnLayout {
+                id: turn
                 required property var modelData
                 required property int index
-                Layout.fillWidth: true
-                Rectangle {
-                    Layout.fillWidth: true; implicitHeight: question.implicitHeight + 16; radius: 6; color: app.colors.accentSoft
-                    Label { id: question; anchors.fill: parent; anchors.margins: 8; text: modelData.question; textFormat: Text.PlainText; wrapMode: Text.Wrap; color: app.colors.textPrimary }
-                }
-                Label {
-                    text: modelData.state === "archived" ? qsTr("Saved exchange")
-                          : modelData.state === "cancelled" ? qsTr("Cancelled · partial answer")
-                          : modelData.state === "failed" ? qsTr("Request failed")
-                          : modelData.state === "partial" ? qsTr("Partial answer") : qsTr("Completed")
-                    color: app.colors.textSecondary; font.pixelSize: 11
+                Layout.fillWidth: true; spacing: 10
+                QuestionBubble { questionText: turn.modelData.question; labelName: "aiChatQuestion" + turn.index }
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 8
+                    LyraToolButton { symbol: "lyra-quill"; icon.color: app.colors.accent; implicitWidth: 16; implicitHeight: 16; padding: 0; focusPolicy: Qt.NoFocus; hoverEnabled: false; Accessible.ignored: true; background: null }
+                    Label { text: qsTr("Lyra"); color: app.colors.accent; font.pixelSize: 11; font.weight: Font.DemiBold }
+                    Item { Layout.fillWidth: true }
+                    LyraToolButton {
+                        objectName: "keepAiChatNote" + turn.index
+                        symbol: "note-add"; text: qsTr("Keep in notes")
+                        visible: !!turn.modelData.note_source && turn.modelData.state === "finished"
+                        enabled: visible && !conversation.owner.readingNoteDraft.id && !conversation.owner.pendingCommands
+                        onClicked: conversation.keepNote(turn.modelData.note_source)
+                    }
+                    LyraToolButton {
+                        objectName: "copyAiChatAnswer" + turn.index
+                        symbol: "copy"; text: qsTr("Copy answer")
+                        visible: !!turn.modelData.answer
+                        onClicked: if (app.session) app.session.copyText(turn.modelData.answer)
+                    }
                 }
                 AiResult {
-                    Layout.fillWidth: true; app: conversation.app; answerName: "aiHistoryAnswer" + index; showSources: true; viewport: conversation.contentItem
-                    value: ({output: modelData.answer, reasoning: modelData.reasoning, usage: modelData.usage, generation: modelData.generation, responsePlan: {action: "DocumentChat", sources: modelData.sources || []}})
+                    Layout.fillWidth: true; app: conversation.app; answerName: "aiHistoryAnswer" + turn.index
+                    showSources: true; inlineConversation: true; bodySize: 14; viewport: conversation.contentItem
+                    value: ({output: turn.modelData.answer, reasoning: turn.modelData.reasoning, usage: turn.modelData.usage, generation: turn.modelData.generation,
+                             responsePlan: {action: "DocumentChat", sources: turn.modelData.sources || []}})
                     onKeyboardNavigation: function(key) {
-                    if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
+                        if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
+                    }
+                    onCitation: function(link, plan) { conversation.citation(link, plan); }
                 }
-                onCitation: function(link, plan) { conversation.citation(link, plan); }
+                Label {
+                    visible: ["cancelled", "failed", "partial", "archived"].indexOf(turn.modelData.state) >= 0
+                    text: turn.modelData.state === "archived" ? qsTr("Saved exchange") : turn.modelData.state === "cancelled" ? qsTr("Cancelled · partial answer")
+                        : turn.modelData.state === "failed" ? qsTr("Request failed") : qsTr("Partial answer")
+                    color: app.colors.textSecondary; font.pixelSize: 11
                 }
-                Button {
-                    objectName: "keepAiChatNote" + index
-                    text: qsTr("Keep as note")
-                    visible: !!modelData.note_source && modelData.state === "finished"
-                    enabled: visible && !conversation.owner.readingNoteDraft.id
-                    onClicked: conversation.keepNote(modelData.note_source)
+                RowLayout {
+                    visible: ["cancelled", "failed"].indexOf(turn.modelData.state) >= 0
+                    Layout.fillWidth: true
+                    Button {
+                        objectName: "retryAiChatTurn" + turn.index
+                        text: qsTr("Retry")
+                        enabled: turn.index === (conversation.viewState.chatTurns || []).length - 1 && !conversation.active && !!conversation.viewState.planSent
+                            && !!conversation.viewState.plan && !conversation.owner.pendingCommands && turn.modelData.generation === conversation.owner.documentGeneration
+                        onClicked: conversation.retry()
+                    }
+                    Label { Layout.fillWidth: true; text: qsTr("Sends the same previewed question again."); wrapMode: Text.Wrap; color: app.colors.textSecondary; font.pixelSize: 11 }
                 }
-                Rectangle { Layout.fillWidth: true; height: 1; color: app.colors.separator }
+
             }
         }
         ColumnLayout {
             visible: conversation.active
-            Layout.fillWidth: true
-            Rectangle {
-                Layout.fillWidth: true; implicitHeight: activeQuestion.implicitHeight + 16; radius: 6; color: app.colors.accentSoft
-                Label { id: activeQuestion; anchors.fill: parent; anchors.margins: 8; text: conversation.viewState.activeQuestion || ""; textFormat: Text.PlainText; wrapMode: Text.Wrap; color: app.colors.textPrimary }
+            Layout.fillWidth: true; spacing: 10
+            QuestionBubble { questionText: conversation.viewState.activeQuestion || ""; labelName: "aiStreamingChatQuestion" }
+            RowLayout {
+                spacing: 8
+                LyraToolButton { symbol: "lyra-quill"; icon.color: app.colors.accent; implicitWidth: 16; implicitHeight: 16; padding: 0; focusPolicy: Qt.NoFocus; hoverEnabled: false; Accessible.ignored: true; background: null }
+                Label { text: qsTr("Lyra"); color: app.colors.accent; font.pixelSize: 11; font.weight: Font.DemiBold }
             }
             AiResult {
-                Layout.fillWidth: true; app: conversation.app; answerName: "aiStreamingChatAnswer"; showSources: true; viewport: conversation.contentItem
-                value: ({output: conversation.viewState.output, reasoning: conversation.viewState.reasoning, usage: conversation.viewState.usage, responsePlan: conversation.viewState.responsePlan, generation: app.currentReader.documentGeneration})
+                Layout.fillWidth: true; app: conversation.app; answerName: "aiStreamingChatAnswer"
+                showSources: true; inlineConversation: true; bodySize: 14; viewport: conversation.contentItem
+                value: ({output: conversation.viewState.output, reasoning: conversation.viewState.reasoning, usage: conversation.viewState.usage,
+                         responsePlan: conversation.viewState.responsePlan, generation: app.currentReader.documentGeneration})
                 onKeyboardNavigation: function(key) {
                     if ([Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Home].indexOf(key) >= 0) conversation.followTail = false;
                 }
                 onCitation: function(link, plan) { conversation.citation(link, plan); }
             }
+            Label { text: conversation.viewState.output ? qsTr("%1 characters received").arg(conversation.viewState.output.length) : qsTr("Waiting for the first token…"); font.pixelSize: 10; color: app.colors.textSecondary }
         }
-        Label {
+        Label { visible: !!conversation.statusMessage; text: conversation.statusMessage; textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 11 }
+        ColumnLayout {
             visible: !(conversation.viewState.chatTurns || []).length && !conversation.active
-            text: qsTr("Ask a question about this document. Preview the passages and request before sending.")
-            Layout.fillWidth: true; textFormat: Text.PlainText; wrapMode: Text.Wrap; color: app.colors.textSecondary
+            Layout.fillWidth: true; spacing: 8
+            Label { text: qsTr("Ask the whole document"); font.pixelSize: 14; font.weight: Font.DemiBold; color: app.colors.textPrimary; wrapMode: Text.Wrap; Layout.fillWidth: true }
+            Label { text: qsTr("Ask a question. Answers link back to passages in this document."); font.pixelSize: 12; color: app.colors.textSecondary; wrapMode: Text.Wrap; Layout.fillWidth: true }
         }
     }
 }
