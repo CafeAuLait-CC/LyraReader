@@ -4855,6 +4855,66 @@ private slots:
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),archived);
     }
 
+    void readingSourceCardsSelectAndCopyCanonicalNativeRanges_data() {
+        QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("dark")<<true;
+    }
+    void readingSourceCardsSelectAndCopyCanonicalNativeRanges() {
+        QFETCH(bool,dark);
+        QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
+        RecordingClipboardWorkspace workspace;QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const auto close=qScopeGuard([&]{window->close();});window->resize(900,700);window->setProperty("appearance",dark?"dark":"light");
+        const QString raw=QString::fromUtf8("A\r\n中文\rB\nemoji 👩‍🔬 é\u2028line\u2029paragraph\u00a0end");
+        QQmlComponent component(&engine,QUrl("qrc:/qml/AiSelectionExcerpt.qml"));
+        QScopedPointer<QObject> object(component.createWithInitialProperties({{"app",QVariant::fromValue(window)},
+            {"title","Synthetic selected passage"},{"text",raw},{"range",QVariantMap{{"page",0},{"start",0},{"end",1}}},
+            {"prepared",true},{"labelName","nativeSourceFixture"}}));
+        QVERIFY2(object,qPrintable(component.errorString()));auto *card=qobject_cast<QQuickItem *>(object.data());QVERIFY(card);
+        card->setParentItem(window->contentItem());card->setX(40);card->setY(160);card->setWidth(320);card->setZ(100);
+        auto *canonical=visualItem(card,"nativeSourceFixture"),*area=visualItem(card,"nativeSourceFixtureText");QVERIFY(canonical && area);
+        QTRY_COMPARE(canonical->property("text").toString(),raw);
+        auto *quick=area->property("textDocument").value<QQuickTextDocument *>();QVERIFY(quick && quick->textDocument());
+        const auto native=quick->textDocument()->toRawText();QVERIFY(native!=raw);
+        QVERIFY(area->property("readOnly").toBool() && area->property("selectByMouse").toBool() && area->property("selectByKeyboard").toBool());
+        ReadingTextGeometry geometry;
+        QCOMPARE(geometry.sourceSelection(quick,raw,0,int(native.size())).value("text").toString(),raw);
+        QCOMPARE(geometry.sourceSelection(quick,raw,2,0).value("text").toString(),QString("A\r\n"));
+        QVERIFY(geometry.sourceSelection(quick,raw+"changed",0,int(native.size())).contains("error"));
+        QVERIFY(geometry.sourceSelection(quick,raw,-1,0).contains("error"));
+        QVERIFY(geometry.sourceSelection(quick,raw,0,int(native.size())+1).contains("error"));
+        const auto emoji=native.indexOf(QString::fromUtf8("👩"));QVERIFY(emoji>=0);
+        QVERIFY(geometry.sourceSelection(quick,raw,int(emoji)+1,int(emoji)+2).contains("error"));
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        area->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(area->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QTest::keyClick(window,Qt::Key_C,Qt::ControlModifier);
+        QTRY_COMPARE(workspace.copies,1);QCOMPARE(workspace.copied,raw);
+        QVERIFY(area->setProperty("cursorPosition",0));
+        QTest::keyClick(window,Qt::Key_Right,Qt::ShiftModifier);QTest::keyClick(window,Qt::Key_Right,Qt::ShiftModifier);
+        QTRY_COMPARE(area->property("selectionEnd").toInt(),2);
+        QTest::keyClick(window,Qt::Key_C,Qt::ControlModifier);QTRY_COMPARE(workspace.copies,2);QCOMPARE(workspace.copied,QString("A\r\n"));
+        auto *menu=card->findChild<QObject *>("nativeSourceFixtureMenu");QVERIFY(menu);
+        QTest::keyClick(window,Qt::Key_Menu);QTRY_VERIFY(menu->property("opened").toBool());
+        QVERIFY(menu->setProperty("currentIndex",0));
+        auto *copy=qobject_cast<QQuickItem *>(card->findChild<QObject *>("nativeSourceFixtureCopy"));QVERIFY(copy && copy->window());
+        auto *menuWindow=copy->window();menuWindow->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),menuWindow);
+        copy->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(menuWindow,Qt::Key_Return);QTRY_COMPARE(workspace.copies,3);QCOMPARE(workspace.copied,QString("A\r\n"));
+        QTRY_VERIFY(!menu->property("visible").toBool());
+        // Recreated DTO objects for the same range must not clear a native selection.
+        QVERIFY(card->setProperty("range",QVariant::fromValue(engine.evaluate("({page:0,start:0,end:1})"))));
+        QCOMPARE(area->property("selectionEnd").toInt(),2);
+        area->forceActiveFocus(Qt::TabFocusReason);
+        QTest::mouseClick(window,Qt::RightButton,Qt::NoModifier,area->mapToScene(QPointF(8,8)).toPoint());
+        QTRY_VERIFY(menu->property("opened").toBool());
+        workspace.newTab();QTRY_VERIFY(!menu->property("visible").toBool());
+        QTRY_COMPARE(area->property("selectionStart").toInt(),area->property("selectionEnd").toInt());
+        QCOMPARE(workspace.copies,3);QCOMPARE(canonical->property("text").toString(),raw);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-source-copy-"+(dark?QString("dark"):QString("light"))+".png"));
+    }
+
     void inlineReadingDisclosuresUseNativeGlyphBoundariesAndLeaveAttachmentsIntact() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*")));
         NativeCorpus::Viewer view;QVERIFY(view.window);view.window->resize(700,600);

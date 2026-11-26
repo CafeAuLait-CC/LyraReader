@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import LyraReader 1.0
 
 Pane {
     id: card
@@ -14,6 +15,23 @@ Pane {
     property bool partial: false
     property bool expanded: false
     property string fullText: ""
+    readonly property string rangeIdentity: range ? [range.page, range.start, range.end].join(":") : ""
+    readonly property var owner: app.currentReader
+    readonly property double ownerGeneration: owner ? owner.documentGeneration : 0
+    function resetTextSelection() {
+        if (excerptDisplay) excerptDisplay.deselect();
+        if (sourceMenu) sourceMenu.close();
+    }
+    function copySelection() {
+        if (!app.session || excerptDisplay.selectionStart === excerptDisplay.selectionEnd) return;
+        const selected = sourceGeometry.sourceSelection(excerptDisplay.textDocument, excerptLabel.text,
+            excerptDisplay.selectionStart, excerptDisplay.selectionEnd);
+        if (selected.error !== undefined) { app.operationStatus = selected.error; return; }
+        app.session.copyText(selected.text);
+    }
+    ReadingTextGeometry { id: sourceGeometry }
+    onOwnerChanged: resetTextSelection()
+    onOwnerGenerationChanged: resetTextSelection()
     function toggleExcerpt() {
         if (!expanded && partial && !prepared && range) {
             const excerpt = app.selectedTextResult(range);
@@ -22,8 +40,8 @@ Pane {
         }
         expanded = !expanded;
     }
-    onTextChanged: { expanded = false; fullText = ""; }
-    onRangeChanged: { expanded = false; fullText = ""; }
+    onTextChanged: { expanded = false; fullText = ""; resetTextSelection(); }
+    onRangeIdentityChanged: { expanded = false; fullText = ""; resetTextSelection(); }
     Layout.fillWidth: true; Layout.minimumWidth: 0
     padding: 12
     background: Rectangle { radius: 8; color: "transparent"; border.color: app.colors.separator }
@@ -64,17 +82,47 @@ Pane {
                         width: parent.width
                         padding: 0; background: null; focusPolicy: Qt.NoFocus
                         font.pixelSize: 13
-                        Accessible.role: Accessible.StaticText
-                        Accessible.name: card.title; Accessible.description: text
+                        Accessible.ignored: true
                         contentItem: TextArea {
                             id: excerptDisplay
+                            objectName: card.labelName + "Text"
                             text: excerptLabel.text; font: excerptLabel.font
                             padding: 0; background: null
-                            readOnly: true; selectByMouse: false; selectByKeyboard: false
-                            focusPolicy: Qt.NoFocus
+                            readOnly: true; selectByMouse: true; selectByKeyboard: true
+                            focusPolicy: Qt.StrongFocus
                             textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
                             color: app.colors.textSecondary
-                            Accessible.ignored: true
+                            Accessible.name: card.title
+                            Keys.onShortcutOverride: function(event) {
+                                if (event.matches(StandardKey.Copy) || event.key === Qt.Key_Menu
+                                        || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) event.accepted = true;
+                            }
+                            Keys.onPressed: function(event) {
+                                if (event.matches(StandardKey.Copy)) { card.copySelection(); event.accepted = true; }
+                                else if (event.key === Qt.Key_Menu
+                                        || (event.key === Qt.Key_F10 && (event.modifiers & Qt.ShiftModifier))) {
+                                    sourceMenu.popup(0, Math.min(excerptPreview.visibleHeight,
+                                        Math.max(0, cursorRectangle.y + cursorRectangle.height)));
+                                    event.accepted = true;
+                                }
+                            }
+                            ContextMenu.menu: Menu {
+                                id: sourceMenu
+                                objectName: card.labelName + "Menu"
+                                parent: excerptDisplay
+                                MenuItem {
+                                    objectName: card.labelName + "Copy"
+                                    text: qsTr("Copy")
+                                    enabled: excerptDisplay.selectionStart !== excerptDisplay.selectionEnd
+                                    onTriggered: card.copySelection()
+                                }
+                                MenuItem {
+                                    objectName: card.labelName + "SelectAll"
+                                    text: qsTr("Select All")
+                                    enabled: excerptDisplay.length > 0
+                                    onTriggered: excerptDisplay.selectAll()
+                                }
+                            }
                         }
                     }
                 }

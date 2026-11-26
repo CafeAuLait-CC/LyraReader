@@ -10,6 +10,40 @@
 #include <QThread>
 #include <cmath>
 
+QVariantMap ReadingTextGeometry::sourceSelection(QObject *document, const QString &source,
+                                               int start, int end) const {
+    const auto changed = [this] {
+        return QVariantMap{{QStringLiteral("error"), tr("The displayed passage changed. Select it again before copying.")}};
+    };
+    auto *quick = qobject_cast<QQuickTextDocument *>(document);
+    if (!quick || quick->thread() != QThread::currentThread() || !quick->textDocument()) return changed();
+    // toRawText keeps NBSP and native line/paragraph separators. toPlainText
+    // would lose their distinction and cannot validate a canonical source.
+    const auto native = quick->textDocument()->toRawText();
+    const auto first = qMin(start, end), last = qMax(start, end);
+    if (first < 0 || last > native.size()) return changed();
+    qsizetype position = 0, rawFirst = -1, rawLast = -1;
+    for (qsizetype raw = 0; raw < source.size();) {
+        if (position == first) rawFirst = raw;
+        if (position == last) rawLast = raw;
+        auto character = source.at(raw++);
+        if (character == QLatin1Char('\r')) {
+            if (raw < source.size() && source.at(raw) == QLatin1Char('\n')) ++raw;
+            character = QChar::ParagraphSeparator;
+        } else if (character == QLatin1Char('\n')) character = QChar::ParagraphSeparator;
+        if (position >= native.size() || native.at(position++) != character) return changed();
+    }
+    if (position != native.size()) return changed();
+    if (position == first) rawFirst = source.size();
+    if (position == last) rawLast = source.size();
+    const auto splitsSurrogate = [&](qsizetype offset) {
+        return offset > 0 && offset < source.size() && source.at(offset).isLowSurrogate()
+            && source.at(offset - 1).isHighSurrogate();
+    };
+    if (rawFirst < 0 || rawLast < rawFirst || splitsSurrogate(rawFirst) || splitsSurrogate(rawLast)) return changed();
+    return {{QStringLiteral("text"), source.mid(rawFirst, rawLast - rawFirst)}};
+}
+
 QVariantMap ReadingTextGeometry::tail(QObject *document, double limit, int maximumLines,
                                     double actionWidth, double availableWidth) const {
     QVariantMap result{{QStringLiteral("measured"), false}};
