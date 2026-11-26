@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 19;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 20;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -17,6 +17,7 @@ double lyra_reader_desktop_paper_shifted_scroll(double source_y,double gap_top,d
 struct LyraReaderDesktopDocument;
 struct LyraReaderRenderSource;
 struct LyraReaderDesktopHistory;
+struct LyraReaderDesktopTerm;
 struct LyraReaderBuffer { std::uint8_t *data; std::size_t len; };
 struct LyraReaderDesktopChatGptAuth;
 // Bind only a local browser callback. Poll 0 while pending, 1 for the one vault
@@ -95,6 +96,12 @@ bool lyra_reader_desktop_history_command(const LyraReaderDesktopHistory *history
 LyraReaderDesktopDocument *lyra_reader_desktop_open(const std::uint8_t *path, std::size_t path_len,
     const std::uint8_t *password, std::size_t password_len, LyraReaderBuffer *error);
 void lyra_reader_desktop_close(LyraReaderDesktopDocument *document);
+// Worker-only ephemeral popover: owns a frozen working revision and a separate audited request.
+// Keep the document alive through new; free once, on a worker, after all command borrows end.
+LyraReaderDesktopTerm *lyra_reader_desktop_term_new(const LyraReaderDesktopDocument *,LyraReaderBuffer *error);
+bool lyra_reader_desktop_term_command(const LyraReaderDesktopTerm *,const std::uint8_t *request,
+    std::size_t request_len,LyraReaderBuffer *output,LyraReaderBuffer *error);
+void lyra_reader_desktop_term_free(LyraReaderDesktopTerm *);
 // Worker-only batch decision; all handles stay alive through the call. Resolution
 // 0=save, 1=discard. No draft is deleted. The owned JSON receipt can cancel this
 // exact decision if the UI epoch changes; error/output start empty and are freed once.

@@ -4,6 +4,7 @@ use crate::document::DesktopDocument;
 use crate::document_cache::{DocumentCache, atomic_write, lock_reading_workspace, read_optional};
 use lyra_reader_ai::workspace::{
     ReadingRecord, ReadingWorkspace, TranslationBlock, reading_scope_key, translation_blocks,
+    translation_terms,
 };
 use lyra_reader_ffi::api::{
     AiActionRecord, AiPlanRecord, AiPlanRequestRecord, AiSelectionRecord, AiSourceRecord,
@@ -616,11 +617,12 @@ fn translation_entry_value(
         .filter(|page| verified && *page > 0 && *page <= page_count)
         .collect();
     let can_replay = !record.source_hash.is_empty() && record.status != "sourceChanged";
+    let terms = translation_terms(&record.originals);
     if record.status == "partial" || record.originals.is_empty() {
         return Ok(
             json!({"id":record.id,"language":record.language,"status":record.status,
             "can_replay":can_replay,"content":record.content,"blocks":[],
-            "selection":selection,"source_pages":source_pages}),
+            "selection":selection,"source_pages":source_pages,"terms":terms}),
         );
     }
     let (rows, warning) =
@@ -637,7 +639,7 @@ fn translation_entry_value(
     Ok(
         json!({"id":record.id,"language":record.language,"status":record.status,
         "can_replay":can_replay,"content":record.content,"blocks":rows,"warning":warning,
-        "selection":selection,"source_pages":source_pages}),
+        "selection":selection,"source_pages":source_pages,"terms":terms}),
     )
 }
 

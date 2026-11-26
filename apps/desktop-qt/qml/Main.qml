@@ -1979,7 +1979,15 @@ ApplicationWindow {
             session.credentials.remove(account);
     }
     function startPreparedAi(owner,key,plan,purpose,token) {
+        if(purpose==="term")return owner.startAiTerm(key,plan);
         return purpose==="document-reading" ? owner.startDocumentReading(key,plan,token) : owner.startAi(key,plan);
+    }
+    function abandonTermCredential(owner,plan) {
+        if(pendingAiPurpose==="term" && pendingAiReader===owner && plan && plan.term_token
+                && pendingAiPlan && pendingAiPlan.term_token===plan.term_token) {
+            if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
+            credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;pendingAiToken="";
+        }
     }
     function sendAi(owner, plan, purpose, token) {
         if (!owner || !plan)
@@ -2013,6 +2021,7 @@ ApplicationWindow {
             const accounts = root.session.chatGptAccounts;
             for (const tab of root.session.tabs) {
                 const reader = tab.reader;
+                reader.readingTerm.cancel();
                 const state = reader.aiState;
                 if (state.running && state.responsePlan && state.responsePlan.chatgpt_account
                         && state.responsePlan.kind !== "inplace_translation" && state.responseView !== "summary_batch")
@@ -2038,10 +2047,12 @@ ApplicationWindow {
         credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;
         if (session)
             for (const tab of session.tabs) {
+                tab.reader.readingTerm.cancel();
                 tab.reader.invalidateAiPlan();
                 tab.reader.invalidateDocumentReadingPreview();
             }
         else if (currentReader) {
+            currentReader.readingTerm.cancel();
             currentReader.invalidateAiPlan();
             currentReader.invalidateDocumentReadingPreview();
         }

@@ -33,6 +33,7 @@ mod session;
 mod summary;
 mod summary_batch;
 mod summary_store;
+mod term;
 mod tile_plan;
 mod translation;
 use document::DesktopDocument as Document;
@@ -45,7 +46,69 @@ use std::{
 /// Version of the Qt boundary, including cache-only text selection geometry.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    19
+    20
+}
+
+/// Worker-only immutable capture for an independent term popover.
+/// # Safety
+/// Document is alive and aligned throughout this call. Error is writable and empty.
+/// Free the returned owner once with term_free, after every command borrow has ended.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_term_new(
+    document: *const Document,
+    error: *mut Buffer,
+) -> *mut term::TermService {
+    // SAFETY: the native owner retains the document and the distinct empty error buffer.
+    unsafe {
+        run(error, || {
+            let document = document.as_ref().ok_or("No document is open.")?;
+            Ok(Box::into_raw(Box::new(term::TermService::new(document)?)))
+        })
+        .unwrap_or(ptr::null_mut())
+    }
+}
+
+/// # Safety
+/// Term is null or the unique owner returned by term_new, with no outstanding borrows.
+/// Retire on a worker: the last frozen PDF/revision lease can perform native cleanup.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_term_free(term: *mut term::TermService) {
+    if !term.is_null() {
+        // SAFETY: ownership is returned exactly once after every synchronous command.
+        drop(unsafe { Box::from_raw(term) });
+    }
+}
+
+/// # Safety
+/// Term is null (rejected) or alive/aligned; request spans its readable byte length.
+/// Output/error are distinct writable empty buffers, each retired once with buffer_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_term_command(
+    term: *const term::TermService,
+    request: *const u8,
+    request_len: usize,
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: the caller retains all owners and satisfies the documented slice/buffer contracts.
+    unsafe {
+        run(error, || {
+            if request_len > 8 * 1024 * 1024 {
+                return Err("The term request exceeds its supported byte size.".into());
+            }
+            if output.is_null() {
+                return Err("The term response buffer is missing.".into());
+            }
+            let term = term.as_ref().ok_or("The term explanation is closed.")?;
+            let request = serde_json::from_slice(bytes(request, request_len)?)
+                .map_err(|error| error.to_string())?;
+            output.write(Buffer::owned(
+                serde_json::to_vec(&term.command(request)?).map_err(|error| error.to_string())?,
+            ));
+            Ok(())
+        })
+        .is_some()
+    }
 }
 
 /// Persist one resolved quit without deleting any draft. Resolution: 0=save, 1=discard.
@@ -1559,7 +1622,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 19);
+        assert_eq!(lyra_reader_desktop_abi_version(), 20);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

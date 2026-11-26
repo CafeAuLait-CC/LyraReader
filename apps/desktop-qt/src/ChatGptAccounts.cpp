@@ -1,6 +1,7 @@
 #include "ChatGptAccounts.h"
 
 #include "ReaderController.h"
+#include "ReadingTermController.h"
 
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -399,7 +400,7 @@ bool ChatGptAccounts::allowsPlan(const QVariantMap &plan,const QString &readingT
     const auto scope=plan.value(QStringLiteral("reading_scope")).toMap();
     const bool selected=!scope.value(QStringLiteral("selection")).toMap().isEmpty();
     const bool selectionTask=selected && (kind==QStringLiteral("reading_summary_selection") || kind==QStringLiteral("reading_translation"));
-    const bool wholeTask=kind==QStringLiteral("reading_summary") || kind==QStringLiteral("summary_synthesis")
+    const bool wholeTask=kind==QStringLiteral("reading_summary") || kind==QStringLiteral("summary_synthesis") || kind==QStringLiteral("reading_term")
         || (kind==QStringLiteral("reading_translation") && !selected);
     const bool layered=action==QStringLiteral("SummarizeAbstract") || action==QStringLiteral("SummarizeSection")
         || action==QStringLiteral("SummarizePageLine");
@@ -416,7 +417,10 @@ bool ChatGptAccounts::allowsPlan(const QVariantMap &plan,const QString &readingT
 bool ChatGptAccounts::send(ReaderController *reader,const QVariantMap &plan,const QString &readingToken) {
     const QPointer<ReaderController> alive(reader);
     if(!alive || busy() || !reloadPreferences() || !alive || busy() || !allowsPlan(plan,readingToken))return false;
-    const auto prepared=readingToken.isEmpty()?reader->aiState():reader->documentReading();
+    const auto *term=qobject_cast<ReadingTermController *>(reader->readingTerm());
+    const bool termPlan=readingToken.isEmpty() && plan.value(QStringLiteral("kind"))==QStringLiteral("reading_term");
+    if(termPlan && (!term || !term->canStart(plan)))return false;
+    const auto prepared=!readingToken.isEmpty()?reader->documentReading() : termPlan?term->state():reader->aiState();
     if(prepared.value(QStringLiteral("plan")).toMap()!=plan || !lockAccount(m_selected))return false;
     m_vault.clearSession();
     m_pendingReader=alive;

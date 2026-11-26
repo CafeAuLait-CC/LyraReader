@@ -32,6 +32,21 @@ impl Drop for OwnedDirectory {
     }
 }
 impl RenderSource {
+    pub(super) fn prepare_term(
+        &self,
+        request: AiPlanRequestRecord,
+    ) -> Result<AiPlanRecord, LyraReaderFfiError> {
+        self.engine.prepare_ai_reading_task(
+            request,
+            AiReadingOptionsRecord {
+                kind: "term".into(),
+                detail: "Standard".into(),
+            },
+        )
+    }
+    pub(super) fn source_sha256(&self) -> String {
+        self.engine.document_identity().sha256
+    }
     pub fn new(document: &DesktopDocument, include_edits: bool) -> Result<Self, String> {
         let edits = document
             .edits

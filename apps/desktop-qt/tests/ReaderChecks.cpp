@@ -4,6 +4,7 @@
 #include "ReadingMarkdown.h"
 #include "ReadingScrollMemory.h"
 #include "ReadingSourceHighlight.h"
+#include "ReadingTermController.h"
 #include <QFutureWatcher>
 #include "AuditController.h"
 #include "NavigationController.h"
@@ -76,6 +77,7 @@
 #include <QSettings>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <QContextMenuEvent>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -5085,6 +5087,223 @@ TextArea { width: 230; font.family: "serif"; font.pixelSize: 18; padding: 0; wra
         QTRY_VERIFY(area->property("contentHeight").toDouble()>50);auto *document=area->property("textDocument").value<QQuickTextDocument *>();QVERIFY(document);
         const auto attachment=geometry.tail(document,area->property("contentHeight").toDouble()+1,0,60,area->width());QVERIFY(attachment.value("measured").toBool());QVERIFY(!attachment.value("inline").toBool());
         QVERIFY(!geometry.tail(nullptr,180,3,60,230).value("measured").toBool());QVERIFY(!geometry.tail(document,-1,3,60,230).value("measured").toBool());QVERIFY(!geometry.tail(document,180,3,60,std::numeric_limits<double>::quiet_NaN()).value("measured").toBool());
+    }
+
+    void termControlPacketsRejectMalformedInputWithoutMutatingTheOwner() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("term-control.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto old=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",old);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader.pageCount()==1 && !reader.loading() && !reader.pendingCommands());
+        const auto document=reader.documentHandle();
+        auto future=QtConcurrent::run([document] {
+            LyraReaderBuffer error{};auto *closed=lyra_reader_desktop_term_new(nullptr,&error);
+            const bool rejected=!closed && error.len>0;lyra_reader_desktop_buffer_free(error);if(!rejected)return QString("Closed parent was accepted");
+            error={};auto *term=lyra_reader_desktop_term_new(document.get(),&error);
+            lyra_reader_desktop_buffer_free(error);if(!term)return QString("Synthetic source could not be captured");
+            const auto cleanup=qScopeGuard([&]{lyra_reader_desktop_term_free(term);});
+            const QList<QByteArray> packets{QByteArray("{"),QByteArray(1,char(0xff)),QByteArray("[]"),
+                QByteArray("{\"op\":\"start\",\"plan\":{}}"),QByteArray(8*1024*1024+1,'x')};
+            for(const auto &packet:packets) {
+                LyraReaderBuffer output{},failure{};
+                const bool ok=lyra_reader_desktop_term_command(term,reinterpret_cast<const std::uint8_t *>(packet.constData()),std::size_t(packet.size()),&output,&failure);
+                const bool protectedOutput=!ok && !output.data && output.len==0 && failure.len>0;
+                lyra_reader_desktop_buffer_free(output);lyra_reader_desktop_buffer_free(failure);
+                if(!protectedOutput)return QString("Malformed control packet changed the output or hid its failure");
+            }
+            lyra_reader_desktop_term_free(nullptr);return QString{};
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(future.isFinished(),10000);QVERIFY2(future.result().isEmpty(),qPrintable(future.result()));
+        QVERIFY(reader.aiState().isEmpty() || !reader.aiState().value("running").toBool());QVERIFY(!reader.hasUnsavedChanges());
+    }
+
+    void translationTermsUseAnIndependentReviewedPopover_data() {
+        QTest::addColumn<bool>("dark");QTest::newRow("wide-light")<<false;QTest::newRow("narrow-dark")<<true;
+    }
+    void translationTermsUseAnIndependentReviewedPopover() {
+        QFETCH(bool,dark);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property).*"));
+        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-term.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto old=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",old);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        const auto size=dark?QSize(700,600):QSize(1200,820);window->setMaximumSize(size);window->resize(size);window->setProperty("appearance",dark?"dark":"light");
+        window->setProperty("reduceMotion",false);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-term-ui"}});
+        const auto oldWhole=view.workspace.chatGptAccounts()->useForWholeDocument();
+        const auto restoreAccount=qScopeGuard([&]{view.workspace.chatGptAccounts()->setUseForWholeDocument(oldWhole);});
+        view.workspace.chatGptAccounts()->setUseForWholeDocument(false);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"translation")));
+        reader->setAiInput("translationShowOriginal",true);
+        reader->prepareAi({{"action","SummarizeDocument"},{"current_page",0},{"base_url",server.baseUrl()},{"model","synthetic-term-ui"},
+            {"language","English"},{"document_knowledge_pages",QVariantList{}},{"reasoning_mode","default"},{"reasoning_encoding","none"}},
+            {},{{"kind","translation"},{"detail","Standard"}});
+        QTRY_COMPARE(reader->pendingCommands(),0);const auto plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());
+        QCOMPARE(plan.value("parts").toList().size(),1);
+        const auto part=plan.value("parts").toList().first().toMap();QString translated;
+        const QRegularExpression marker(QStringLiteral("(?m)^\\[Paragraph (\\d+); Page (\\d+)\\]$"));
+        auto markers=marker.globalMatch(part.value("user_prompt").toString());QVERIFY(markers.hasNext());
+        while(markers.hasNext()){const auto item=markers.next();translated+=QString("<!--lyra:%1--> **Saved translation** %1 [p.%2].\n\n```text\nsynthetic_code\n```\n\n| Heading | Value |\n| --- | --- |\n| Cell | 1 |\n\n").arg(item.captured(1),item.captured(2));}
+        server.responses.append({{MockChatServer::delta({{"content",translated}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_COMPARE(server.requests.size(),1);
+        QQuickItem *row=nullptr;
+        const auto entry=[&] {row=visualItem(window->contentItem(),"aiSavedTranslationRow0");if(!row)return QVariantMap{};const auto value=row->property("entry");return value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toVariant().toMap():value.toMap();};
+        QTRY_VERIFY(entry().value("terms").toStringList().contains("LyraReader"));QVERIFY(row);
+        auto *original=visualItem(row,"aiTranslationOriginal0");QVERIFY(original && original->isVisible());
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);original->forceActiveFocus();
+        const auto point=original->mapToScene(QPointF(8,8)).toPoint();
+        QContextMenuEvent context(QContextMenuEvent::Mouse,point,window->mapToGlobal(point));QCoreApplication::sendEvent(window,&context);
+        auto *menu=row->findChild<QObject *>("aiTranslationTermsMenu0");QVERIFY(menu);QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("parent").value<QQuickItem *>(),original);
+        QList<QQuickItem *> textControls;
+        const std::function<void(QQuickItem *)> collectText=[&](QQuickItem *item){
+            if(item->objectName().startsWith("aiTranslationAnswer0") && item->objectName()!="aiTranslationAnswer0Reasoning"
+                    && item->property("textDocument").isValid())textControls.append(item);
+            for(auto *child:item->childItems())collectText(child);
+        };collectText(row);QVERIFY(textControls.size()>=6);
+        QQmlComponent menuProbe(&view.engine);
+        menuProbe.setData("import QtQml\nimport QtQuick.Controls\nQtObject { function menuFor(control) { return control.ContextMenu.menu; } }",QUrl());
+        QScopedPointer<QObject> probe(menuProbe.create());QVERIFY2(probe,qPrintable(menuProbe.errorString()));
+        for(auto *control:textControls){
+            QVariant value;QVERIFY(QMetaObject::invokeMethod(probe.get(),"menuFor",Q_RETURN_ARG(QVariant,value),Q_ARG(QVariant,QVariant::fromValue(control))));
+            auto *attached=value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toQObject():value.value<QObject *>();
+            QVERIFY2(attached==menu,qPrintable(control->objectName()+": "+value.toString()));
+        }
+        QQmlExpression selectAll(QQmlEngine::contextForObject(menu),menu,QStringLiteral("itemAt(1)"));
+        auto *selectAction=selectAll.evaluate().value<QObject *>();QVERIFY(selectAction && selectAction->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(selectAction,"triggered"));QVERIFY(!original->property("selectedText").toString().isEmpty());
+        QObject *explain=nullptr;QTRY_VERIFY((explain=menu->findChild<QObject *>("explainAiTranslationTerm0")));QVERIFY(explain->property("text").toString().contains("LyraReader"));
+        QTRY_VERIFY(explain->property("enabled").toBool());
+        reader->setAiInput("question","Unsent main draft stays unchanged");const auto main=reader->aiState();
+        QCOMPARE(main.value("input").toMap().value("question").toString(),QString("Unsent main draft stays unchanged"));
+        QVERIFY(QMetaObject::invokeMethod(explain,"triggered"));QVERIFY(QMetaObject::invokeMethod(menu,"close"));
+        auto *task=visualItem(window->contentItem(),"aiTranslationTask");QVERIFY(task);
+        auto *popup=task->findChild<QObject *>("aiTermPopup");QVERIFY(popup);QTRY_VERIFY(popup->property("opened").toBool());
+        auto *worker=reader->readingTerm();QVERIFY(worker);const auto state=[&]{return worker->property("state").toMap();};
+        QTRY_COMPARE(state().value("phase").toString(),QString("preview"));QCOMPARE(server.requests.size(),1);QCOMPARE(reader->aiState(),main);
+        QCOMPARE(qRound(popup->property("width").toDouble()),340);QCOMPARE(qRound(popup->property("height").toDouble()),300);
+        const auto prepared=state().value("plan").toMap();QCOMPARE(prepared.value("kind").toString(),QString("reading_term"));
+        auto *review=popup->findChild<QObject *>("aiTermReview");QVERIFY(review);
+        QVERIFY(QMetaObject::invokeMethod(popup,"showReview"));QTRY_VERIFY(review->property("opened").toBool());
+        auto *body=visualItem(window->contentItem(),"aiTermRequestBodies");QVERIFY(body);
+        QCOMPARE(body->property("text").toString(),prepared.value("parts").toList().first().toMap().value("wire_body").toString());
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!review->property("visible").toBool());QVERIFY(popup->property("visible").toBool());QCOMPARE(server.requests.size(),1);
+        QVERIFY(QMetaObject::invokeMethod(popup,"showReview"));QTRY_VERIFY(review->property("opened").toBool());
+        server.responses.append({{MockChatServer::delta({{"content","A concise LyraReader explanation [p.1], unverified [p.99]."}}),QByteArray("data: [DONE]\n\n")},5,200});
+        auto *send=visualItem(window->contentItem(),"sendAiTermRequest");QVERIFY(send && send->isEnabled());
+        QVERIFY(QMetaObject::invokeMethod(send,"clicked"));QTRY_COMPARE(server.requests.size(),2);
+        QTRY_COMPARE(state().value("phase").toString(),QString("done"));
+        const auto request=server.requests.last();QCOMPARE(request.mid(request.indexOf("\r\n\r\n")+4),body->property("text").toString().toUtf8());
+        QCOMPARE(state().value("sent_pages").toList(),QVariantList{1});QCOMPARE(reader->aiState(),main);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+(dark?"-term-dark.png":"-term-light.png")));
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());QTRY_VERIFY(state().isEmpty());
+        QTRY_VERIFY(original->hasActiveFocus());
+        QVERIFY(!reader->startAiTerm("local",prepared));QCOMPARE(server.requests.size(),2);QCOMPARE(reader->aiState(),main);
+        // Reopen during the outgoing fade. The old close callback must not retire the new worker.
+        QVERIFY(QMetaObject::invokeMethod(explain,"triggered"));QTRY_VERIFY(popup->property("opened").toBool());
+        QTRY_COMPARE(state().value("phase").toString(),QString("preview"));const auto firstReplacement=state().value("plan").toMap();
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QVERIFY(QMetaObject::invokeMethod(explain,"triggered"));
+        QTRY_VERIFY(popup->property("opened").toBool());QTRY_COMPARE(state().value("phase").toString(),QString("preview"));
+        QVERIFY(state().value("plan").toMap().value("term_token")!=firstReplacement.value("term_token"));
+        QVERIFY(!reader->startAiTerm("local",firstReplacement));QCOMPARE(server.requests.size(),2);
+        const auto credentialPlan=state().value("plan").toMap();
+        window->setProperty("pendingAiPurpose","term");window->setProperty("pendingAiReader",QVariant::fromValue(reader));
+        window->setProperty("pendingAiPlan",credentialPlan);window->setProperty("credentialReadId",12345.0);
+        auto *credential=window->findChild<QObject *>("aiCredentialDialog");QVERIFY(credential);
+        QVERIFY(QMetaObject::invokeMethod(credential,"open"));QTRY_VERIFY(credential->property("opened").toBool());
+        auto *key=visualItem(window->contentItem(),"requestAiCredential");QVERIFY(key);key->setProperty("text","synthetic-unsubmitted-key");
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!credential->property("visible").toBool());
+        QTRY_VERIFY(!popup->property("visible").toBool());QVERIFY(key->property("text").toString().isEmpty());
+        QVERIFY(!window->property("pendingAiReader").value<QObject *>());QCOMPARE(window->property("credentialReadId").toDouble(),-1.0);
+        QVERIFY(QMetaObject::invokeMethod(view.workspace.credentials(),"finished",Q_ARG(quint64,quint64(12345)),Q_ARG(QString,QString("read")),
+            Q_ARG(QString,QString("synthetic-late-key")),Q_ARG(QString,QString())));
+        QCOMPARE(server.requests.size(),2);QVERIFY(state().isEmpty());
+        QVERIFY(QMetaObject::invokeMethod(explain,"triggered"));QTRY_VERIFY(popup->property("opened").toBool());
+        QTRY_COMPARE(state().value("phase").toString(),QString("preview"));
+        QVERIFY(QMetaObject::invokeMethod(popup,"showReview"));QTRY_VERIFY(review->property("opened").toBool());
+        auto changedSettings=window->property("aiSettings").toMap();changedSettings.insert("model","another-synthetic-term-model");
+        window->setProperty("aiSettings",changedSettings);QTRY_VERIFY(!popup->property("visible").toBool());
+        QTRY_VERIFY(!review->property("visible").toBool());QTRY_VERIFY(state().isEmpty());QCOMPARE(server.requests.size(),2);
+        QCOMPARE(reader->aiState().value("input").toMap().value("question"),main.value("input").toMap().value("question"));
+        QCOMPARE(reader->aiState().value("output"),main.value("output"));
+        window->setProperty("reduceMotion",true);
+        QVERIFY(QMetaObject::invokeMethod(explain,"triggered"));QTRY_VERIFY(popup->property("opened").toBool());
+        QTRY_COMPARE(state().value("phase").toString(),QString("preview"));
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!popup->property("visible").toBool());QTRY_VERIFY(state().isEmpty());
+        QCOMPARE(server.requests.size(),2);
+    }
+
+    void termCancellationAndLatePreparationNeverReplaceTheMainRequest() {
+        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-term-cancel.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto old=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",old);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader.pageCount()==1 && !reader.loading() && !reader.pendingCommands());
+        QVariantMap request{{"action","DocumentChat"},{"current_page",0},{"question","Synthetic main question"},
+            {"base_url",server.baseUrl()},{"model","synthetic-term-cancel"},{"document_knowledge_pages",QVariantList{}},
+            {"reasoning_mode","default"},{"reasoning_encoding","none"}};
+        reader.prepareAi(request);QTRY_COMPARE(reader.pendingCommands(),0);const auto mainPlan=reader.aiState().value("plan").toMap();QVERIFY(!mainPlan.isEmpty());
+        server.responses.append({{MockChatServer::delta({{"content","MAIN_PARTIAL_STAYS"}}),QByteArray("data: [DONE]\n\n")},5,200,true});
+        QVERIFY(reader.startAi("local",mainPlan));QTRY_VERIFY(reader.aiState().value("output").toString().contains("MAIN_PARTIAL_STAYS"));
+        auto *term=qobject_cast<ReadingTermController *>(reader.readingTerm());QVERIFY(term);
+        request.insert("action","SummarizeDocument");request.insert("question","LyraReader");request.insert("language","English");
+        QVERIFY(term->prepare(request));QTRY_COMPARE(term->state().value("phase").toString(),QString("preview"));
+        const auto termPlan=term->state().value("plan").toMap();
+        server.responses.append({{MockChatServer::delta({{"reasoning_content","Separate synthetic reasoning"}}),MockChatServer::delta({{"content","TERM_PARTIAL_ONLY"}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},5,200,true});
+        QVERIFY(reader.startAiTerm("local",termPlan));QTRY_VERIFY(term->state().value("output").toString().contains("TERM_PARTIAL_ONLY"));
+        QTRY_VERIFY(!term->state().value("reasoning").toString().isEmpty());QTRY_VERIFY(term->state().contains("usage"));
+        QCOMPARE(term->state().value("phase").toString(),QString("running"));QTRY_COMPARE(server.activeConnections(),2);
+        term->dismiss();QVERIFY(!reader.startAiTerm("local",termPlan));QCOMPARE(term->state().value("output").toString(),QString("TERM_PARTIAL_ONLY"));
+        QTRY_COMPARE(server.activeConnections(),1);QVERIFY(reader.aiState().value("running").toBool());
+        QVERIFY(reader.aiState().value("output").toString().contains("MAIN_PARTIAL_STAYS"));
+        QVERIFY(term->prepare(request));term->cancel();QTest::qWait(150);QVERIFY(term->state().isEmpty());QCOMPARE(server.requests.size(),2);
+        QVERIFY(reader.aiState().value("running").toBool());
+        QVERIFY(term->prepare(request));reader.openFile(QUrl::fromLocalFile(path));
+        QTRY_VERIFY(reader.pageCount()==1 && !reader.loading() && !reader.pendingCommands());QTest::qWait(150);
+        QVERIFY(term->state().isEmpty());QVERIFY(!reader.startAiTerm("local",termPlan));QCOMPARE(server.requests.size(),2);
+        QTRY_COMPARE(server.activeConnections(),0);
+    }
+
+    void termChatGptAdmissionUsesItsOwnPreviewAndKeepsTheExistingGrant() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-term-chatgpt.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        auto *accounts=view.workspace.chatGptAccounts();QSettings settings;
+        const QString roster="chatGptPlan/accounts",selected="chatGptPlan/selected",whole="chatGptPlan/useForWholeDocument";
+        const auto previousRoster=settings.value(roster),previousSelected=settings.value(selected),previousWhole=settings.value(whole);
+        const auto restore=qScopeGuard([&]{
+            for(const auto &entry:QList<QPair<QString,QVariant>>{{roster,previousRoster},{selected,previousSelected},{whole,previousWhole}})
+                if(entry.second.isValid())settings.setValue(entry.first,entry.second);else settings.remove(entry.first);
+            settings.sync();accounts->selectAccount(previousSelected.toString());
+        });
+        const QString id="synthetic-term-registration";
+        settings.setValue(roster,QVariantList{QVariantMap{{"id",id},{"connected",true},{"model","synthetic-term-model"},
+            {"models",QVariantList{QVariantMap{{"id","synthetic-term-model"}}}}}});settings.setValue(selected,id);settings.setValue(whole,true);settings.sync();
+        accounts->selectAccount(id);QVERIFY(accounts->connected() && accounts->useForWholeDocument());
+        auto *term=qobject_cast<ReadingTermController *>(reader->readingTerm());QVERIFY(term);
+        QVariantMap request{{"action","SummarizeDocument"},{"current_page",0},{"question","LyraReader"},{"language","English"},
+            {"base_url","http://127.0.0.1:1/v1"},{"model","synthetic-term-model"},{"chatgpt_account",id},
+            {"document_knowledge_pages",QVariantList{}},{"reasoning_mode","default"},{"reasoning_encoding","none"}};
+        QVERIFY(term->prepare(request));QTRY_COMPARE(term->state().value("phase").toString(),QString("preview"));
+        const auto plan=term->state().value("plan").toMap();QCOMPARE(plan.value("endpoint").toString(),QString("https://api.openai.com/v1/responses"));
+        const auto body=QJsonDocument::fromJson(plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8()).object();
+        QVERIFY(body.value("stream").toBool());QVERIFY(!body.value("store").toBool());QVERIFY(body.value("input").isArray());
+        QVERIFY(!reader->startAiTerm("local",plan));QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+        // Holding the synthetic account lock proves admission used the term preview,
+        // and prevents any system vault access or external request in this check.
+        const auto folder=QDir(QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation)).filePath("chatgpt-accounts");QVERIFY(QDir().mkpath(folder));
+        const auto hash=QString::fromLatin1(QCryptographicHash::hash(id.toUtf8(),QCryptographicHash::Sha256).toHex());
+        QLockFile lock(QDir(folder).filePath("chatgpt-"+hash+".lock"));lock.setStaleLockTime(0);QVERIFY(lock.tryLock(0));
+        QVERIFY(!accounts->send(reader,plan,{}));QVERIFY(accounts->status().contains("being updated"));QVERIFY(!accounts->busy());
+        // Dismiss preserves the outgoing presentation, but cannot admit another vault read.
+        term->dismiss();QVERIFY(!term->state().value("plan").toMap().isEmpty());QVERIFY(!term->canStart(plan));
+        QVERIFY(!accounts->send(reader,plan,{}));QVERIFY(!accounts->busy());
+        accounts->setUseForWholeDocument(false);QVERIFY(!accounts->useForWholeDocument());QVERIFY(term->state().isEmpty());
+        QVERIFY(!accounts->send(reader,plan,{}));QVERIFY(!reader->startChatGptRequest(id,"unused-synthetic-token",plan,{}));QVERIFY(!accounts->busy());
     }
 
     void translationTimelineScrollsLazilyAndReplaysOnlyTheReviewedSource_data() {

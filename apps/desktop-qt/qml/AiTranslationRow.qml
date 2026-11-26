@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQml.Models
 
 Item {
     id: row
@@ -30,8 +31,13 @@ Item {
     readonly property bool collapsed: !isActive && !isExpanded
     function focusDisclosure() { answerPreview.focusAction(); }
     function focusAnswer() { answerView.focusAnswer(); }
+    ContextMenu.menu: termsMenu
     Component.onCompleted: if (!isActive) task.needEntry(recordId)
-    onRecordIdChanged: if (!isActive) task.needEntry(recordId)
+    onRecordIdChanged: {
+        if (task && typeof task.releaseTermRow === "function") task.releaseTermRow(row);
+        if (!isActive) task.needEntry(recordId);
+    }
+    Component.onDestruction: if (task && typeof task.releaseTermRow === "function") task.releaseTermRow(row)
     ColumnLayout {
         id: content
         x: row.task.leadingInset; y: 6; width: row.task.rowWidth
@@ -88,6 +94,7 @@ Item {
                     wrapMode: TextEdit.Wrap; padding: 0; background: null
                     color: app.colors.textSecondary; font.pixelSize: 14
                     Accessible.name: qsTr("Original passage")
+                    ContextMenu.menu: termsMenu
                     Keys.onPressed: function(event) {
                         if ([Qt.Key_Up, Qt.Key_Down, Qt.Key_Left, Qt.Key_Right, Qt.Key_Home, Qt.Key_End, Qt.Key_PageUp, Qt.Key_PageDown].indexOf(event.key) >= 0 && !row.originalExpanded)
                             row.task.setOriginalOpen(row.originalKey, true);
@@ -122,6 +129,7 @@ Item {
                 plainText: false; citationPages: row.verifiedPages
                 inlineConversation: true; bodySize: 14
                 showActions: false; showSources: false
+                readingMenu: termsMenu
                 viewport: row.task.viewport
                 onCitation: function(link, plan) { row.task.panel.followVerifiedPage(link, row.verifiedPages, row.task.generation); }
                 onKeyboardNavigation: if (row.collapsed) row.task.expandRecord(row.recordId, true)
@@ -157,5 +165,40 @@ Item {
             }
         }
         Rectangle { Layout.fillWidth: true; height: 1; color: app.colors.separator }
+    }
+    Menu {
+        id: termsMenu
+        objectName: "aiTranslationTermsMenu" + row.index
+        property var snapshot: null
+        onAboutToShow: snapshot = {reader: row.task.owner, generation: row.task.generation,
+            record: row.recordId, terms: row.entry ? (row.entry.terms || []).slice() : []}
+        focus: true
+        background: Rectangle {radius: 6; color: app.colors.menuBg; border.color: app.colors.separator}
+        MenuItem {
+            text: qsTr("Copy")
+            enabled: !!termsMenu.parent && typeof termsMenu.parent.copy === "function" && !!termsMenu.parent.selectedText
+            onTriggered: termsMenu.parent.copy()
+        }
+        MenuItem {
+            text: qsTr("Select all")
+            enabled: !!termsMenu.parent && typeof termsMenu.parent.selectAll === "function"
+            onTriggered: termsMenu.parent.selectAll()
+        }
+        MenuSeparator {}
+        Instantiator {
+            model: termsMenu.snapshot ? termsMenu.snapshot.terms : []
+            delegate: MenuItem {
+                required property int index
+                required property string modelData
+                objectName: "explainAiTranslationTerm" + index
+                text: qsTr("Explain “%1”").arg(modelData)
+                enabled: row.task.canExplain && !!row.entry && row.entry.status !== "sourceChanged"
+                    && !!termsMenu.snapshot && termsMenu.snapshot.reader === row.task.owner
+                    && termsMenu.snapshot.generation === row.task.generation && termsMenu.snapshot.record === row.recordId
+                onTriggered: row.task.explainTerm(modelData, termsMenu.parent || row, row, termsMenu.snapshot)
+            }
+            onObjectAdded: function(index, object) { termsMenu.insertItem(index + 3, object); }
+            onObjectRemoved: function(index, object) { termsMenu.removeItem(object); }
+        }
     }
 }

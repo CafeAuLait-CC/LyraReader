@@ -17,9 +17,15 @@ ColumnLayout {
     property bool showActions: true
     property bool plainText: sent.kind === "reading_translation"
     property var citationPages: undefined
+    property var readingMenu: null
+    function configureReadingMenu(control) {
+        if (readingMenu && control) control.ContextMenu.menu = readingMenu;
+    }
     readonly property var rendered: collapsibleSummary ? ({}) : renderFor(outputText)
     readonly property var textControl: collapsibleSummary || !answerLoader.item ? null
         : (rendered.blocks || []).length ? answerLoader.item.textControl : answerLoader.item
+    onReadingMenuChanged: configureReadingMenu(textControl)
+    onTextControlChanged: configureReadingMenu(textControl)
     property Flickable viewport: null
     signal keyboardNavigation(int key)
     function scrollParent(dy) {
@@ -134,6 +140,7 @@ ColumnLayout {
         id: answer
     TextArea {
         id: answerArea
+        Component.onCompleted: result.configureReadingMenu(answerArea)
         objectName: result.answerName
         Layout.fillWidth: true
         readonly property var rendered: result.rendered

@@ -32,6 +32,7 @@ ColumnLayout {
         measuredHeight: area.implicitHeight
         TextArea {
             id: area
+            Component.onCompleted: if (block.renderer && typeof block.renderer.configureReadingMenu === "function") block.renderer.configureReadingMenu(area)
             objectName: block.textName
             width: block.limited ? view.width : Math.max(view.width, implicitWidth)
             text: block.sourceText

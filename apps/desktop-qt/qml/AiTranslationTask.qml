@@ -14,7 +14,7 @@ Item {
     readonly property real rowWidth: Math.max(0, timeline.width - 36 - bar.gutterWidth)
     readonly property var viewport: timeline
     readonly property bool showOriginal: panel.input.translationShowOriginal !== false
-    readonly property bool popupVisible: more.visible || (!!timeline.headerItem && timeline.headerItem.languagePicker.popupVisible)
+    readonly property bool popupVisible: more.visible || termPopup.anyVisible || (!!timeline.headerItem && timeline.headerItem.languagePicker.popupVisible)
     readonly property bool covered: panel.payloadOpen || !!panel.reviewTicket || panel.running
     readonly property bool configured: {
         const accounts = app.session ? app.session.chatGptAccounts : null;
@@ -22,6 +22,25 @@ Item {
         return useAccount ? accounts.connected && !!String(accounts.model || "").trim() : !!String(app.aiSettings.model || "").trim();
     }
     readonly property bool canReview: configured && !panel.running && !owner.pendingCommands && owner.pageCount > 0
+    readonly property bool termConfigured: {
+        const accounts = app.session ? app.session.chatGptAccounts : null;
+        return accounts && accounts.useForWholeDocument ? accounts.connected && !!String(accounts.model || "").trim()
+            : !!String(app.aiSettings.model || "").trim();
+    }
+    readonly property bool canExplain: termConfigured && !panel.running && !panel.previewReady && !covered
+        && !owner.pendingCommands && !owner.snapshotReadOnly && owner.pageCount > 0
+    function explainTerm(term, anchor, sourceRow, snapshot) {
+        if (!canExplain || !current() || !sourceRow || !sourceRow.entry || sourceRow.entry.status === "sourceChanged"
+                || !snapshot || snapshot.reader !== owner || snapshot.generation !== generation
+                || snapshot.record !== sourceRow.recordId || (snapshot.terms || []).indexOf(term) < 0) return false;
+        const request = panel.baseRequest("SummarizeDocument");
+        request.selection = null; request.question = term;
+        request.language = panel.input.language === undefined ? "English" : panel.input.language;
+        const accounts = app.session ? app.session.chatGptAccounts : null;
+        if (accounts && !panel.connectChatGpt(request, accounts, accounts.useForWholeDocument)) return false;
+        return termPopup.openFor(owner, generation, request, anchor, sourceRow);
+    }
+    function releaseTermRow(row) { if (termPopup && termPopup.ticket && termPopup.ticket.sourceRow === row) termPopup.close(); }
     readonly property bool activeMatches: !!panel.result.responsePlan && panel.result.responsePlan.kind === "reading_translation"
         && (!!(panel.result.responsePlan.reading_scope || {}).selection !== panel.translateDocument)
     readonly property bool showActive: activeMatches && (panel.running || !!panel.result.translationHistoryWarning)
@@ -50,6 +69,7 @@ Item {
     function withoutKey(map, key) { const result = Object.assign(Object.create(null), map); delete result[key]; return result; }
     function current() { return boundReader === owner && boundGeneration === generation; }
     function reset() {
+        termPopup.close();
         more.close(); visibleEntries.stop(); restoreFocus.stop(); pendingFocus = null;
         metadataCommand = 0; metadataLoaded = false; failure = "";
         boundReader = owner; boundGeneration = generation;
@@ -135,7 +155,7 @@ Item {
     onActiveCountChanged: if (initialized) rebuildRows()
     onVisibleChanged: if (initialized) {
         if (visible) wakeReads();
-        else { more.close(); if (timeline.headerItem) timeline.headerItem.languagePicker.closePopups(); refresh.stop(); entryFlush.stop(); visibleEntries.stop(); restoreFocus.stop(); pendingFocus = null; }
+        else { termPopup.close(); more.close(); if (timeline.headerItem) timeline.headerItem.languagePicker.closePopups(); refresh.stop(); entryFlush.stop(); visibleEntries.stop(); restoreFocus.stop(); pendingFocus = null; }
     }
     Component.onCompleted: { initialized = true; reset(); }
     Timer { id: refresh; interval: 80; onTriggered: translationTask.reload() }
@@ -341,4 +361,5 @@ Item {
         MenuItem { text: qsTr("Document Reading…"); enabled: !translationTask.owner.snapshotReadOnly; onTriggered: app.openDocumentReading() }
         MenuItem { text: qsTr("Local audit trail…"); onTriggered: app.showAuditTrail() }
     }
+    AiTermPopup {id: termPopup; app: translationTask.app; task: translationTask}
 }

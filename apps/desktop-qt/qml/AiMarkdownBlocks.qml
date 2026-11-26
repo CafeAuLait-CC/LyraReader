@@ -43,6 +43,7 @@ ColumnLayout {
                 id: prose
                 TextArea {
                     id: area
+                    Component.onCompleted: if (typeof document.renderer.configureReadingMenu === "function") document.renderer.configureReadingMenu(area)
                     readonly property var textControl: area
                     objectName: row.textName
                     text: row.block.text || ""; textFormat: TextEdit.RichText

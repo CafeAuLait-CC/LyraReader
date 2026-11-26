@@ -1,4 +1,5 @@
 #include "ReaderController.h"
+#include "ReadingTermController.h"
 #include "DateFormatting.h"
 #include "NativeRaster.h"
 #include "RasterCache.h"

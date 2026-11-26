@@ -44,6 +44,7 @@ AiHorizontalReadingView {
                 model: table.columns
                 TextArea {
                     id: cell
+                    Component.onCompleted: if (table.renderer && typeof table.renderer.configureReadingMenu === "function") table.renderer.configureReadingMenu(cell)
                     required property int index
                     readonly property var cellData: (table.rows[row.rowIndex] || [])[index] || ({})
                     objectName: row.rowIndex === 0 && index === 0 ? table.textName

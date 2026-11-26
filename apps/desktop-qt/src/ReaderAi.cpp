@@ -1,4 +1,5 @@
 #include "ReaderController.h"
+#include "ReadingTermController.h"
 #include "NativeRaster.h"
 #include "RenderBudget.h"
 #include <QFutureWatcher>
@@ -35,6 +36,7 @@ QVariantList ReaderController::aiMathMarkup(const QString &text) const {
 }
 
 void ReaderController::initAi() {
+    m_readingTerm=std::make_unique<ReadingTermController>(this);
     initTranslations();initDocumentReading();initRegionPersistence();initSummaryCatalog();initSummaryBatch();
     m_readingNoteSaveTimer.setSingleShot(true);m_readingNoteSaveTimer.setInterval(500);
     connect(&m_readingNoteSaveTimer,&QTimer::timeout,this,&ReaderController::flushReadingNoteThoughts);
@@ -50,6 +52,9 @@ void ReaderController::initAi() {
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
 void ReaderController::resetAi(bool preserveTranslationViews) {
+    QPointer<ReaderController> termOwner(this);const auto termGeneration=m_generation;
+    if(m_readingTerm)m_readingTerm->cancel();
+    if(!termOwner || termGeneration!=m_generation)return;
     m_readingNoteSaveTimer.stop();
     if(m_readingNoteDraft.isEmpty()){m_readingNoteAutomatic=false;m_readingNoteSaveError.clear();}
     resetTranslations(preserveTranslationViews);resetSummaryBatch();
@@ -612,8 +617,15 @@ bool ReaderController::startAi(const QString &key,const QVariantMap &expectedPla
     return startAiWithCredential(key,expectedPlan);
 }
 
+QObject *ReaderController::readingTerm()const {return m_readingTerm.get();}
+bool ReaderController::startAiTerm(const QString &key,const QVariantMap &expectedPlan) {
+    return !expectedPlan.contains(QStringLiteral("chatgpt_account")) && m_readingTerm && m_readingTerm->start(key,expectedPlan);
+}
+
 bool ReaderController::startChatGptRequest(const QString &account,const QString &token,const QVariantMap &plan,const QString &readingToken) {
     if(account.isEmpty() || token.isEmpty() || plan.value(QStringLiteral("chatgpt_account")).toString()!=account)return false;
+    if(readingToken.isEmpty() && plan.value(QStringLiteral("kind"))==QStringLiteral("reading_term"))
+        return m_readingTerm && m_readingTerm->start(token,plan);
     return readingToken.isEmpty() ? startAiWithCredential(token,plan) : startDocumentReadingWithCredential(token,plan,readingToken);
 }
 

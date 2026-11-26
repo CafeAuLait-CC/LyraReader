@@ -837,6 +837,7 @@ Item {
     }
     Dialog {
         id: credential
+        objectName: "aiCredentialDialog"
         title: qsTr("API key")
         parent: Overlay.overlay
         anchors.centerIn: parent
@@ -851,6 +852,7 @@ Item {
             }
             TextField {
                 id: requestKey
+                objectName: "requestAiCredential"
                 Layout.fillWidth: true
                 echoMode: TextInput.Password
                 Accessible.name: qsTr("API key for this request")

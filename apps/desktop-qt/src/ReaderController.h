@@ -13,6 +13,7 @@
 #include <memory>
 class CommandQueue;
 class NativeRasterSource;
+class ReadingTermController;
 struct TileSpec {
     QString key;
     int page=0,level=0,column=0,row=0;
@@ -35,6 +36,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
+    Q_PROPERTY(QObject *readingTerm READ readingTerm CONSTANT)
     Q_PROPERTY(bool chatDraftPending READ chatDraftPending NOTIFY aiStateChanged)
     Q_PROPERTY(bool chatDraftSaving READ chatDraftSaving NOTIFY aiStateChanged)
     Q_PROPERTY(bool documentRevisionPending READ documentRevisionPending NOTIFY commandsChanged)
@@ -94,6 +96,8 @@ public:
     Q_INVOKABLE void inspectTranslations(int page);
     Q_INVOKABLE void toggleTranslation(const QString &id);
     QVariantMap aiState()const{return m_aiState;}
+    QObject *readingTerm()const;
+    Q_INVOKABLE bool startAiTerm(const QString &key,const QVariantMap &expectedPlan);
     QVariantMap summaryCatalog()const{return m_summaryCatalog;}
     Q_INVOKABLE void setSummaryExpanded(bool expanded);
     Q_INVOKABLE void loadSummaryCatalog(const QString &layer,int offset=0);
@@ -423,6 +427,7 @@ private:
     void startNextRaster();
     void setError(const QString &error);
     std::shared_ptr<LyraReaderDesktopDocument> m_document;
+    std::unique_ptr<ReadingTermController> m_readingTerm;
     std::shared_ptr<NativeRasterSource> m_source;
     std::shared_ptr<std::atomic_bool> m_indexCancellation=std::make_shared<std::atomic_bool>(false);
     QString m_cachePrefix;

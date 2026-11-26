@@ -276,7 +276,7 @@ fn value<T: Serialize>(result: Result<T, LyraReaderFfiError>) -> Result<Value, S
     serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
-fn render_reviewed_plan(
+pub(super) fn render_reviewed_plan(
     result: Result<AiPlanRecord, LyraReaderFfiError>,
     account: Option<&str>,
 ) -> Result<Value, String> {
