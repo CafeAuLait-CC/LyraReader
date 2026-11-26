@@ -4,6 +4,9 @@ import QtQuick.Layouts
 
 AiReadingScrollView {
     id: task
+    memoryReader: task.owner
+    memoryKey: "summary"
+    memoryReady: scopedStore.current() && scopedStore.loaded && !scopedStore.loading
     objectName: "aiSummaryTaskScroll"
     contentHeight: taskBody.implicitHeight + 36
     required property var app
@@ -44,6 +47,7 @@ AiReadingScrollView {
         return useAccount ? account.connected && !!String(account.model || "").trim() : !!String(app.aiSettings.model || "").trim();
     }
     AiTaskStore { id: scopedStore; app: task.app; parent: task }
+    Connections { target: scopedStore; function onAboutToReplaceEntries() { task.rememberPosition(); } }
     Timer { id: scopeRefresh; interval: 80; onTriggered: task.refreshMetadata() }
     function refreshMetadata() {
         // History is covered by the review dialog. Its deferred read must not

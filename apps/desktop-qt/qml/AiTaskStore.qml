@@ -13,11 +13,15 @@ Item {
     property string failure: ""
     property string kind: "summary"
     property var scopeSelection: undefined
+    property bool loaded: false
+    signal aboutToReplaceEntries()
     readonly property bool loading: command !== 0
-    function reset() { reader = null; command = 0; entries = []; failure = ""; scopeSelection = undefined; }
+    function reset() { loaded = false; reader = null; command = 0; entries = []; failure = ""; scopeSelection = undefined; }
     function current() { return reader && reader === owner && generation === ownerGeneration; }
     function reload(taskKind, selection) {
         if (!owner.pageCount) return;
+        if (current()) aboutToReplaceEntries();
+        loaded = false;
         reader = owner; generation = ownerGeneration; kind = taskKind;
         failure = ""; entries = []; scopeSelection = selection;
         const request = {kind: taskKind};
@@ -30,8 +34,10 @@ Item {
         target: store.reader
         function onCommandFinished(id, operation, result, error) {
             if (!store.current() || id !== store.command || operation !== "ai_reading_tasks") return;
+            store.aboutToReplaceEntries();
             store.command = 0; store.failure = error;
             if (!error) store.entries = result;
+            store.loaded = true;
         }
     }
 }

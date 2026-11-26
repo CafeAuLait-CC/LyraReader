@@ -7,6 +7,7 @@ ReadingWheelHandler {
     enabled: !!viewport
     zoomEnabled: false
     signal scrollIntent(real dx, real dy)
+    signal scrollApplied()
     onScrollRequested: function(dx, dy) {
         viewport.cancelFlick();
         handler.scrollIntent(dx, dy);
@@ -25,5 +26,6 @@ ReadingWheelHandler {
                 viewport.originY + viewport.contentHeight - viewport.height + viewport.bottomMargin);
         } else
             viewport.contentY = y;
+        handler.scrollApplied();
     }
 }

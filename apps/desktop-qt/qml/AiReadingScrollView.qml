@@ -1,11 +1,28 @@
+import QtQuick
 import QtQuick.Controls
+import LyraReader 1.0
 
 ScrollView {
     id: view
+    property var memoryReader: null
+    property string memoryKey: ""
+    property bool memoryReady: true
+    function rememberPosition() { scrollMemory.capturePosition(); }
+    ReadingScrollMemory {
+        id: scrollMemory
+        reader: view.memoryReader; key: view.memoryKey
+        viewport: view.contentItem; active: view.visible; ready: view.memoryReady
+    }
+    Connections {
+        target: view
+        function onScrollIntent() { scrollMemory.userIntent(); }
+        function onVerticalBarPressedChanged() { if (view.verticalBarPressed) scrollMemory.userIntent(); }
+    }
     signal scrollIntent(real dx, real dy)
     PanelWheelHandler {
         viewport: view.contentItem
         onScrollIntent: function(dx, dy) { view.scrollIntent(dx, dy); }
+        onScrollApplied: scrollMemory.completeUserScroll()
     }
     readonly property bool verticalBarPressed: verticalBar.pressed
     readonly property real gutterWidth: verticalBar.gutterWidth

@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import LyraReader 1.0
 
 Item {
     id: translationTask
@@ -59,6 +60,7 @@ Item {
     }
     function reload() {
         if (!visible || covered || !owner.pageCount || !current()) return;
+        timelineMemory.capturePosition();
         metadataSelection = !panel.translateDocument;
         metadataCommand = owner.submit("ai_translation_history", {selection: metadataSelection});
     }
@@ -116,6 +118,8 @@ Item {
     }
     function setOriginalOpen(key, value) { originalOpen = withValue(originalOpen, key, value); }
     function chooseScope(index) {
+        if (!current()) return;
+        timelineMemory.resetPosition(owner, generation, index ? "translation-selection" : "translation-document");
         owner.setAiInput("translationScope", index ? "selection" : "document");
         timeline.positionViewAtBeginning();
     }
@@ -165,11 +169,13 @@ Item {
         function onCommandFinished(id, operation, result, error) {
             if (!translationTask.current()) return;
             if (operation === "ai_translation_history" && id === translationTask.metadataCommand) {
+                timelineMemory.capturePosition();
                 translationTask.metadataCommand = 0;
                 if (translationTask.metadataSelection !== !translationTask.panel.translateDocument) return;
                 translationTask.metadataLoaded = true; translationTask.failure = error;
                 if (!error) { translationTask.records = result; translationTask.rebuildRows(); }
             } else if (operation === "ai_translation_history_entries" && translationTask.entryCommands[String(id)]) {
+                timelineMemory.capturePosition();
                 const ids = translationTask.entryCommands[String(id)];
                 translationTask.entryCommands = translationTask.withoutKey(translationTask.entryCommands, String(id));
                 const values = Object.assign(Object.create(null), translationTask.entries);
@@ -190,7 +196,17 @@ Item {
         objectName: "aiTranslationTimeline"
         anchors.fill: parent
         model: rows; clip: true; spacing: 0
-        PanelWheelHandler { viewport: timeline }
+        ReadingScrollMemory {
+            id: timelineMemory
+            reader: translationTask.owner
+            key: translationTask.panel.translateDocument ? "translation-document" : "translation-selection"
+            viewport: timeline
+            active: translationTask.visible
+            ready: translationTask.current() && translationTask.metadataLoaded && !translationTask.metadataCommand
+                && !translationTask.queued.length && !Object.keys(translationTask.entryCommands).length
+        }
+        PanelWheelHandler { viewport: timeline; onScrollIntent: timelineMemory.userIntent(); onScrollApplied: timelineMemory.completeUserScroll() }
+        Connections { target: bar; function onPressedChanged() { if (bar.pressed) timelineMemory.userIntent(); } }
         ScrollBar.vertical: AiReadingScrollBar { id: bar }
         header: Item {
             readonly property var languagePicker: language

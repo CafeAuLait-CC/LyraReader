@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import LyraReader 1.0
 
 Pane {
     id: notes
@@ -63,8 +64,12 @@ Pane {
         } else if (source) command = reader.submit("ai_reading_keep", {id: source});
         else refresh();
     }
+    function rememberPosition() {
+        if (current()) { listMemory.capturePosition(); contents.rememberPosition(); }
+    }
     function refresh() {
         if (!current() || editing || reviewing) return;
+        rememberPosition();
         preferred = preferred || (note ? note.id : "");
         note = null;
         failure = "";
@@ -72,6 +77,7 @@ Pane {
     }
     function read(index) {
         if (!current() || editing || reviewing || index < 0 || index >= entries.length) return;
+        rememberPosition();
         note = null;
         failure = "";
         command = reader.submit("ai_reading_note", {id: entries[index].id});
@@ -154,6 +160,7 @@ Pane {
         function onAiStateChanged() { if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
         function onCommandFinished(id, operation, result, error) {
             if (id !== notes.command || !notes.current()) return;
+            notes.rememberPosition();
             notes.command = 0;
             notes.failure = error;
             if (error) return;
@@ -280,7 +287,13 @@ Pane {
             clip: true
             model: notes.entries
             boundsBehavior: Flickable.StopAtBounds
-            PanelWheelHandler { viewport: noteList }
+            ReadingScrollMemory {
+                id: listMemory
+                reader: notes.reader; key: "notes"; viewport: noteList
+                active: noteList.visible; ready: notes.current() && !notes.command
+            }
+            PanelWheelHandler { viewport: noteList; onScrollIntent: listMemory.userIntent(); onScrollApplied: listMemory.completeUserScroll() }
+            Connections { target: noteBar; function onPressedChanged() { if (noteBar.pressed) listMemory.userIntent(); } }
             ScrollBar.vertical: AiReadingScrollBar { id: noteBar }
             delegate: Button {
                 id: entryButton
@@ -308,6 +321,9 @@ Pane {
         }
         AiReadingScrollView {
             id: contents
+            memoryReader: notes.reader
+            memoryKey: notes.note ? "note-" + notes.note.id : ""
+            memoryReady: notes.current() && !notes.command
             Layout.fillWidth: true; Layout.fillHeight: true
             visible: !notes.editing && !notes.reviewing && !!notes.note
             Column {

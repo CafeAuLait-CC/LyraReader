@@ -2,6 +2,7 @@
 #include "DisplayCalibration.h"
 #include "ReadingTextGeometry.h"
 #include "ReadingMarkdown.h"
+#include "ReadingScrollMemory.h"
 #include "ReadingSourceHighlight.h"
 #include <QFutureWatcher>
 #include "AuditController.h"
@@ -92,6 +93,15 @@ public:
     void copyText(const QString &text) override {copied=text;++copies;}
 };
 
+// Observe real native property signals for synchronous destruction/rebinding checks.
+class NativeScrollSignalAction final : public QObject {
+    Q_OBJECT
+public:
+    std::function<void()> callback;
+public slots:
+    void trigger() { if (callback) callback(); }
+};
+
 // Isolated Checks settings retain both values and the original absence of owned keys.
 class ReadingPreferenceGuard final {
 public:
@@ -166,6 +176,7 @@ protected:
 
 static void registerReaderTypes() {
     qmlRegisterUncreatableType<ReaderController>("LyraReader",1,0,"ReaderController","Created by host");
+    qmlRegisterType<ReadingScrollMemory>("LyraReader",1,0,"ReadingScrollMemory");
     qmlRegisterType<ReadingMarkdown>("LyraReader",1,0,"ReadingMarkdown");
     qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
     qmlRegisterType<ReadingSourceHighlight>("LyraReader",1,0,"ReadingSourceHighlight");
@@ -5141,10 +5152,16 @@ TextArea { width: 230; font.family: "serif"; font.pixelSize: 18; padding: 0; wra
         const auto replay=reader->aiState().value("plan").toMap();QCOMPARE(replay.value("reading_scope").toMap().value("language").toString(),QString("Simplified Chinese"));QCOMPARE(replay.value("sources"),original.value("sources"));
         const auto repeated=replay.value("parts").toList();QCOMPARE(repeated.size(),wires.size());for(qsizetype i=0;i<repeated.size();++i)QCOMPARE(repeated[i].toMap().value("wire_body").toString().toUtf8(),wires[i]);QCOMPARE(server.requests.size(),wires.size());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!dialog->property("visible").toBool());
         window->resize(700,600);QVERIFY(settleReaderViewport(window));if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-translation-narrow-"+theme+".png"));QCOMPARE(server.requests.size(),wires.size());
+        QVERIFY(QMetaObject::invokeMethod(timeline,"positionViewAtEnd"));QTest::qWait(30);
+        const auto rememberedOffset=timeline->property("contentY").toDouble()-timeline->property("originY").toDouble();
+        qInfo()<<"scroll-memory actual translation timeline offset"<<rememberedOffset;
+        QVERIFY2(rememberedOffset>0,"The narrow synthetic timeline must exercise a nonzero saved position");
         QPointer<QQuickItem> closing=task;QVERIFY(QMetaObject::invokeMethod(task,"wakeReads"));
         reader->setAiInput("view","chat");QTRY_VERIFY(closing.isNull());QTRY_COMPARE(reader->pendingCommands(),0);
         reader->setAiInput("view","translation");QTRY_VERIFY((task=visualItem(window->contentItem(),"aiTranslationTask")));QTRY_VERIFY(task->property("metadataLoaded").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
         QTRY_COMPARE(loaded().value("blocks").toList().size(),sources.size());QCOMPARE(server.requests.size(),wires.size());
+        timeline=visualItem(window->contentItem(),"aiTranslationTimeline");QVERIFY(timeline);
+        QTRY_VERIFY(qAbs(timeline->property("contentY").toDouble()-timeline->property("originY").toDouble()-rememberedOffset)<1);
     }
 
     void translationLanguagePickerPreservesReviewedValues_data() {
@@ -6071,6 +6088,160 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
     void commandCompletionDoesNotPublishAfterANotificationReopensTheDocument() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto first=scratch.filePath("completion-old.pdf"),second=scratch.filePath("completion-new.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",first));QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",second));ReaderController reader;reader.openFile(QUrl::fromLocalFile(first));QTRY_COMPARE(reader.pageCount(),1);QTRY_COMPARE(reader.pendingCommands(),0);QSignalSpy commands(&reader,&ReaderController::commandFinished);bool reopened=false;
         connect(&reader,&ReaderController::dataChanged,this,[&]{if(!reopened && reader.data().contains("links")){reopened=true;reader.openFile(QUrl::fromLocalFile(second));}});reader.submit("links",{{"page",0}});QTRY_VERIFY(reopened);QTRY_COMPARE(reader.pageCount(),3);QTRY_COMPARE(reader.pendingCommands(),0);for(const auto &event:commands)QVERIFY2(event[1].toString()!=QStringLiteral("links"),"The old completion must not be published after a synchronous document switch");QVERIFY(!reader.data().contains("links"));
+    }
+
+    void readingScrollMemoryOwnsOnlySettledNativePresentation() {
+        QTest::failOnWarning(QRegularExpression(".*(No such signal|No such slot|TypeError:|Binding loop|ReferenceError:).*"));
+        ReaderController first, second; first.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        second.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        QTRY_COMPARE(first.pageCount(),3); QTRY_COMPARE(second.pageCount(),3);
+        QQuickWindow window; window.resize(240,200); window.show();
+        QQmlEngine engine; QQmlComponent component(&engine);
+        component.setData("import QtQuick\nFlickable { width: 240; height: 200; contentWidth: 240; contentHeight: 2000; clip: true; Keys.onDownPressed: contentY += 20 }", QUrl("qrc:/scroll-memory-unit.qml"));
+        QScopedPointer<QObject> object(component.create()); QVERIFY2(object,qPrintable(component.errorString()));
+        auto *viewport=qobject_cast<QQuickItem *>(object.data()); QVERIFY(viewport); viewport->setParentItem(window.contentItem());
+        auto memory=std::make_unique<ReadingScrollMemory>();
+        const auto attach=[&] {memory->setReader(&first);memory->setViewport(viewport);memory->setKey("summary");memory->setActive(true);};
+        attach(); QTest::qWait(10); QTRY_COMPARE(viewport->property("contentY").toDouble(),0.0);
+        viewport->setProperty("contentY",420.0);QTest::qWait(10);
+        memory->setKey("translation");QTRY_COMPARE(viewport->property("contentY").toDouble(),0.0);
+        viewport->setProperty("contentY",170.0);QTest::qWait(10);
+        memory->setKey("summary");QTRY_COMPARE(viewport->property("contentY").toDouble(),420.0);
+        memory->setReader(&second);QTRY_COMPARE(viewport->property("contentY").toDouble(),0.0);
+        viewport->setProperty("contentY",210.0);QTest::qWait(10);
+        memory->setReader(&first);QTRY_COMPARE(viewport->property("contentY").toDouble(),420.0);
+        memory.reset();viewport->setProperty("contentY",0.0);memory=std::make_unique<ReadingScrollMemory>();attach();
+        QTRY_COMPARE(viewport->property("contentY").toDouble(),420.0);
+        memory->setActive(false);viewport->setProperty("contentY",0.0);viewport->setProperty("contentHeight",200.0);
+        memory->setReady(false);memory->setActive(true);QTest::qWait(110);QCOMPARE(viewport->property("contentY").toDouble(),0.0);
+        viewport->setProperty("contentHeight",2000.0);memory->setReady(true);QTRY_COMPARE(viewport->property("contentY").toDouble(),420.0);
+        memory->setActive(false);viewport->setProperty("contentY",0.0);viewport->setProperty("contentHeight",300.0);memory->setActive(true);
+        QTRY_COMPARE(viewport->property("contentY").toDouble(),100.0);
+        viewport->setProperty("contentHeight",2000.0);viewport->setProperty("contentY",420.0);QTest::qWait(10);
+        memory->setActive(false);memory->setReady(false);viewport->setProperty("contentY",0.0);memory->setActive(true);
+        memory->userIntent();viewport->setProperty("contentY",80.0);QTest::qWait(10);memory->setReady(true);
+        QTest::qWait(110);QCOMPARE(viewport->property("contentY").toDouble(),80.0);
+        memory->userIntent();viewport->setProperty("contentY",120.0);memory->setReady(false);memory->completeUserScroll();memory->setReady(true);
+        QTest::qWait(20);QCOMPARE(viewport->property("contentY").toDouble(),120.0);
+        memory->userIntent();memory->setReader(&second);viewport->setProperty("contentY",75.0);memory->completeUserScroll();QTRY_COMPARE(viewport->property("contentY").toDouble(),210.0);
+        memory->setReader(&first);QTRY_COMPARE(viewport->property("contentY").toDouble(),120.0);
+        viewport->setProperty("contentY",420.0);QTest::qWait(10);
+        memory->setActive(false);viewport->setProperty("contentHeight",300.0);viewport->setProperty("contentY",0.0);memory->setActive(true);
+        memory->userIntent();viewport->setProperty("contentY",30.0);QTest::qWait(110);QCOMPARE(viewport->property("contentY").toDouble(),30.0);
+        window.requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),&window);viewport->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(viewport->hasActiveFocus());
+        memory->setActive(false);memory->setReady(false);viewport->setProperty("contentY",0.0);memory->setActive(true);
+        QTest::keyClick(&window,Qt::Key_Down);QTest::qWait(10);memory->setReady(true);QTest::qWait(110);QCOMPARE(viewport->property("contentY").toDouble(),20.0);
+        viewport->setProperty("contentHeight",2000.0);viewport->setProperty("contentY",30.0);QTest::qWait(10);
+        memory->setKey("translation");QTRY_COMPARE(viewport->property("contentY").toDouble(),170.0);
+        memory->setKey("summary");QTRY_COMPARE(viewport->property("contentY").toDouble(),30.0);
+        memory->setActive(false);viewport->setProperty("contentY",0.0);
+        NativeScrollSignalAction mutation;
+        const auto signal=QObject::connect(viewport,SIGNAL(contentYChanged()),&mutation,SLOT(trigger()));QVERIFY(signal);
+        bool rekeyed=false;
+        mutation.callback=[&] { if (!rekeyed && viewport->property("contentY").toDouble()==30.0) {rekeyed=true;memory->setKey("reentrant-note");} };
+        memory->setActive(true);QTRY_VERIFY(rekeyed);QTRY_COMPARE(viewport->property("contentY").toDouble(),0.0);
+        mutation.callback={};memory->setKey("summary");QTRY_COMPARE(viewport->property("contentY").toDouble(),30.0);
+        memory->setActive(false);viewport->setProperty("contentY",0.0);QPointer<ReadingScrollMemory> guard(memory.get());
+        mutation.callback=[&] { if (viewport->property("contentY").toDouble()==30.0) memory.reset(); };
+        memory->setActive(true);QTRY_VERIFY(guard.isNull());mutation.callback={};QObject::disconnect(signal);
+        memory=std::make_unique<ReadingScrollMemory>();attach();QTRY_COMPARE(viewport->property("contentY").toDouble(),30.0);
+        memory->setKey("translation");QTRY_COMPARE(viewport->property("contentY").toDouble(),170.0);
+        memory->resetPosition(&first,first.documentGeneration(),"translation-selection");memory->setKey("translation-selection");QTRY_COMPARE(viewport->property("contentY").toDouble(),0.0);
+        memory->setKey("translation");QTRY_COMPARE(viewport->property("contentY").toDouble(),170.0);
+        memory->resetPosition(&second,second.documentGeneration(),"translation");
+        memory->setKey("summary");QTRY_COMPARE(viewport->property("contentY").toDouble(),30.0);memory->setKey("translation");QTRY_COMPARE(viewport->property("contentY").toDouble(),170.0);
+        const auto generation=first.documentGeneration();first.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
+        QTRY_VERIFY(first.documentGeneration()!=generation);QTRY_COMPARE(first.pageCount(),3);QTRY_COMPARE(viewport->property("contentY").toDouble(),0.0);
+        memory.reset();
+        QCOMPARE(first.pendingCommands(),0);QCOMPARE(second.pendingCommands(),0);
+    }
+
+    void readingScrollMemoryHandlesNativeListOriginsAndHeaders() {
+        ReaderController reader;reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_COMPARE(reader.pageCount(),3);
+        QQuickWindow window;window.resize(240,200);window.show();QQmlEngine engine;QQmlComponent component(&engine);
+        component.setData(R"QML(import QtQuick
+ListView {
+ width: 240; height: 200; model: 100; clip: true
+ header: Rectangle { width: 240; height: 80 }
+ delegate: Rectangle { required property int index; width: 240; height: 30 + (index % 3) * 10 }
+})QML",QUrl("qrc:/scroll-memory-list.qml"));
+        QScopedPointer<QObject> object(component.create());QVERIFY2(object,qPrintable(component.errorString()));
+        auto *view=qobject_cast<QQuickItem *>(object.data());QVERIFY(view);view->setParentItem(window.contentItem());
+        QVERIFY(QMetaObject::invokeMethod(view,"forceLayout"));QTest::qWait(30);
+        QVERIFY(QMetaObject::invokeMethod(view,"positionViewAtBeginning"));QTest::qWait(10);
+        const auto beginning=view->property("contentY").toDouble();
+        qInfo()<<"scroll-memory ListView initial contentY/originY"<<beginning<<view->property("originY").toDouble();
+        ReadingScrollMemory memory;memory.setReader(&reader);memory.setViewport(view);memory.setKey("translation");memory.setActive(true);
+        QTest::qWait(30);QCOMPARE(view->property("contentY").toDouble(),beginning);
+        view->setProperty("contentY",view->property("originY").toDouble()+600.0);QTest::qWait(30);
+        const auto offset=view->property("contentY").toDouble()-view->property("originY").toDouble();
+        memory.setKey("notes");QTRY_COMPARE(view->property("contentY").toDouble(),view->property("originY").toDouble());
+        memory.setKey("translation");QTRY_VERIFY2(qAbs(view->property("contentY").toDouble()-view->property("originY").toDouble()-offset)<.5,qPrintable(QString("Expected offset %1, contentY %2, originY %3").arg(offset).arg(view->property("contentY").toDouble()).arg(view->property("originY").toDouble())));
+    }
+
+    void readingTaskScrollPositionsFollowTheDocumentWithoutRequests_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void readingTaskScrollPositionsFollowTheDocumentWithoutRequests() {
+        QFETCH(QString,theme);ReadingPreferenceGuard preferences;
+        QTest::failOnWarning(QRegularExpression(".*(No such signal|No such slot|TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        MockChatServer server;QVERIFY(server.listen());QString response="## Overview\n\n";
+        for(int index=0;index<90;++index)response+=QString("Synthetic paragraph %1 keeps the original answer and reviewed sources unchanged. [p.1]\n\n").arg(index);
+        for(const auto &name:{QString("FIRST"),QString("SECOND")})server.responses.append({{MockChatServer::delta({{"content",name+"\n\n"+response}}),QByteArray("data: [DONE]\n\n")},6,200});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto firstPath=scratch.filePath("scroll-first.pdf"),secondPath=scratch.filePath("scroll-second.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",firstPath));QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",secondPath));
+        NativeCorpus::Viewer viewer;auto *window=viewer.window;QVERIFY(window);window->resize(1000,780);window->setProperty("appearance",theme);
+        auto &workspace=viewer.workspace;workspace.openFile(QUrl::fromLocalFile(firstPath));auto *first=workspace.activeReader();QTRY_COMPARE(first->pageCount(),1);QTRY_COMPARE(first->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-scroll-memory"}});
+        QList<QByteArray> wires;
+        const auto send=[&](ReaderController *reader,int count) {
+            QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));
+            auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);
+            const auto plan=reader->aiState().value("plan").toMap();QVERIFY(!plan.isEmpty());QCOMPARE(plan.value("parts").toList().size(),1);
+            wires.append(plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8());
+            QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),count);
+        };
+        const auto viewport=[&]() -> QQuickItem * {
+            auto *task=visualItem(window->contentItem(),"aiSummaryTaskScroll");
+            return task ? task->property("contentItem").value<QQuickItem *>() : nullptr;
+        };
+        const auto ready=[&] {auto *task=visualItem(window->contentItem(),"aiSummaryTaskScroll");return task && task->property("memoryReady").toBool() && viewport() && viewport()->property("contentHeight").toDouble()>viewport()->height()+900;};
+        const auto offset=[&] {return viewport()->property("contentY").toDouble()-viewport()->property("originY").toDouble();};
+        const auto wheel=[&](int delta) {
+            auto *target=viewport();QVERIFY(target);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+            const auto point=target->mapToScene(QPointF(target->width()/2,target->height()/2));
+            QTest::mouseMove(window,point.toPoint());
+            QWheelEvent event(point,window->mapToGlobal(point.toPoint()),QPoint(),QPoint(0,delta),Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);
+            QCoreApplication::sendEvent(window,&event);
+        };
+        send(first,1);QTRY_VERIFY(ready());QTest::qWait(20);wheel(-960);QTRY_VERIFY(offset()>100);QTest::qWait(20);const auto firstOffset=offset();
+        QPointer<QQuickItem> originalTask=visualItem(window->contentItem(),"aiSummaryTaskScroll");
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"translation")));QTRY_VERIFY(originalTask.isNull());
+        QTRY_VERIFY(visualItem(window->contentItem(),"aiTranslationTimeline"));QCOMPARE(server.requests.size(),1);
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));QTRY_VERIFY(ready());QTRY_VERIFY(qAbs(offset()-firstOffset)<1);
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,false)));QTest::qWait(20);
+        QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));QTRY_VERIFY(ready());QTRY_VERIFY(qAbs(offset()-firstOffset)<1);QCOMPARE(server.requests.size(),1);
+        workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=workspace.activeReader();QVERIFY(second!=first);QTRY_COMPARE(second->pageCount(),1);QTRY_COMPARE(second->pendingCommands(),0);
+        send(second,2);QTRY_VERIFY(ready());QTest::qWait(20);QVERIFY(offset()<1);wheel(-480);QVERIFY(offset()>50);const auto secondOffset=offset()+40;
+        viewport()->setProperty("contentY",viewport()->property("originY").toDouble()+secondOffset);
+        // A caret/scrollbar can move before the zero-timer sampler. Replace
+        // metadata immediately and require that exact native point to survive.
+        auto *refreshingTask=visualItem(window->contentItem(),"aiSummaryTaskScroll");QVERIFY(refreshingTask);
+        QVERIFY(QMetaObject::invokeMethod(refreshingTask,"refreshMetadata"));QTRY_VERIFY(ready());QTRY_VERIFY(qAbs(offset()-secondOffset)<1);
+        QVERIFY(qAbs(secondOffset-firstOffset)>20);
+        qInfo()<<"scroll-memory captured first/second"<<firstOffset<<secondOffset<<reinterpret_cast<quintptr>(first)<<reinterpret_cast<quintptr>(second);
+        workspace.selectTab(0);QCOMPARE(workspace.activeReader(),first);QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));QTRY_VERIFY(ready());QTRY_VERIFY(qAbs(offset()-firstOffset)<1);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_AI_REFERENCE_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-scroll-first-"+theme+".png"));
+        workspace.selectTab(1);QCOMPARE(workspace.activeReader(),second);QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));QTRY_VERIFY(ready());QTRY_VERIFY2(qAbs(offset()-secondOffset)<1,qPrintable(QString("Second expected %1 observed %2, extent %3").arg(secondOffset).arg(offset()).arg(viewport()->property("contentHeight").toDouble())));
+        wheel(-120);const auto rapidOffset=offset();QVERIFY(rapidOffset>secondOffset);
+        // A rapid tab switch must retain the completed wheel event even when
+        // its deferred generic observer has not had an event-loop turn.
+        workspace.selectTab(0);QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));QTRY_VERIFY(ready());
+        workspace.selectTab(1);QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));QTRY_VERIFY(ready());QTRY_VERIFY(qAbs(offset()-rapidOffset)<1);
+        QTest::qWait(120);QCOMPARE(server.requests.size(),2);
+        for(int index=0;index<2;++index)QCOMPARE(server.requests[index].mid(server.requests[index].indexOf("\r\n\r\n")+4),wires[index]);
+        QVERIFY(!first->hasUnsavedChanges() && !second->hasUnsavedChanges());
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-scroll-second-"+theme+".png"));
     }
 
     void readingMarkdownKeepsNativeBlocksAndSafeInlineSemantics() {
