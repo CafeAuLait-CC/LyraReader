@@ -11,6 +11,7 @@
 #include "PaperAppearance.h"
 #include "PdfPrintJob.h"
 #include "NativeRaster.h"
+#include "RecentCoverCache.h"
 #include "PreviewController.h"
 #include "MockChatServer.h"
 #include "PerformanceRecorder.h"
@@ -2895,6 +2896,110 @@ private slots:
         QTest::keyClick(window,Qt::Key_Right);QTRY_VERIFY(visualItem(window->contentItem(),"overviewPage1")->hasActiveFocus());
         QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!window->property("overviewVisible").toBool());QTRY_COMPARE(window->property("currentPage").toInt(),1);
     }
+    void homeUsesCachedCoversAndMacLayout_data() {
+        QTest::addColumn<QSize>("viewport");QTest::addColumn<bool>("dark");
+        QTest::newRow("wide-light")<<QSize(1200,820)<<false;
+        QTest::newRow("narrow-dark")<<QSize(700,600)<<true;
+        QTest::newRow("compact-light")<<QSize(640,440)<<false;
+    }
+    void homeUsesCachedCoversAndMacLayout() {
+        QFETCH(QSize,viewport);QFETCH(bool,dark);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|ReferenceError:|Binding loop|Required property).*"));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());QSettings settings;
+        const auto previous=settings.value("reader/recentDocuments");
+        const auto restore=qScopeGuard([&]{settings.setValue("reader/recentDocuments",previous);});
+        QImage image(280,376,QImage::Format_ARGB32_Premultiplied);image.fill(Qt::white);
+        {QPainter p(&image);p.setPen(Qt::black);p.setFont(QFont("Sans Serif",12));p.drawText(18,35,"Public synthetic cover");for(int i=0;i<24;++i)p.drawLine(18,60+i*10,250,60+i*10);}
+        QVariantList entries;
+        for(int i=0;i<8;++i) {
+            const auto id=QString::fromLatin1(QCryptographicHash::hash(QByteArray::number(i),QCryptographicHash::Sha256).toHex());
+            QString error;const auto key=RecentCoverCache::write(id,image,&error);QVERIFY2(!key.isEmpty(),qPrintable(error));
+            entries.append(QVariantMap{{"url",QUrl::fromLocalFile(scratch.filePath(QString("Synthetic & paper %1.pdf").arg(i))).toString()},
+                {"title",QString("Synthetic & paper %1.pdf").arg(i)},{"documentId",id},{"coverKey",key},
+                {"openedAt",i ? QString{} : QString("2024-01-02T03:04:05.000Z")}});
+        }
+        settings.setValue("reader/recentDocuments",entries);
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        window->setProperty("appearance",dark?"dark":"light");window->setProperty("paperAppearance","original");
+        window->setMaximumSize(viewport);window->resize(viewport);QTRY_COMPARE(window->size(),viewport);
+        auto *home=visualItem(window->contentItem(),"welcomeView"),*grid=visualItem(window->contentItem(),"recentDocuments"),*hero=visualItem(window->contentItem(),"welcomeDropPanel");QVERIFY(home && grid && hero);
+        QTRY_COMPARE(grid->property("count").toInt(),5);QVERIFY(hero->isVisible());
+        QCOMPARE(view.workspace.recentDocuments().size(),8);QVERIFY(!view.workspace.recentDocuments()[0].toMap().value("openedDate").toString().isEmpty());
+        QVERIFY(view.workspace.recentDocuments()[1].toMap().value("openedDate").toString().isEmpty());
+        QCOMPARE(visualItem(window->contentItem(),"tabStrip")->property("count").toInt(),0);
+        QCOMPARE(visualItem(window->contentItem(),"zoomMenuButton")->property("text").toString(),QString("100% ▾"));
+        QQuickItem *cover=nullptr;QTRY_VERIFY((cover=visualItem(window->contentItem(),"recentDocumentCover0")));QTRY_COMPARE(cover->property("status").toInt(),1);
+        QCOMPARE(view.workspace.activeReader()->completedRasters(),quint64(0));QCOMPARE(view.workspace.activeReader()->pageCount(),0);
+        auto *open=visualItem(window->contentItem(),"welcomeOpen");QVERIFY(open);QCOMPARE(open->property("text").toString(),QString("Open Files…"));
+        auto *header=grid->property("headerItem").value<QQuickItem *>();QVERIFY(header);
+        qInfo()<<"Home viewport extents"<<grid->property("originY")<<grid->property("contentHeight")<<grid->height()<<header->y()<<header->height()<<grid->property("contentY");
+        auto *palette=window->property("colors").value<QObject *>();QVERIFY(palette);
+        QCOMPARE(palette->property("accentFg").value<QColor>(),QColor(dark?"#2D2417":"#FFFFFF"));
+        const auto foreground=palette->property("accentFg").value<QColor>();int foregroundPixels=0;
+        const auto foregroundReady=[&] {
+            const auto capture=window->grabWindow();if(capture.isNull())return false;
+            const auto region=open->mapRectToScene(open->boundingRect());const auto ratio=double(capture.width())/window->width();foregroundPixels=0;
+            for(int y=qMax(0,qFloor(region.top()*ratio));y<qMin(capture.height(),qCeil(region.bottom()*ratio));++y)
+                for(int x=qMax(0,qFloor(region.left()*ratio));x<qMin(capture.width(),qCeil(region.right()*ratio));++x) {
+                    const auto p=capture.pixelColor(x,y);if(qAbs(p.red()-foreground.red())<10 && qAbs(p.green()-foreground.green())<10 && qAbs(p.blue()-foreground.blue())<10)++foregroundPixels;
+                }
+            return foregroundPixels>10;
+        };
+        QTRY_VERIFY2(foregroundReady(),qPrintable(QString("Action ink %1, viewport offset %2, current card %3, button y %4")
+            .arg(foregroundPixels).arg(grid->property("contentY").toDouble()).arg(grid->property("currentIndex").toInt()).arg(open->mapToScene(QPointF()).y())));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_HOME_EVIDENCE");
+        if(!evidence.isEmpty()){QTest::qWait(50);QVERIFY(window->grabWindow().save(evidence+"-"+QString::fromLatin1(QTest::currentDataTag())+".png"));}
+        auto *all=visualItem(window->contentItem(),"viewAllRecentDocuments");QVERIFY(all);QVERIFY(QMetaObject::invokeMethod(all,"clicked"));
+        QTRY_COMPARE(grid->property("count").toInt(),8);QTRY_VERIFY(!hero->isVisible());
+        auto *back=visualItem(window->contentItem(),"recentDocumentsBack");QVERIFY(back);QTRY_VERIFY(back->hasActiveFocus());
+        QVERIFY(QMetaObject::invokeMethod(home,"focusCard",Q_ARG(QVariant,7)));
+        QTRY_COMPARE(grid->property("currentIndex").toInt(),7);
+        auto *last=visualItem(window->contentItem(),"recentDocument7");QVERIFY(last);QTRY_VERIFY(last->hasActiveFocus());
+        QTRY_VERIFY(last->mapRectToItem(grid,last->boundingRect()).top()>=-1 && last->mapRectToItem(grid,last->boundingRect()).bottom()<=grid->height()+1);
+        QTest::keyClick(window,Qt::Key_Home);QTRY_COMPARE(grid->property("currentIndex").toInt(),0);
+        QVERIFY(QMetaObject::invokeMethod(back,"clicked"));QTRY_COMPARE(grid->property("count").toInt(),5);QTRY_VERIFY(hero->isVisible());
+        auto *clear=visualItem(window->contentItem(),"clearRecentDocuments");QVERIFY(clear);QVERIFY(QMetaObject::invokeMethod(clear,"clicked"));
+        QTRY_COMPARE(grid->property("count").toInt(),0);QVERIFY(view.workspace.recentDocuments().isEmpty());
+    }
+    void recentCoversReuseCompletedRastersWithoutReopeningSources() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("recent-cover.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        WorkspaceController workspace;workspace.clearRecentDocuments();workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(RecentCoverCache::validDocumentId(reader->data().value("document_id").toString()));
+        reader->requestPage(0,.3,true);QTRY_COMPARE(reader->pendingRasters(),0);
+        QTRY_VERIFY(!workspace.recentDocuments().first().toMap().value("coverKey").toString().isEmpty());
+        const auto entry=workspace.recentDocuments().first().toMap();const auto count=reader->completedRasters();
+        QString error;const auto pixels=RecentCoverCache::read(entry.value("coverKey").toString(),&error);QVERIFY2(!pixels.isNull(),qPrintable(error));
+        QVERIFY(pixels.width()<=280 && pixels.height()<=376);QVERIFY(QFile::rename(path,path+".moved"));
+        NativeCorpus::Viewer home;QVERIFY(home.window);QTRY_COMPARE(home.workspace.recentDocuments().size(),1);
+        QQuickItem *cover=nullptr;QTRY_VERIFY((cover=visualItem(home.window->contentItem(),"recentDocumentCover0")));QTRY_COMPARE(cover->property("status").toInt(),1);
+        QCOMPARE(reader->completedRasters(),count);QCOMPARE(home.workspace.activeReader()->pageCount(),0);QVERIFY(!QFileInfo::exists(path));
+        auto *card=visualItem(home.window->contentItem(),"recentDocument0");QVERIFY(card);card->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(card->hasActiveFocus());
+        QVERIFY(QFile::rename(path+".moved",path));
+        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        const auto generation=reader->documentGeneration();
+        reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});
+        QTRY_VERIFY(reader->documentGeneration()!=generation && !reader->pendingCommands());QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        reader->requestPage(0,.3,true);QTRY_COMPARE(reader->pendingRasters(),0);
+        QTRY_VERIFY(workspace.recentDocuments().first().toMap().value("coverKey")!=entry.value("coverKey"));
+        QCOMPARE(visualItem(home.window->contentItem(),"recentDocument0"),card);QVERIFY(card->hasActiveFocus());
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);original.close();
+        reader->submit("document_discard",{});QTRY_COMPARE(reader->pendingCommands(),0);
+        workspace.clearRecentDocuments();QTRY_VERIFY(home.workspace.recentDocuments().isEmpty());QVERIFY(QFileInfo::exists(path));
+    }
+    void recentCoverCacheRejectsTraversalChangedBytesAndOversizedHeaders() {
+        const auto id=QString(64,'a');QImage image(140,188,QImage::Format_ARGB32_Premultiplied);image.fill(Qt::white);
+        QString error;const auto key=RecentCoverCache::write(id,image,&error);QVERIFY2(!key.isEmpty(),qPrintable(error));
+        QVERIFY(!RecentCoverCache::read(key,&error).isNull());QVERIFY(RecentCoverCache::read("../"+key,&error).isNull());
+        const auto folder=QStandardPaths::writableLocation(QStandardPaths::CacheLocation)+"/RecentCovers/";
+        QFile file(folder+key+".png");QVERIFY(file.open(QIODevice::Append));QCOMPARE(file.write("changed"),qint64(7));file.close();
+        QVERIFY(RecentCoverCache::read(key,&error).isNull());QVERIFY(error.contains("changed"));
+        QImage wide(281,1,QImage::Format_ARGB32_Premultiplied);wide.fill(Qt::white);QByteArray encoded;QBuffer output(&encoded);QVERIFY(output.open(QIODevice::WriteOnly));QVERIFY(wide.save(&output,"PNG"));
+        const auto badKey=id+"-"+QString::fromLatin1(QCryptographicHash::hash(encoded,QCryptographicHash::Sha256).toHex());
+        QFile malformed(folder+badKey+".png");QVERIFY(malformed.open(QIODevice::WriteOnly));QCOMPARE(malformed.write(encoded),qint64(encoded.size()));malformed.close();
+        QVERIFY(RecentCoverCache::read(badKey,&error).isNull());QVERIFY(error.contains("dimensions"));
+    }
     void recentDocumentsAndNarrowWindowRemainKeyboardReachable() {
         WorkspaceController workspace;workspace.clearRecentDocuments();
         workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));
@@ -2910,7 +3015,7 @@ private slots:
         QTRY_COMPARE(recent->property("count").toInt(),1);
         QTRY_VERIFY(visualItem(window->contentItem(),"recentDocument0"));
         auto *row=visualItem(window->contentItem(),"recentDocument0");QVERIFY(row);QTest::qWait(150);
-        QVERIFY(row->isVisible());
+        QVERIFY(row->isVisible());row->forceActiveFocus(Qt::TabFocusReason);
         auto *recentInterface=QAccessible::queryAccessibleInterface(row);QVERIFY(recentInterface);QVERIFY(recentInterface->actionInterface());QVERIFY(recentInterface->actionInterface()->actionNames().contains(QAccessibleActionInterface::pressAction()));
         QTRY_VERIFY(row->mapToScene(QPointF(0,row->height())).y()<=window->height());
         row->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
@@ -3121,6 +3226,8 @@ private slots:
     }
     void tabAddButtonFollowsTheLastTabInScrollableContent() {
         NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QTRY_COMPARE(view.workspace.activeReader()->pageCount(),1);
         auto *strip=visualItem(view.window->contentItem(),"tabStrip");QVERIFY(strip);
         for(int count:{1,2,8}) {
             while(view.workspace.tabs().size()<count)view.workspace.newTab();
@@ -9606,6 +9713,7 @@ int main(int argc, char **argv) {
     QTemporaryDir documentCacheDirectory;
     if(!documentCacheDirectory.isValid())return 2;
     qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",documentCacheDirectory.path().toUtf8());
+    qputenv("XDG_CACHE_HOME",(documentCacheDirectory.path()+"/native-cache").toUtf8());
     qputenv("LYRA_READER_INDEX_CACHE","disabled");
     QCoreApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication application(argc, argv);

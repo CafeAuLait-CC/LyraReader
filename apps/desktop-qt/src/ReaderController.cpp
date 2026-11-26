@@ -77,6 +77,7 @@ struct OpenResult {
     QVariantMap rules;
     QVariant historyLimit;
     QString revision;
+    QString documentId;
     QString error;
 };
 struct RasterResult { ResidentImage image,backdrop; QString error; double actualScale = 0; qint64 elapsedMs = 0;bool cancelled=false,pressure=false; };
@@ -185,6 +186,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         m_data.insert(QStringLiteral("recovery"),result.recovery);
         m_data.insert(QStringLiteral("xfa_status"),result.xfa);
         m_data.insert(QStringLiteral("document_revision"),result.revision);
+        m_data.insert(QStringLiteral("document_id"),result.documentId);
         m_data.insert(QStringLiteral("annotation_rules"),result.rules);
         m_data.insert(QStringLiteral("ai_history_limit"),result.historyLimit);
         if(!result.recovery.value(QStringLiteral("error")).toString().isEmpty())setError(result.recovery.value(QStringLiteral("error")).toString());
@@ -227,6 +229,7 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
         result.rules = object.value(QStringLiteral("annotation_rules")).toObject().toVariantMap();
         result.historyLimit = object.value(QStringLiteral("ai_history_limit")).toVariant();
         result.revision = object.value(QStringLiteral("revision")).toString();
+        result.documentId = object.value(QStringLiteral("document_id")).toString();
         result.source=NativeRasterSource::prepare(result.document,false,&result.error);
         return result;
     }));
@@ -429,6 +432,7 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
             m_data.clear();m_data.insert(QStringLiteral("marks"),revision.value(QStringLiteral("marks")));m_data.insert(QStringLiteral("signature_status"),info.value(QStringLiteral("signature_status")));
             m_data.insert(QStringLiteral("xfa_status"),info.value(QStringLiteral("xfa_status")));
             m_data.insert(QStringLiteral("document_revision"),info.value(QStringLiteral("revision")));
+            m_data.insert(QStringLiteral("document_id"),info.value(QStringLiteral("document_id")));
             m_data.insert(QStringLiteral("annotation_rules"),info.value(QStringLiteral("annotation_rules")));
             m_data.insert(QStringLiteral("ai_history_limit"),info.value(QStringLiteral("ai_history_limit")));
             emit documentReset();if(!current())return;emit documentChanged();if(!current())return;emit dataChanged();if(!current())return;emit textPagesChanged();if(!current())return;

@@ -611,6 +611,13 @@ impl DesktopDocument {
     }
     pub fn info(&self) -> Result<Value, String> {
         let current = self.active()?;
+        let document_id = self
+            .marks
+            .lock()
+            .map_err(|_| "Annotation state is unavailable")?
+            .cache_location()
+            .ok()
+            .and_then(|cache| cache.document_id().map(str::to_owned));
         let layout = self
             .layout
             .read()
@@ -620,7 +627,9 @@ impl DesktopDocument {
             "pages":layout.placements().iter().map(|p|json!({"index":p.index,"width":p.width_pt,"height":p.height_pt,"top":p.top_pt,"left":p.left_pt})).collect::<Vec<_>>(),
             "width":layout.content_width_pt(),"height":layout.content_height_pt(),"gap":layout.gap_pt(),"path":self.original_path,"revision":self.active()?.path(),"signature_status":self.source_signature(&current),"xfa_status":self.source_xfa(&current),"annotation_rules":desktop_annotation_rules()?,"ai_history_limit":ai_chat_history_limit(),"recovery":self.recovery_status.lock().map_err(|_|"Recovery state is unavailable")?.clone(),
         });
-        // This object is constructed here; indexing cannot depend on a file-supplied type.
+        // Private revisions keep the source cache's identity. An unavailable cache leaves
+        // this optional decoration unknown rather than blocking document reading.
+        value["document_id"] = json!(document_id);
         value["rows"] = rows;
         value["mode"] = json!(layout_mode_name(layout.mode()));
         Ok(value)
@@ -2648,6 +2657,32 @@ mod tests {
     }
 
     #[test]
+    fn home_identity_tracks_source_bytes_across_private_revisions_and_save() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = doc.info().unwrap()["document_id"].clone();
+        let staged = doc
+            .command(
+                json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}}}),
+            )
+            .unwrap();
+        assert_eq!(staged["info"]["document_id"], source);
+        assert_ne!(
+            doc.active().unwrap().document_id(),
+            source.as_str().unwrap()
+        );
+        let undo = doc.command(json!({"op":"page_undo"})).unwrap();
+        assert_eq!(undo["info"]["document_id"], source);
+        doc.command(json!({"op":"page_redo"})).unwrap();
+        let saved = doc.command(json!({"op":"document_save"})).unwrap();
+        assert_ne!(saved["info"]["document_id"], source);
+        assert_eq!(
+            saved["info"]["document_id"],
+            doc.active().unwrap().document_id()
+        );
+    }
+
+    #[test]
     fn annotation_cache_uses_document_id_and_ignores_both_adjacent_formats() {
         let fixture = Fixture::new("text-page.pdf");
         let modern = format!("{}.lyra-reader-annotations.json", fixture.path.display());
@@ -2656,6 +2691,10 @@ mod tests {
         fs::write(&legacy, b"[]").unwrap();
         let doc = fixture.open();
         let state = doc.command(json!({"op":"marks"})).unwrap();
+        assert_eq!(
+            doc.info().unwrap()["document_id"],
+            doc.active().unwrap().document_id()
+        );
         assert!(state["error"].is_null());
         assert!(state["annotations"].as_array().unwrap().is_empty());
         doc.command(json!({"op":"mark_create","entry":{"kind":"highlight","page":0,"start":0,"end":1,"color":"#E8BC5552","note":"cached only"}})).unwrap();

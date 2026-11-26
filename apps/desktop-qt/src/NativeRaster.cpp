@@ -1,4 +1,5 @@
 #include "NativeRaster.h"
+#include "RecentCoverCache.h"
 #include "PaperAppearance.h"
 #include "RasterJobs.h"
 #include <QHash>
@@ -231,7 +232,9 @@ QImage NativeImageProvider::rawImage(const QUrl &url,qint64 maximumBytes,QString
 }
 QImage NativeImageProvider::requestImage(const QString &id,QSize *size,const QSize &) {
     const QUrl url(QStringLiteral("image://lyrapreview/")+id);const QUrlQuery query(url);
-    auto image=rawImage(url);
+    const auto path=url.path().split('/',Qt::SkipEmptyParts);QString coverError;
+    auto image=path.size()==2 && path.first()==QStringLiteral("recent")
+        ? RecentCoverCache::read(path.last(),&coverError) : rawImage(url);
     if(!image.isNull())image=PaperAppearance::displayImage(image,PaperAppearance::mode(query.queryItemValue(QStringLiteral("paper"))));
     if(size)*size=image.size();
     return image;

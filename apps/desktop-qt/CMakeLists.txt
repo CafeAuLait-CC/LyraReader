@@ -37,6 +37,7 @@ target_sources(lyrareader_shell PRIVATE src/ChatGptAccounts.cpp src/ChatGptAccou
 target_sources(lyrareader_shell PRIVATE src/ContentDragItem.cpp src/ContentDragItem.h
     src/ReaderWindowFactory.cpp src/ReaderWindowFactory.h src/LocalFileIdentity.cpp src/LocalFileIdentity.h)
 target_sources(lyrareader_shell PRIVATE src/RenderTrace.cpp src/RenderTrace.h)
+target_sources(lyrareader_shell PRIVATE src/RecentCoverCache.cpp src/RecentCoverCache.h)
 target_include_directories(lyrareader_shell PUBLIC src)
 target_sources(lyrareader_shell PRIVATE src/ReaderDocumentReading.cpp src/ReaderRegionPersistence.cpp)
 target_sources(lyrareader_shell PRIVATE src/FileDialogNavigation.cpp src/FileDialogNavigation.h)
@@ -55,7 +56,7 @@ set(LYRA_READER_QML_FILES qml/NoteBadge.qml qml/ContentResizeHandles.qml qml/Mai
     qml/SettingsWindow.qml qml/PdfPreviewWindow.qml qml/ReaderChrome.qml qml/SecondaryTools.qml qml/FillSignTools.qml qml/FillSignInspector.qml qml/TypedSignatureDialog.qml qml/DrawnSignatureDialog.qml qml/SignaturePad.qml qml/ContentEditing.qml qml/ContentInspector.qml qml/ContentPageLayer.qml qml/ContentAlignmentGuides.qml qml/WelcomeView.qml qml/ReaderSidebar.qml qml/DocumentCanvas.qml qml/PageTextView.qml qml/PageInteraction.qml
     qml/PageOverview.qml qml/PageExports.qml qml/RedactionReview.qml qml/RedactionLayer.qml qml/FormOverlay.qml qml/DocumentDraftBar.qml qml/PreviewPanel.qml qml/AnnotationsLayer.qml qml/AnnotationHandles.qml qml/AnnotationTools.qml qml/SearchPanel.qml qml/AiPanel.qml qml/AiWorkspacePicker.qml qml/SummaryCatalog.qml qml/SummaryBatchResults.qml qml/AiResult.qml qml/AiConversation.qml qml/AiReadingNotes.qml qml/AiReadingScrollView.qml qml/AiReadingScrollBar.qml qml/ReaderDialogs.qml qml/QuitDialog.qml qml/ReaderLogic.js)
 file(GLOB LYRA_READER_ICONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icons/*.svg")
-list(APPEND LYRA_READER_QML_FILES qml/ReadingWheelHandler.qml qml/PanelWheelHandler.qml qml/SlidingPanel.qml)
+list(APPEND LYRA_READER_QML_FILES qml/ReadingWheelHandler.qml qml/PanelWheelHandler.qml qml/SlidingPanel.qml qml/HomeDocumentGlyph.qml)
 foreach(ICON_PATH IN LISTS LYRA_READER_ICONS)
     file(RELATIVE_PATH ICON_RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${ICON_PATH}")
     list(APPEND LYRA_READER_QML_FILES "${ICON_RELATIVE}")

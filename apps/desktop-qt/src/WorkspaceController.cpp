@@ -1,6 +1,9 @@
 #include "WorkspaceController.h"
 #include "PdfPrintJob.h"
 #include "LocalFileIdentity.h"
+#include "RecentCoverCache.h"
+#include "DateFormatting.h"
+#include "RenderBudget.h"
 #include <QPrinter>
 #include <QPrintDialog>
 #include <QPointer>
@@ -18,6 +21,11 @@
 #include <QCryptographicHash>
 #include <QSaveFile>
 #include <QTimer>
+#include <QDateTime>
+#include <QFutureWatcher>
+#include <QThreadPool>
+#include <QtConcurrentRun>
+#include <atomic>
 #include <cmath>
 #include <optional>
 
@@ -29,17 +37,25 @@ qulonglong &regionStyleRevision() {static qulonglong revision=0;return revision;
 QVariantList normalizedRecents(const QVariantList &entries) {
     QVariantList result;QSet<QString> seen;
     for(const auto &value:entries) {
-        const auto entry=value.toMap();const QUrl url(entry.value(QStringLiteral("url")).toString());
+        auto entry=value.toMap();const QUrl url(entry.value(QStringLiteral("url")).toString());
         if(!url.isLocalFile())continue;
         const QFileInfo file(url.toLocalFile());const auto normalized=QUrl::fromLocalFile(file.absoluteFilePath()).toString();
         if(seen.contains(normalized))continue;
         seen.insert(normalized);
         const auto title=entry.value(QStringLiteral("title")).toString();
-        result.append(QVariantMap{{QStringLiteral("url"),normalized},{QStringLiteral("title"),title.isEmpty()?file.fileName():title}});
-        if(result.size()==20)break;
+        entry.insert(QStringLiteral("url"),normalized);
+        entry.insert(QStringLiteral("title"),title.isEmpty()?file.fileName():title);
+        entry.insert(QStringLiteral("displayTitle"),file.completeBaseName());
+        const auto opened=QDateTime::fromString(entry.value(QStringLiteral("openedAt")).toString(),Qt::ISODateWithMs);
+        entry.insert(QStringLiteral("openedDate"),opened.isValid()
+            ? DateFormatting::format(QStringLiteral("medium"),opened.toLocalTime().date().toString(Qt::ISODate)).value(QStringLiteral("text")).toString() : QString{});
+        result.append(entry);
+        if(result.size()==100)break;
     }
     return result;
 }
+QThreadPool *coverPool() {static QThreadPool pool;static const bool ready=[] {pool.setMaxThreadCount(1);return true;}();Q_UNUSED(ready);return &pool;}
+std::atomic_int &coverJobs(){static std::atomic_int jobs{0};return jobs;}
 QString positionKey(const ReaderController *reader) {
     return QStringLiteral("reader/positions/") + QString::fromLatin1(QCryptographicHash::hash(
         reader->fileUrl().toEncoded(), QCryptographicHash::Sha256).toHex());
@@ -137,7 +153,9 @@ void WorkspaceController::connectReader(ReaderController *reader) {
     m_readerConnections.insert(reader,{
         connect(reader,&ReaderController::documentChanged,this,&WorkspaceController::tabsChanged),
         connect(reader,&ReaderController::loadingChanged,this,&WorkspaceController::tabsChanged),
-        connect(reader,&ReaderController::openFinished,this,[this,reader](bool success){if(success)remember(reader);})
+        connect(reader,&ReaderController::openFinished,this,[this,reader](bool success){if(success)remember(reader);}),
+        connect(reader,&ReaderController::pageReady,this,[this,reader](int page,double scale){if(page==0)rememberCover(reader,scale);}),
+        connect(reader,&QObject::destroyed,this,[this,reader]{m_coverAttempts.remove(reader);})
     });
 }
 ReaderController *WorkspaceController::appendTab(bool notify) {
@@ -444,14 +462,55 @@ void WorkspaceController::remember(ReaderController *reader) {
     QSettings settings;
     auto entries=normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());
     const auto url = reader->fileUrl().toString();
+    const auto id=reader->data().value(QStringLiteral("document_id")).toString();
+    QVariantMap entry;
     for (auto it=entries.begin();it!=entries.end();) {
-        if (it->toMap().value(QStringLiteral("url")).toString()==url) it=entries.erase(it);
+        if (it->toMap().value(QStringLiteral("url")).toString()==url
+                || (RecentCoverCache::validDocumentId(id) && it->toMap().value(QStringLiteral("documentId")).toString()==id)) {entry=it->toMap();it=entries.erase(it);}
         else ++it;
     }
-    entries.prepend(QVariantMap{{QStringLiteral("url"),url},{QStringLiteral("title"),reader->title()}});
-    while (entries.size()>20) entries.removeLast();
+    if(entry.value(QStringLiteral("documentId")).toString()!=id)entry.remove(QStringLiteral("coverKey"));
+    entry.insert(QStringLiteral("url"),url);entry.insert(QStringLiteral("title"),reader->title());
+    entry.insert(QStringLiteral("documentId"),id);entry.insert(QStringLiteral("openedAt"),QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    entries.prepend(entry);entries=normalizedRecents(entries);
     settings.setValue(QStringLiteral("reader/recentDocuments"),entries);
     publishRecents(entries);
+}
+void WorkspaceController::rememberCover(ReaderController *reader,double scale) {
+    const auto generation=reader->documentGeneration();const auto id=reader->data().value(QStringLiteral("document_id")).toString();
+    if(!RecentCoverCache::validDocumentId(id))return;
+    auto pixels=reader->cachedPage(0,scale,true);const int quality=pixels.isNull()?1:2;
+    if(pixels.isNull())pixels=reader->cachedBackdrop(0);
+    if(pixels.isNull() || pixels.width()>512 || pixels.height()>1024)return;
+    const auto previous=m_coverAttempts.value(reader);
+    if(previous.first==generation && previous.second>=quality)return;
+    if(coverJobs().fetch_add(1)>=4){coverJobs().fetch_sub(1);return;}
+    auto retained=ResidentImage::retain(pixels);
+    if(retained.isNull()){coverJobs().fetch_sub(1);return;}
+    m_coverAttempts.insert(reader,{generation,quality});
+    const auto url=reader->fileUrl().toString();QPointer<ReaderController> owner(reader);
+    auto *watcher=new QFutureWatcher<QPair<QString,QString>>(this);
+    connect(watcher,&QFutureWatcher<QPair<QString,QString>>::finished,this,[this,watcher,owner,generation,id,url] {
+        const auto result=watcher->result();watcher->deleteLater();
+        if(!result.second.isEmpty()) {
+            qWarning().noquote()<<"lyra-reader-recent-cover:"<<result.second;
+            if(owner && m_coverAttempts.value(owner).first==generation)m_coverAttempts.remove(owner);
+        }
+        if(result.first.isEmpty() || !owner || owner->documentGeneration()!=generation || owner->fileUrl().toString()!=url
+                || owner->data().value(QStringLiteral("document_id")).toString()!=id)return;
+        QSettings settings;auto entries=normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());
+        bool changed=false;
+        for(auto &value:entries) {auto entry=value.toMap();
+            if(entry.value(QStringLiteral("url")).toString()==url && entry.value(QStringLiteral("documentId")).toString()==id) {
+                entry.insert(QStringLiteral("coverKey"),result.first);value=entry;changed=true;
+            }
+        }
+        if(changed){settings.setValue(QStringLiteral("reader/recentDocuments"),entries);publishRecents(entries);}
+    });
+    watcher->setFuture(QtConcurrent::run(coverPool(),[id,retained=std::move(retained)] {
+        const auto finish=qScopeGuard([]{coverJobs().fetch_sub(1);});QString error;
+        const auto key=RecentCoverCache::write(id,retained.pixels,&error);return qMakePair(key,error);
+    }));
 }
 void WorkspaceController::clearRecentDocuments() {
     QSettings settings;

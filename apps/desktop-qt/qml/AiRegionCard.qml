@@ -513,7 +513,7 @@ Item {
                 text:card.notePreview ? card.plan && card.plan.consolidation ? qsTr("Send note synthesis") : qsTr("Send note request") : qsTr("Send")
                 visible:card.previewReady && !card.regionRunning
                 enabled:card.previewReady && !card.running && card.owner && card.owner.pendingCommands===0
-                icon.color:enabled ? card.app.colors.onAccent : card.app.colors.textDisabled
+                icon.color:enabled ? card.app.colors.accentFg : card.app.colors.textDisabled
                 contentItem.rotation:-45
                 background:Rectangle {
                     radius:7

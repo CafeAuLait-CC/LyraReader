@@ -230,6 +230,12 @@ fn lock_carried_cache(directory: &Path, name: &str) -> Result<Option<fs::File>, 
 }
 
 impl DocumentCache {
+    /// The source identity retained across private editing revisions, without reopening it.
+    pub fn document_id(&self) -> Option<&str> {
+        self.identity
+            .as_ref()
+            .map(|identity| identity.document_id.as_str())
+    }
     pub fn open(document: &Path, root: &Path) -> Result<Self, String> {
         Self::open_with_identity(document, root, None)
     }

@@ -139,7 +139,7 @@ ColumnLayout {
                 orientation: ListView.Horizontal
                 spacing: 4
                 clip: true
-                model: app.session ? app.session.tabs : [
+                model: app.session ? (app.session.tabs.length===1 && !app.session.tabs[0].loading && !String(app.session.tabs[0].url).length ? [] : app.session.tabs) : [
                     {
                         title: app.currentReader.title
                     }
@@ -427,7 +427,7 @@ ColumnLayout {
                 ToolButton {
                     id: zoomMenuButton
                     objectName: "zoomMenuButton"
-                    text: Math.round((app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent)) + (app.textViewVisible ? "%" : "% ▾")
+                    text: (app.currentReader.pageCount ? Math.round(app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent) : 100) + (app.textViewVisible ? "%" : "% ▾")
                     Layout.preferredWidth: 72
                     Layout.minimumWidth: 72
                     onClicked: zoomMenu.popup(0, height)

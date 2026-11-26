@@ -96,6 +96,7 @@ private:
     void connectReader(ReaderController *reader);
     static QString readerTransferBlockReason(const ReaderController *reader,bool allowEmpty);
     void remember(ReaderController *reader);
+    void rememberCover(ReaderController *reader,double scale);
     static void publishRecents(const QVariantList &entries);
     const QString m_windowTransferId;
     QList<ReaderController *> m_tabs;
@@ -104,6 +105,7 @@ private:
     bool m_tabTransfer=false;
     int m_printJobs=0;
     QVariantList m_recent;
+    QHash<ReaderController *,QPair<qulonglong,int>> m_coverAttempts;
     int m_activeIndex = 0;
     PreviewController *m_preview = new PreviewController(this);
     CredentialStore *m_credentials=nullptr;
