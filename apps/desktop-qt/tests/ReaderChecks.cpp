@@ -3542,6 +3542,82 @@ private slots:
         button->setEnabled(false);QCOMPARE(background->property("color").value<QColor>(),QColor("transparent"));QVERIFY(!menu->property("visible").toBool());
     }
 
+    void pageCornerBookmarksKeepFixedHoverGeometryAndCreateTheAnchoredDefault_data() {
+        QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void pageCornerBookmarksKeepFixedHoverGeometryAndCreateTheAnchoredDefault() {
+        QFETCH(QString,appearance);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("page-corner.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(1100,800);window->setProperty("appearance",appearance);window->setProperty("reduceMotion",true);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==3 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        auto *canvas=visualItem(window->contentItem(),"documentCanvas");QVERIFY(canvas);QQuickItem *hover=nullptr,*button=nullptr,*page=nullptr;
+        QTRY_VERIFY((hover=visualItem(canvas,"pageBookmarkHover0")) && (button=visualItem(canvas,"pageBookmarkButton0")) && (page=visualItem(canvas,"pdfPage0")));
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTest::mouseMove(window,QPoint(5,5),20);QTRY_VERIFY(!button->isVisible());
+        QCOMPARE(hover->width(),60.);QCOMPARE(hover->height(),56.);QCOMPARE(button->position(),QPointF(28,0));QCOMPARE(button->size(),QSizeF(22,36));
+        const auto corner=hover->mapToItem(page,QPointF());QCOMPARE(corner,QPointF(page->width()-62,-6));
+        const auto outsideButton=hover->mapToScene(QPointF(5,30)).toPoint();QTest::mouseMove(window,outsideButton,20);QTRY_VERIFY(button->isVisible());
+        QSignalSpy commands(reader,&ReaderController::commandFinished);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,outsideButton);QTest::qWait(30);QCOMPARE(reader->data().value("marks").toMap().value("bookmarks").toList().size(),0);
+        for(const auto &signal:commands)QVERIFY(signal[1].toString()!="bookmark_create");
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,button->mapToScene(QPointF(11,18)).toPoint());
+        auto *editor=window->findChild<QObject *>("bookmarkEditor");QVERIFY(editor);QTRY_VERIFY(editor->property("visible").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto bookmarks=reader->data().value("marks").toMap().value("bookmarks").toList();QCOMPARE(bookmarks.size(),1);QCOMPARE(bookmarks.first().toMap().value("title").toString(),QString("Page 1"));QCOMPARE(bookmarks.first().toMap().value("yPt").toDouble(),0.);
+        auto *field=visualItem(window->contentItem(),"bookmarkNameField");QVERIFY(field);QTRY_VERIFY(field->hasActiveFocus());QCOMPARE(field->property("selectedText").toString(),QString("Page 1"));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"-page-corner-"+appearance+".png"));
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!editor->property("visible").toBool());QTest::mouseMove(window,QPoint(5,5),20);QVERIFY(button->isVisible());
+        auto *accessible=QAccessible::queryAccessibleInterface(button);QVERIFY(accessible);QCOMPARE(accessible->text(QAccessible::Name),QString("Edit bookmark on page 1"));
+        button->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(editor->property("visible").toBool());QCOMPARE(reader->data().value("marks").toMap().value("bookmarks").toList(),bookmarks);
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!editor->property("visible").toBool());
+        reader->submit("marks_undo");QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(reader->data().value("marks").toMap().value("bookmarks").toList().isEmpty());
+        QTest::mouseMove(window,QPoint(5,5),20);QTRY_VERIFY(!button->isVisible());
+        QFile cache(reader->data().value("marks").toMap().value("path").toString());QVERIFY(cache.open(QIODevice::Append));QCOMPARE(cache.write("\n"),qint64(1));cache.close();QVERIFY(cache.open(QIODevice::ReadOnly));const auto external=cache.readAll();cache.close();
+        QVERIFY(QMetaObject::invokeMethod(hover,"activate"));QTRY_VERIFY(!reader->pendingCommands() && !reader->error().isEmpty());QVERIFY(!editor->property("visible").toBool());QVERIFY(!window->property("operationStatus").toString().isEmpty());QVERIFY(reader->data().value("marks").toMap().value("bookmarks").toList().isEmpty());QVERIFY(cache.open(QIODevice::ReadOnly));QCOMPARE(cache.readAll(),external);
+    }
+
+
+    void pageCornerBookmarksFollowZoomFacingScrollAndRejectLateOwners() {
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("corner-layout.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(1200,850);window->setProperty("reduceMotion",true);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==3 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        auto *canvas=visualItem(window->contentItem(),"documentCanvas");QVERIFY(canvas);
+        for(const QString mode:{QString("Continuous"),QString("Facing")}) {
+            QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,mode)));QTRY_COMPARE(reader->pendingCommands(),0);
+            for(double zoom:{.25,1.,3.}) {
+                window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));
+                QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,2),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+                QQuickItem *hover=nullptr,*page=nullptr,*button=nullptr;QTRY_VERIFY((hover=visualItem(canvas,"pageBookmarkHover2")) && (page=visualItem(canvas,"pdfPage2")) && (button=visualItem(canvas,"pageBookmarkButton2")));
+                QCOMPARE(hover->mapToItem(page,QPointF()),QPointF(page->width()-62,-6));QCOMPARE(hover->size(),QSizeF(60,56));QCOMPARE(button->size(),QSizeF(22,36));
+                const auto scene=hover->mapToItem(canvas,QPointF());const auto frame=hover->property("viewportFrame").toRectF();QVERIFY(QLineF(scene,frame.topLeft()).length()<.01);
+                const bool intersects=QRectF(scene,hover->size()).intersects(QRectF(QPointF(),canvas->size()));QCOMPARE(hover->property("inViewport").toBool(),intersects);
+            }
+        }
+        QVERIFY(QMetaObject::invokeMethod(window,"setPageLayout",Q_ARG(QVariant,"Continuous")));QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,1.),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        QVERIFY(reader->captureAiRegion(0,{{"x",40},{"y",80},{"width",180},{"height",70}},1));QTRY_VERIFY(reader->aiRegion().contains("image_png"));
+        auto *card=window->findChild<QObject *>("aiRegionCard");QVERIFY(card);QVERIFY(QMetaObject::invokeMethod(card,"open"));QTRY_VERIFY(reader->aiRegionPaper().contains("rows") && !reader->aiRegionPaper().value("loading").toBool());
+        QTRY_VERIFY(visualItem(canvas,"pageBookmarkHover0"));const auto countFlags=[&](auto &&self,QQuickItem *item)->int{int count=item->objectName()=="pageBookmarkHover0";for(auto *child:item->childItems())count+=self(self,child);return count;};QCOMPARE(countFlags(countFlags,canvas),1);
+        auto *paper=visualItem(canvas,"pdfPage0");QVERIFY(paper);QCOMPARE(visualItem(canvas,"pageBookmarkHover0")->mapToItem(paper,QPointF()),QPointF(paper->width()-62,-6));
+        reader->clearAiRegion();QVERIFY(settleReaderViewport(window));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));
+        auto *flag=visualItem(canvas,"pageBookmarkHover0");QVERIFY(flag);auto *editor=window->findChild<QObject *>("bookmarkEditor");QVERIFY(editor);QVERIFY(QMetaObject::invokeMethod(flag,"activate"));
+        view.workspace.newTab();QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!editor->property("visible").toBool());QCOMPARE(reader->data().value("marks").toMap().value("bookmarks").toList().size(),1);QVERIFY(!view.workspace.activeReader()->hasUnsavedChanges());
+        view.workspace.selectTab(0);QTRY_VERIFY(window->property("currentReader").value<QObject *>()==reader);QVERIFY(settleReaderViewport(window));
+        reader->submit("bookmark_create",{{"page",0},{"title","Second bookmark on the same page"}});QTRY_COMPARE(reader->pendingCommands(),0);
+        QTRY_VERIFY((flag=visualItem(canvas,"pageBookmarkHover0")));QVERIFY(QMetaObject::invokeMethod(flag,"activate"));QTRY_VERIFY(editor->property("visible").toBool());
+        auto *field=visualItem(window->contentItem(),"bookmarkNameField");QVERIFY(field);QCOMPARE(field->property("text").toString(),QString("Page 1"));QVERIFY(QQmlProperty(field,"text").write("Saved corner name"));QVERIFY(QMetaObject::invokeMethod(field,"accepted"));QTRY_VERIFY(!editor->property("visible").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,false)));QTRY_VERIFY_WITH_TIMEOUT(!reader->pendingCommands() && !reader->hasUnsavedChanges(),15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reopened.pageCount()==3 && !reopened.loading() && !reopened.pendingCommands());QCOMPARE(reopened.data().value("marks").toMap().value("bookmarks").toList().first().toMap().value("title").toString(),QString("Saved corner name"));
+        QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,2),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));QTRY_VERIFY((flag=visualItem(canvas,"pageBookmarkHover2")));QVERIFY(QMetaObject::invokeMethod(flag,"activate"));QVERIFY(QMetaObject::invokeMethod(window,"navigate",Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!editor->property("visible").toBool());QCOMPARE(reader->data().value("marks").toMap().value("bookmarks").toList().last().toMap().value("page").toInt(),2);
+    }
+
+    void pageCornerBookmarksRemainLocalOnReadOnlyPdfKinds_data() {
+        QTest::addColumn<QString>("fixture");QTest::newRow("xfa")<<QString("xfa-refusal.pdf");QTest::newRow("signed")<<QString("signed-signature.pdf");
+    }
+    void pageCornerBookmarksRemainLocalOnReadOnlyPdfKinds() {
+        QFETCH(QString,fixture);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("read-only-corner.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/"+fixture,path));QFile pdf(path);QVERIFY(pdf.open(QIODevice::ReadOnly));const auto original=pdf.readAll();pdf.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->setProperty("reduceMotion",true);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));
+        auto *flag=visualItem(window->contentItem(),"pageBookmarkHover0");QVERIFY(flag);QVERIFY(flag->property("contextCurrent").toBool());QVERIFY(QMetaObject::invokeMethod(flag,"activate"));auto *editor=window->findChild<QObject *>("bookmarkEditor");QVERIFY(editor);QTRY_VERIFY(editor->property("visible").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(reader->data().value("marks").toMap().value("bookmarks").toList().size(),1);QVERIFY(pdf.open(QIODevice::ReadOnly));QCOMPARE(pdf.readAll(),original);
+    }
+
     void bookmarkSidebarKeepsMacRowsAndAnchoredEditor_data() {
         QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
@@ -10171,7 +10247,13 @@ Rectangle {
         window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"ai")));
         reader->setAiInput("action",0);auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY2_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),qPrintable(reader->aiState().value("status").toString()),10000);QCOMPARE(server.requests.size(),0);
         const auto plan=reader->aiState().value("plan").toMap();QVERIFY(plan.value("is_local").toBool());
-        auto *send=window->findChild<QQuickItem *>("sendAiRequest");QVERIFY(send);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
+        auto *send=window->findChild<QQuickItem *>("sendAiRequest");QVERIFY(send);
+        // Preparing a local preview can finish before the drawer enters the window.
+        // Inject the pointer only after its real layout and clipping have settled.
+        QVERIFY(settleReaderViewport(window));QVERIFY(send->isVisible() && send->isEnabled());
+        const auto sendBounds=send->mapRectToScene(send->boundingRect());
+        QVERIFY2(QRectF(QPointF(),QSizeF(window->size())).contains(sendBounds),qPrintable(QString("Send target outside window: %1,%2 %3x%4").arg(sendBounds.x()).arg(sendBounds.y()).arg(sendBounds.width()).arg(sendBounds.height())));
+        QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,sendBounds.center().toPoint());
         QTRY_COMPARE(server.requests.size(),1);QVERIFY(reader->aiState().value("running").toBool());
         workspace.newTab();auto *other=workspace.activeReader();other->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));QTRY_COMPARE_WITH_TIMEOUT(other->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(other->pendingCommands(),0,10000);
         QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(other->aiState().value("output").toString().isEmpty());QVERIFY(reader->aiState().value("output").toString().contains("Answer"));QVERIFY(!reader->aiState().value("output").toString().contains("provider rationale"));QCOMPARE(reader->aiState().value("reasoning").toString(),QString("provider rationale"));QCOMPARE(reader->aiState().value("usage").toMap().value("total_tokens").toInt(),10);

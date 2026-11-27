@@ -1516,8 +1516,19 @@ impl Marks {
                 })?;
             }
             "bookmark_create" => {
-                let entry = json!({"id":uuid()?,"kind":"bookmark","page":r["page"],"title":r["title"],"yPt":r.get("yPt").cloned().unwrap_or(json!(0)),"createdAt":now()});
-                validate(&entry, self.page_count)?;
+                // An absent name requests the shared default. Explicit empty,
+                // null, or incorrectly typed names retain their codec contract.
+                let title = r.get("title").cloned().unwrap_or(json!(""));
+                let mut entry = json!({"id":uuid()?,"kind":"bookmark","page":r["page"],"title":title,"yPt":r.get("yPt").cloned().unwrap_or(json!(0)),"createdAt":now()});
+                if !validate(&entry, self.page_count)? {
+                    return Err("Unsupported bookmark".into());
+                }
+                if r.get("title").is_none() {
+                    // Validate the page before calling the display formatter,
+                    // which deliberately clamps invalid display-only inputs.
+                    let page = entry["page"].as_i64().ok_or("Invalid bookmark page")?;
+                    entry["title"] = json!(bookmark_title(None, page));
+                }
                 self.change(|s| {
                     s.entries.push(Entry::Known(entry));
                     Ok(())

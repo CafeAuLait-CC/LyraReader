@@ -60,6 +60,7 @@ set(LYRA_READER_QML_FILES qml/NoteBadge.qml qml/ContentResizeHandles.qml qml/Mai
 file(GLOB LYRA_READER_ICONS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icons/*.svg")
 list(APPEND LYRA_READER_QML_FILES qml/AiTermPopup.qml qml/AiMathBlock.qml qml/ReadingTextToolTip.qml)
 list(APPEND LYRA_READER_QML_FILES qml/LyraMenu.qml qml/LyraMenuItem.qml qml/LyraMenuSeparator.qml)
+list(APPEND LYRA_READER_QML_FILES qml/PageBookmarkFlag.qml)
 list(APPEND LYRA_READER_QML_FILES qml/ReadingWheelHandler.qml qml/PanelWheelHandler.qml qml/SlidingPanel.qml qml/HomeDocumentGlyph.qml qml/LyraReadingSegmentedPicker.qml qml/ReadingPrimaryButton.qml qml/ReadingTextField.qml qml/ReadingNotice.qml)
 foreach(ICON_PATH IN LISTS LYRA_READER_ICONS)
     file(RELATIVE_PATH ICON_RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" "${ICON_PATH}")

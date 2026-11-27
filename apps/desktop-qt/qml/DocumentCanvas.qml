@@ -563,6 +563,17 @@ Item {
                         width: 34
                         height: 34
                     }
+                    PageBookmarkFlag {
+                        app: canvas.app
+                        page: sheet.modelData.index
+                        viewport: canvas
+                        z: 20
+                        x: sheet.width - 62
+                        y: -6
+                        placementRevision: [rowItem.x, rowItem.y, sheet.x, sheet.y, sheet.width, sheet.height,
+                            pageList.contentX, pageList.contentY, pageList.originY, canvas.placementEpoch,
+                            canvas.paperProgress, canvas.width, canvas.height]
+                    }
                 }
             }
         }

@@ -1349,7 +1349,6 @@ ApplicationWindow {
             showSidebar("bookmarks");
             currentReader.submit("bookmark_create", {
                 page: currentPage,
-                title: qsTr("Page %1").arg(currentPage + 1),
                 yPt: canvas.pageOffset(currentPage)
             });
         }
@@ -1359,6 +1358,9 @@ ApplicationWindow {
     }
     function editBookmarkAt(bookmark, index, anchor) {
         dialogs.openBookmark(bookmark, index, anchor);
+    }
+    function editPageBookmarkAt(bookmark, index, anchor) {
+        dialogs.openBookmark(bookmark, index, anchor, true);
     }
     function annotationAt(page, x, y, inkOnly) {
         if(!inkOnly) {

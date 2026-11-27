@@ -160,6 +160,7 @@ Item {
     property var bookmarkOwner: null
     property var bookmarkGeneration: null
     property var bookmarkAnchor: null
+    property bool bookmarkAbove: false
     property double bookmarkRequest: -1
     property string bookmarkError: ""
     function bookmarkContextCurrent() {
@@ -167,12 +168,13 @@ Item {
             && !bookmarkOwner.documentRevisionPending && bookmarkGeneration===bookmarkOwner.documentGeneration
             && editingBookmark && app.bookmarks.some(function(b){return b.id===editingBookmark.id;});
     }
-    function openBookmark(bookmark, index, anchor) {
+    function openBookmark(bookmark, index, anchor, above) {
         if (!bookmark || !app.currentReader || app.currentReader.loading || app.currentReader.documentRevisionPending
                 || !app.bookmarks.some(function(b){return b.id===bookmark.id;})) return;
         bookmarkOwner=app.currentReader;
         bookmarkGeneration=bookmarkOwner.documentGeneration;
         bookmarkAnchor=anchor;
+        bookmarkAbove=above===true;
         bookmarkRequest=-1;
         bookmarkError="";
         editingBookmark = Object.assign({},bookmark);
@@ -245,11 +247,15 @@ Item {
         onAboutToShow: {
             const anchor=dialogs.bookmarkAnchor;
             const p=anchor ? anchor.mapToItem(parent,0,anchor.height) : Qt.point((app.width-width)/2,(app.height-height)/2);
+            if(anchor && dialogs.bookmarkAbove) {
+                const top=anchor.mapToItem(parent,0,0).y-height;
+                if(top>=8)p.y=top;
+            }
             x=Math.max(8,Math.min(parent.width-width-8,p.x));
             y=Math.max(8,Math.min(parent.height-height-8,p.y));
         }
         onOpened: {bookmarkTitle.forceActiveFocus();bookmarkTitle.selectAll();}
-        onClosed: {dialogs.editingBookmark=null;dialogs.bookmarkOwner=null;dialogs.bookmarkGeneration=null;dialogs.bookmarkAnchor=null;dialogs.bookmarkRequest=-1;}
+        onClosed: {dialogs.editingBookmark=null;dialogs.bookmarkOwner=null;dialogs.bookmarkGeneration=null;dialogs.bookmarkAnchor=null;dialogs.bookmarkAbove=false;dialogs.bookmarkRequest=-1;}
         background: Rectangle { color:app.colors.menuBg; radius:8; border.width:1; border.color:app.colors.controlBorder }
         contentItem: ColumnLayout {
             spacing: 14

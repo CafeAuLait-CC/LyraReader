@@ -3557,6 +3557,75 @@ mod tests {
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
     #[test]
+    fn page_corner_bookmarks_default_only_an_omitted_name_and_keep_manual_order() {
+        let fixture = Fixture::new("multipage.pdf");
+        let sidecar = cache_path(&fixture.path);
+        let foreign = r#"{ "kind":"future-tool", "future":[1, 2, 3] }"#;
+        fs::write(&sidecar, format!("[{foreign}]\n")).unwrap();
+        let doc = fixture.open();
+        let created = doc
+            .command(json!({"op":"bookmark_create","page":2}))
+            .unwrap();
+        let first = created["bookmarks"][0].clone();
+        assert_eq!(first["title"], bookmark_title(None, 2));
+        assert_eq!(first["yPt"], 0);
+        assert!(fs::read_to_string(&sidecar).unwrap().contains(foreign));
+        let explicit = doc
+            .command(json!({"op":"bookmark_create","page":0,"title":"  Kept 😀  "}))
+            .unwrap();
+        assert_eq!(explicit["bookmarks"][0], first);
+        assert_eq!(explicit["bookmarks"][1]["title"], "  Kept 😀  ");
+        let empty = doc
+            .command(json!({"op":"bookmark_create","page":1,"title":""}))
+            .unwrap();
+        assert_eq!(empty["bookmarks"][2]["title"], "");
+        let undone = doc.command(json!({"op":"marks_undo"})).unwrap();
+        assert_eq!(undone["bookmarks"], explicit["bookmarks"]);
+        let redone = doc.command(json!({"op":"marks_redo"})).unwrap();
+        assert_eq!(redone["bookmarks"], empty["bookmarks"]);
+        let copy = fixture.directory.join("corner-copy.pdf");
+        doc.command(json!({"op":"save_current_annotations","destination":copy}))
+            .unwrap();
+        let reopened = open_fixture_document(&copy, None)
+            .unwrap()
+            .command(json!({"op":"marks"}))
+            .unwrap();
+        assert_eq!(reopened["bookmarks"].as_array().unwrap().len(), 3);
+        assert_eq!(reopened["bookmarks"][0]["title"], "Page 3");
+        assert_eq!(reopened["bookmarks"][1]["title"], "  Kept 😀  ");
+    }
+
+    #[test]
+    fn page_corner_bookmarks_refuse_invalid_arguments_without_cache_or_history_changes() {
+        let fixture = Fixture::new("multipage.pdf");
+        let doc = fixture.open();
+        for request in [
+            json!({"op":"bookmark_create","page":-1}),
+            json!({"op":"bookmark_create","page":3}),
+            json!({"op":"bookmark_create","page":u64::MAX}),
+            json!({"op":"bookmark_create","page":"0"}),
+            json!({"op":"bookmark_create"}),
+            json!({"op":"bookmark_create","page":0,"title":null}),
+            json!({"op":"bookmark_create","page":0,"title":1}),
+            json!({"op":"bookmark_create","page":0,"yPt":-1}),
+        ] {
+            let before = doc.command(json!({"op":"marks"})).unwrap();
+            assert!(doc.command(request.clone()).is_err(), "{request}");
+            assert_eq!(doc.command(json!({"op":"marks"})).unwrap(), before);
+        }
+        doc.command(json!({"op":"bookmark_create","page":0}))
+            .unwrap();
+        let sidecar = cache_path(&fixture.path);
+        let external = b"[]\n";
+        fs::write(&sidecar, external).unwrap();
+        assert!(
+            doc.command(json!({"op":"bookmark_create","page":1}))
+                .is_err()
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), external);
+    }
+
+    #[test]
     fn annotations_bookmarks_and_future_entries_survive_verified_replace() {
         let fixture = Fixture::new("text-page.pdf");
         let original = fs::read(&fixture.path).unwrap();
