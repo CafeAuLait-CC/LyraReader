@@ -353,88 +353,88 @@ Item {
             app.exportContext=null;
         }
     }
-    Menu {
+    LyraMenu {
         id: selection
         parent: Overlay.overlay
-        MenuItem {
+        LyraMenuItem {
             objectName:"editAnnotationTextAction"
             text:qsTr("Edit Annotation Text")
             enabled:app.canModifyPdf && !!app.selectedAnnotation && app.selectedAnnotation.kind==="textBox" && !Logic.annotationUnsupportedReason(app.selectedAnnotation).length
             onTriggered:app.selectAnnotation(app.selectedAnnotation,true)
         }
-        MenuItem {
+        LyraMenuItem {
             objectName:"annotationPropertiesAction"
             text:qsTr("Annotation Properties…")
             enabled:!!app.selectedAnnotation
             onTriggered:app.showAnnotationProperties()
         }
-        MenuSeparator {}
-        MenuItem {
+        LyraMenuSeparator {}
+        LyraMenuItem {
             text: qsTr("Copy Text")
             enabled: !!app.selection
             onTriggered: app.copySelection()
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Highlight")
             enabled: app.canModifyPdf && !!app.selection
             onTriggered: app.markSelection("highlight")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Underline")
             enabled: app.canModifyPdf && !!app.selection
             onTriggered: app.markSelection("underline")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Strikethrough")
             enabled: app.canModifyPdf && !!app.selection
             onTriggered: app.markSelection("strikeout")
         }
-        MenuSeparator {}
-        MenuItem {
+        LyraMenuSeparator {}
+        LyraMenuItem {
             text: qsTr("Translate in Place…")
             Accessible.description:qsTr("With page focus, Control+Shift+L opens translation previews.")
             enabled: !!app.selection
             onTriggered: {app.currentReader.setAiInput("action",3);app.currentReader.setAiInput("inplace",true);app.showAiPanel(true);}
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Ask AI about Selection")
             enabled: !!app.selection
             onTriggered: { app.currentReader.setAiInput("action",2); app.showAiPanel(true); }
         }
     }
-    Menu {
+    LyraMenu {
         id: exports
         parent: Overlay.overlay
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Save Annotated Copy…")
             enabled: app.canModifyPdf
             onTriggered: app.chooseExport("annotations")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Save and Replace Original…")
             enabled: app.canModifyPdf && !app.originalReadOnly
             onTriggered: app.confirmReplace("annotations")
         }
-        MenuSeparator {}
-        MenuItem {
+        LyraMenuSeparator {}
+        LyraMenuItem {
             text: qsTr("Save Filled Form Copy…")
             enabled: app.canModifyPdf
             onTriggered: app.chooseExport("forms")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Save Edited Copy…")
             enabled: app.canModifyPdf && app.pageEditsPending
             onTriggered: app.chooseExport("pages")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Export Annotations as Markdown…")
             onTriggered: app.chooseExport("markdown")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Export Annotations as CSV…")
             onTriggered: app.chooseExport("csv")
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Export BibTeX…")
             onTriggered: app.chooseExport("bibtex")
         }

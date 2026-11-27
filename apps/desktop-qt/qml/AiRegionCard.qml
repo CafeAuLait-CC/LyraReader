@@ -377,27 +377,28 @@ Item {
                 elide:Text.ElideRight;font.pixelSize:12;color:card.app.colors.textSecondary
             }
             LyraToolButton {
+                id: regionActionsButton
                 objectName:"aiRegionActions";symbol:"more";text:qsTr("Conversation actions")
-                onClicked:actions.popup(0,height)
-                Menu {
+                onClicked:actions.openBelow(regionActionsButton)
+                LyraMenu {
                     id: actions
                     objectName:"aiRegionActionMenu"
-                    MenuItem {text:card.showingNote ? qsTr("Show Conversation") : qsTr("Show Reading Note");enabled:card.hasNote;onTriggered:card.showingNote=!card.showingNote}
-                    MenuItem {
+                    LyraMenuItem {text:card.showingNote ? qsTr("Show Conversation") : qsTr("Show Reading Note");enabled:card.hasNote;onTriggered:card.showingNote=!card.showingNote}
+                    LyraMenuItem {
                         objectName:"prepareAiRegionKnowledge"
                         text:qsTr("Finish & Make Note…")
                         enabled:!!card.attachment.completed_turn_count && !card.candidate && !!card.owner && !!card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
                         onTriggered:card.prepareKnowledge()
                     }
-                    MenuItem {objectName:"saveAiRegionNote";text:qsTr("Save to Reading Notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onTriggered:card.owner.saveAiRegionNote()}
-                    MenuItem {text:qsTr("Request Details");enabled:card.previewReady;onTriggered:payload.open()}
-                    MenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable && card.chatGptAccounts.connectionMode==="legacy";height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
-                    MenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openReadingNotes()}
-                    MenuItem {text:qsTr("Open in AI Panel");enabled:!!card.attachment.saved && !!card.attachment.history_id;onTriggered:card.app.openSavedReadingNote(card.attachment.history_id)}
-                    MenuItem {text:qsTr("Read document (optional)…");enabled:!!card.owner && !!card.owner.documentReading.choice_pending;onTriggered:card.app.openDocumentReading()}
-                    MenuSeparator {}
-                    MenuItem {text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onTriggered:card.app.armRegion()}
-                    MenuItem {text:qsTr("Clear area");enabled:!card.running && !!card.owner;onTriggered:card.owner.clearAiRegion()}
+                    LyraMenuItem {objectName:"saveAiRegionNote";text:qsTr("Save to Reading Notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onTriggered:card.owner.saveAiRegionNote()}
+                    LyraMenuItem {text:qsTr("Request Details");enabled:card.previewReady;onTriggered:payload.open()}
+                    LyraMenuItem {objectName:"prepareAiRegionWithChatGpt";text:qsTr("Preview with ChatGPT plan");visible:card.chatGptAvailable && card.chatGptAccounts.connectionMode==="legacy";height:visible ? implicitHeight : 0;enabled:card.canPrepare && !card.chatGptAccounts.busy;onTriggered:card.prepareWithChatGpt()}
+                    LyraMenuItem {text:qsTr("All Reading Notes");onTriggered:card.app.openReadingNotes()}
+                    LyraMenuItem {text:qsTr("Open in AI Panel");enabled:!!card.attachment.saved && !!card.attachment.history_id;onTriggered:card.app.openSavedReadingNote(card.attachment.history_id)}
+                    LyraMenuItem {text:qsTr("Read document (optional)…");enabled:!!card.owner && !!card.owner.documentReading.choice_pending;onTriggered:card.app.openDocumentReading()}
+                    LyraMenuSeparator {}
+                    LyraMenuItem {text:qsTr("New area");enabled:!card.running && !card.attachment.loading;onTriggered:card.app.armRegion()}
+                    LyraMenuItem {text:qsTr("Clear area");enabled:!card.running && !!card.owner;onTriggered:card.owner.clearAiRegion()}
                 }
             }
             LyraToolButton {

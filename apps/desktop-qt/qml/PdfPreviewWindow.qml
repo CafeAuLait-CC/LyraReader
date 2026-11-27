@@ -96,15 +96,17 @@ ApplicationWindow {
                 id:more
                 objectName:"previewMoreButton"
                 symbol:"more";text:qsTr("Preview actions")
-                onClicked:actions.popup(0,height)
-                Menu {
+                selected:actions.visible
+                Accessible.description:actions.visible ? qsTr("Expanded") : qsTr("Collapsed")
+                onClicked:actions.openBelow(more)
+                LyraMenu {
                     id:actions
-                    MenuItem {text:qsTr("Fit width");enabled:!!preview.pageSize;onTriggered:preview.fitWidth()}
-                    MenuItem {text:calibration.fallbackReason.length ? qsTr("100% (uncalibrated)") : qsTr("Actual Size");enabled:!!preview.pageSize;onTriggered:preview.actualSize()}
-                    MenuItem {text:qsTr("Read page text");checkable:true;checked:preview.textMode;enabled:!!preview.pageSize;onTriggered:preview.readText()}
-                    MenuItem {text:qsTr("Copy page text");enabled:!!preview.previewReader && !!preview.previewReader.textPages[String(preview.page)];onTriggered:preview.copyPageText()}
-                    MenuSeparator {}
-                    MenuItem {text:qsTr("Close preview");onTriggered:preview.close()}
+                    LyraMenuItem {text:qsTr("Fit width");enabled:!!preview.pageSize;onTriggered:preview.fitWidth()}
+                    LyraMenuItem {text:calibration.fallbackReason.length ? qsTr("100% (uncalibrated)") : qsTr("Actual Size");enabled:!!preview.pageSize;onTriggered:preview.actualSize()}
+                    LyraMenuItem {text:qsTr("Read page text");checkable:true;checked:preview.textMode;enabled:!!preview.pageSize;onTriggered:preview.readText()}
+                    LyraMenuItem {text:qsTr("Copy page text");enabled:!!preview.previewReader && !!preview.previewReader.textPages[String(preview.page)];onTriggered:preview.copyPageText()}
+                    LyraMenuSeparator {}
+                    LyraMenuItem {text:qsTr("Close preview");onTriggered:preview.close()}
                 }
             }
         }

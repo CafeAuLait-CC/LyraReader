@@ -145,7 +145,7 @@ Item {
         owner.setAiInput("translationScope", index ? "selection" : "document");
         timeline.positionViewAtBeginning();
     }
-    function openMore(anchor) { more.parent = anchor; more.popup(0, anchor.height); }
+    function openMore(anchor) { more.openBelow(anchor); }
     // Observe the combined state itself. Dependency change handlers may run
     // before this derived value settles, leaving the final reload suppressed.
     onCoveredChanged: if (initialized) {
@@ -352,16 +352,16 @@ Item {
             Item { height: 18; width: 1 }
         }
     }
-    Menu {
+    LyraMenu {
         id: more
         focus: true
-        background: Rectangle { radius: 6; color: app.colors.menuBg; border.color: app.colors.separator }
-        MenuItem { objectName: "openAiTranslationHistory"; text: qsTr("Translation history…"); enabled: !translationTask.panel.running && !translationTask.owner.pendingCommands; onTriggered: translationTask.panel.openTranslationHistory() }
-        MenuItem { text: qsTr("Translate in place…"); enabled: !translationTask.panel.running; onTriggered: { const reader = translationTask.owner; reader.setAiInput("translationScope", "selection"); reader.setAiInput("inplace", true); } }
-        MenuItem { text: qsTr("Copy latest translation"); enabled: !!translationTask.panel.result.output; onTriggered: if (app.session) app.session.copyText(translationTask.panel.pairedTranslation.length ? translationTask.panel.pairedTranslation.map(block => block.translation).join("\n\n") : translationTask.panel.result.output) }
-        MenuItem { text: qsTr("Request payload…"); enabled: !!translationTask.panel.plan; onTriggered: translationTask.panel.inspectPayload() }
-        MenuItem { text: qsTr("Document Reading…"); enabled: !translationTask.owner.snapshotReadOnly; onTriggered: app.openDocumentReading() }
-        MenuItem { text: qsTr("Local audit trail…"); onTriggered: app.showAuditTrail() }
+
+        LyraMenuItem { objectName: "openAiTranslationHistory"; text: qsTr("Translation history…"); enabled: !translationTask.panel.running && !translationTask.owner.pendingCommands; onTriggered: translationTask.panel.openTranslationHistory() }
+        LyraMenuItem { text: qsTr("Translate in place…"); enabled: !translationTask.panel.running; onTriggered: { const reader = translationTask.owner; reader.setAiInput("translationScope", "selection"); reader.setAiInput("inplace", true); } }
+        LyraMenuItem { text: qsTr("Copy latest translation"); enabled: !!translationTask.panel.result.output; onTriggered: if (app.session) app.session.copyText(translationTask.panel.pairedTranslation.length ? translationTask.panel.pairedTranslation.map(block => block.translation).join("\n\n") : translationTask.panel.result.output) }
+        LyraMenuItem { text: qsTr("Request payload…"); enabled: !!translationTask.panel.plan; onTriggered: translationTask.panel.inspectPayload() }
+        LyraMenuItem { text: qsTr("Document Reading…"); enabled: !translationTask.owner.snapshotReadOnly; onTriggered: app.openDocumentReading() }
+        LyraMenuItem { text: qsTr("Local audit trail…"); onTriggered: app.showAuditTrail() }
     }
     AiTermPopup {id: termPopup; app: translationTask.app; task: translationTask}
 }

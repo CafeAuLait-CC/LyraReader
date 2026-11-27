@@ -32,14 +32,14 @@ ColumnLayout {
         }
         ReadingTextToolTip {app: block.app; area: parent}
     }
-    Menu {
+    LyraMenu {
         id: sourceMenu
         parent: area
         objectName: block.textName + "MathMenu"
         property string sourceSnapshot: ""
         onAboutToShow: sourceSnapshot = block.sourceText
-        background: Rectangle {radius: 6; color: block.app.colors.menuBg; border.color: block.app.colors.separator}
-        MenuItem {
+
+        LyraMenuItem {
             objectName: block.textName + "CopyMathSource"
             text: qsTr("Copy LaTeX source")
             onTriggered: if(block.app.session)block.app.session.copyText(sourceMenu.sourceSnapshot)

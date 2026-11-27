@@ -155,17 +155,18 @@ Item {
                 Accessible.name:qsTr("Translation for page %1: %2").arg(translationLayer.page+1).arg(Array.from(overlay.target.source_text.slice(0,162)).slice(0,80).join(""))
                 Accessible.description:qsTr("%1 using %2. Open the menu for full text or the original.").arg(overlay.modelData.language || "").arg(overlay.modelData.model || "")
                 ToolTip.visible:hovered;ToolTip.text:qsTr("Full translation or original")
+                // A page-local disclosure keeps its own anchor, independently of toolbar menus.
                 onClicked:menu.popup(0,height)
-                Menu {
+                LyraMenu {
                     id:menu
                     objectName:"translationMenu"
                     parent:chip;focus:true
-                    MenuItem {
+                    LyraMenuItem {
                         objectName:"translationToggleOriginal"
                         text: overlay.original ? qsTr("Show saved translation") : qsTr("Show original")
                         onTriggered:translationLayer.toggleOriginal(overlay.modelData.id)
                     }
-                    MenuItem {objectName:"translationShowFull";text:qsTr("Full translation…");onTriggered:translationLayer.showFull(overlay.modelData)}
+                    LyraMenuItem {objectName:"translationShowFull";text:qsTr("Full translation…");onTriggered:translationLayer.showFull(overlay.modelData)}
                 }
             }
 

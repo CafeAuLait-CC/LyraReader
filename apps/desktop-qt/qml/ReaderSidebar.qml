@@ -9,7 +9,7 @@ Pane {
     id: sidebarPanel
     required property var app
     padding: 0
-    component BookmarkOption: MenuItem {
+    component BookmarkOption: LyraMenuItem {
         implicitHeight: 30
         font.pixelSize: 12
         icon.width: 14
@@ -410,8 +410,8 @@ Pane {
                             text: qsTr("Bookmark options")
                             selected: bookmarkMenu.visible
                             Accessible.description: bookmarkMenu.visible ? qsTr("Expanded") : qsTr("Collapsed")
-                            onClicked: bookmarkMenu.popup(0,height)
-                            Menu {
+                            onClicked: bookmarkMenu.openBelow(bookmarkOptions)
+                            LyraMenu {
                                 id: bookmarkMenu
                                 objectName: "bookmarkOptionsMenu" + bookmarkRow.index
                                 onAboutToShow: bookmarkRow.menuContext={owner:app.currentReader,generation:app.currentReader.documentGeneration,bookmark:Object.assign({},bookmarkRow.modelData)}
@@ -421,7 +421,7 @@ Pane {
                                     onTriggered: if(bookmarkRow.contextCurrent())app.editBookmarkAt(bookmarkRow.menuContext.bookmark,bookmarkRow.index,bookmarkOptions)
                                 }
                                 BookmarkOption { text: qsTr("Remove Bookmark"); icon.source:"qrc:/icons/delete.svg"; onTriggered: bookmarkRow.command("bookmark_delete") }
-                                MenuSeparator {}
+                                LyraMenuSeparator {}
                                 BookmarkOption { text: qsTr("Move Up"); icon.source:"qrc:/icons/arrow-up.svg"; onTriggered: bookmarkRow.command("bookmark_move",-1) }
                                 BookmarkOption { text: qsTr("Move Down"); icon.source:"qrc:/icons/arrow-down.svg"; onTriggered: bookmarkRow.command("bookmark_move",1) }
                             }

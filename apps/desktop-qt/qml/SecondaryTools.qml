@@ -64,11 +64,11 @@ Item {
                 symbol:"redact";text:qsTr("Redact");fitLabel:true
                 display:editStrip.compact ? AbstractButton.IconOnly : AbstractButton.TextBesideIcon
                 selected:["erase","blackout"].indexOf(app.contentEditor.tool)>=0;enabled:app.canModifyPdf
-                onClicked:redactMenu.popup(0,height)
-                Menu {
+                onClicked:redactMenu.openBelow(redactButton)
+                LyraMenu {
                     id:redactMenu
-                    MenuItem {objectName:"contentBlackoutAction";text:qsTr("Blackout");onTriggered:app.contentEditor.arm("blackout")}
-                    MenuItem {objectName:"contentEraseAction";text:qsTr("Erase");onTriggered:app.contentEditor.arm("erase")}
+                    LyraMenuItem {objectName:"contentBlackoutAction";text:qsTr("Blackout");icon.source:"qrc:/icons/redact.svg";onTriggered:app.contentEditor.arm("blackout")}
+                    LyraMenuItem {objectName:"contentEraseAction";text:qsTr("Erase");icon.source:"qrc:/icons/eraser.svg";onTriggered:app.contentEditor.arm("erase")}
                 }
             }
             ToolSeparator {}

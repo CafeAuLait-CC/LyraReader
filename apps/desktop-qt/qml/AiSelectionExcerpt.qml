@@ -106,17 +106,17 @@ Pane {
                                     event.accepted = true;
                                 }
                             }
-                            ContextMenu.menu: Menu {
+                            ContextMenu.menu: LyraMenu {
                                 id: sourceMenu
                                 objectName: card.labelName + "Menu"
                                 parent: excerptDisplay
-                                MenuItem {
+                                LyraMenuItem {
                                     objectName: card.labelName + "Copy"
                                     text: qsTr("Copy")
                                     enabled: excerptDisplay.selectionStart !== excerptDisplay.selectionEnd
                                     onTriggered: card.copySelection()
                                 }
-                                MenuItem {
+                                LyraMenuItem {
                                     objectName: card.labelName + "SelectAll"
                                     text: qsTr("Select All")
                                     enabled: excerptDisplay.length > 0

@@ -60,7 +60,7 @@ AiReadingScrollView {
     onRangeChanged: scopeRefresh.restart()
     onOwnerChanged: { more.close(); previous.checked = false; scopeRefresh.restart(); }
     onGenerationChanged: { more.close(); previous.checked = false; scopeRefresh.restart(); }
-    function openMore(anchor) { more.parent = anchor; more.popup(0, anchor.height); }
+    function openMore(anchor) { more.openBelow(anchor); }
     onLiveResultIdChanged: if (visible && liveResultId) refreshMetadata()
     Connections {
         target: task.panel
@@ -73,15 +73,15 @@ AiReadingScrollView {
         else { more.close(); scopeRefresh.stop(); }
     }
     Component.onCompleted: scopeRefresh.restart()
-    Menu {
+    LyraMenu {
         id: more
         focus: true
-        background: Rectangle { color: app.colors.menuBg; radius: 6; border.color: app.colors.separator }
-        MenuItem { text: qsTr("Layers and coverage…"); enabled: panel.owner.pageCount > 0 && !panel.owner.loading && !panel.owner.snapshotReadOnly; onTriggered: panel.openSummaryCatalog() }
-        MenuItem { text: qsTr("Document Reading…"); enabled: !panel.owner.snapshotReadOnly; onTriggered: app.openDocumentReading() }
-        MenuItem { text: qsTr("Request payload…"); enabled: !!panel.plan; onTriggered: panel.inspectPayload() }
-        MenuItem { text: qsTr("Local audit trail…"); onTriggered: app.showAuditTrail() }
-        MenuItem { text: qsTr("Reading notes…"); onTriggered: app.openReadingNotes() }
+
+        LyraMenuItem { text: qsTr("Layers and coverage…"); enabled: panel.owner.pageCount > 0 && !panel.owner.loading && !panel.owner.snapshotReadOnly; onTriggered: panel.openSummaryCatalog() }
+        LyraMenuItem { text: qsTr("Document Reading…"); enabled: !panel.owner.snapshotReadOnly; onTriggered: app.openDocumentReading() }
+        LyraMenuItem { text: qsTr("Request payload…"); enabled: !!panel.plan; onTriggered: panel.inspectPayload() }
+        LyraMenuItem { text: qsTr("Local audit trail…"); onTriggered: app.showAuditTrail() }
+        LyraMenuItem { text: qsTr("Reading notes…"); onTriggered: app.openReadingNotes() }
     }
     ColumnLayout {
         id: taskBody

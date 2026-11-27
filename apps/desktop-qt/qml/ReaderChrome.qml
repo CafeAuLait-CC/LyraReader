@@ -372,48 +372,56 @@ ColumnLayout {
                     objectName: "viewMenuButton"
                     symbol: "view"
                     text: qsTr("View settings")
-                    onClicked: viewMenu.popup(0, height)
+                    selected: viewMenu.visible
+                    Accessible.description: viewMenu.visible ? qsTr("Expanded") : qsTr("Collapsed")
+                    onClicked: viewMenu.openBelow(viewMenuButton)
                 }
-                Menu {
+                LyraMenu {
                     id: viewMenu
                     objectName: "viewSettingsMenu"
                     parent: viewMenuButton
                     focus: true
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Read Page Text (Ctrl+Shift+R)")
+                        icon.source: "qrc:/icons/outline.svg"
                         checkable: true
                         checked: app.textViewVisible
                         enabled: app.currentReader.pageCount > 0
                         onTriggered: app.setTextViewEnabled(!app.textViewVisible)
                     }
-                    MenuSeparator {}
-                    MenuItem {
+                    LyraMenuSeparator {}
+                    LyraMenuItem {
                         text: qsTr("Continuous Pages")
+                        icon.source: "qrc:/icons/pages.svg"
                         checkable: true
                         checked: app.layoutMode === "Continuous"
                         onTriggered: app.setPageLayout("Continuous")
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Facing Pages")
+                        icon.source: "qrc:/icons/view.svg"
                         checkable: true
                         checked: app.layoutMode === "Facing"
                         onTriggered: app.setPageLayout("Facing")
                     }
-                    MenuSeparator {}
-                    MenuItem {
+                    LyraMenuSeparator {}
+                    LyraMenuItem {
                         text: qsTr("Fit Width")
+                        icon.source: "qrc:/icons/fit-width.svg"
                         enabled: !app.textViewVisible
                         onTriggered: app.fitWidth()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Actual Size")
+                        icon.source: "qrc:/icons/actual-size.svg"
                         enabled: !app.textViewVisible
                         onTriggered: {
                             app.actualSize();
                         }
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Reading Appearance…")
+                        icon.source: "qrc:/icons/settings.svg"
                         onTriggered: app.showSettings()
                     }
                 }
@@ -424,32 +432,38 @@ ColumnLayout {
                     enabled: app.currentReader.pageCount > 0
                     onClicked: app.zoomBy(1 / 1.2)
                 }
-                ToolButton {
+                LyraToolButton {
                     id: zoomMenuButton
                     objectName: "zoomMenuButton"
                     text: (app.currentReader.pageCount ? Math.round(app.textViewVisible ? app.textViewZoom * 100 : app.zoomPercent) : 100) + (app.textViewVisible ? "%" : "% ▾")
+                    display: AbstractButton.TextOnly
+                    selected: zoomMenu.visible
+                    Accessible.description: zoomMenu.visible ? qsTr("Expanded") : qsTr("Collapsed")
                     Layout.preferredWidth: 72
                     Layout.minimumWidth: 72
-                    onClicked: zoomMenu.popup(0, height)
+                    onClicked: zoomMenu.openBelow(zoomMenuButton)
                     enabled: app.currentReader.pageCount > 0 && !app.textViewVisible
                 }
-                Menu {
+                LyraMenu {
                     id: zoomMenu
                     objectName: "zoomPresetMenu"
                     parent: zoomMenuButton
                     focus: true
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Actual Size (100%)")
+                        icon.source: "qrc:/icons/actual-size.svg"
                         onTriggered: {
                             app.actualSize();
                         }
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Fit Width")
+                        icon.source: "qrc:/icons/fit-width.svg"
                         onTriggered: app.fitWidth()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Fit Page")
+                        icon.source: "qrc:/icons/fit-page.svg"
                         onTriggered: app.fitPage()
                     }
                 }
@@ -504,6 +518,7 @@ ColumnLayout {
                         fitLabel: true
                         symbol: "form"
                         text: qsTr("Fill && Sign")
+                        icon.source: "qrc:/icons/form.svg"
                         Accessible.name:qsTr("Fill & Sign")
                         ToolTip.text:qsTr("Fill & Sign")
                         selected: app.secondaryRow === "fill"
@@ -545,64 +560,76 @@ ColumnLayout {
                     objectName: "moreCommands"
                     symbol: "more"
                     text: qsTr("More commands")
+                    selected: moreMenu.visible
+                    Accessible.description: moreMenu.visible ? qsTr("Expanded") : qsTr("Collapsed")
                     // The trailing menu grows to the left so it stays anchored to
                     // its button even in the compact reader.
-                    onClicked: moreMenu.popup(width - moreMenu.width, height)
+                    onClicked: moreMenu.openBelow(moreCommandsButton)
                 }
-                Menu {
+                LyraMenu {
                     id: moreMenu
                     objectName: "moreCommandsMenu"
                     parent: moreCommandsButton
                     focus: true
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Fill && Sign")
+                        icon.source: "qrc:/icons/form.svg"
                         Accessible.name: qsTr("Fill & Sign")
                         enabled: app.canModifyPdf
                         onTriggered: app.toggleForms()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("AI Assistant")
+                        icon.source: "qrc:/icons/lyra-quill.svg"
                         enabled: app.currentReader.pageCount > 0
                         onTriggered: app.showSidebar("ai")
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Page operations")
+                        icon.source: "qrc:/icons/overview.svg"
                         enabled: app.currentReader.pageCount > 0
                         onTriggered: app.showOverview()
                     }
-                    MenuSeparator {}
-                    MenuItem {
+                    LyraMenuSeparator {}
+                    LyraMenuItem {
                         text: qsTr("Open PDF…")
+                        icon.source: "qrc:/icons/folder.svg"
                         onTriggered: app.openDialog()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Add Bookmark")
+                        icon.source: "qrc:/icons/bookmark.svg"
                         enabled: app.currentReader.pageCount > 0
                         onTriggered: app.addBookmark()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Merge PDFs…")
+                        icon.source: "qrc:/icons/pages.svg"
                         enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
                         onTriggered: app.showMergeDialog()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Split PDF…")
+                        icon.source: "qrc:/icons/pages.svg"
                         enabled: app.canModifyPdf && !app.currentReader.hasEditDrafts
                         onTriggered: app.showSplitDialog()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Document Information…")
+                        icon.source: "qrc:/icons/info.svg"
                         enabled: app.currentReader.pageCount > 0
                         onTriggered: app.showDocumentInformation()
                     }
-                    MenuItem {
+                    LyraMenuItem {
                         text: qsTr("Print…")
+                        icon.source: "qrc:/icons/print.svg"
                         enabled: app.currentReader.pageCount > 0
                         onTriggered: app.printDocument()
                     }
-                    MenuSeparator {}
-                    MenuItem {
+                    LyraMenuSeparator {}
+                    LyraMenuItem {
                         text: qsTr("Settings…")
+                        icon.source: "qrc:/icons/settings.svg"
                         onTriggered: app.showSettings()
                     }
                 }

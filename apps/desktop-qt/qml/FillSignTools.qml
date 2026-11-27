@@ -30,7 +30,7 @@ ToolBar {
                 enabled:app.canModifyPdf
                 onClicked: {
                     app.setFillTool(modelData.kind);
-                    if (modelData.kind==="stamp" && app.fillTool==="stamp") {stampMenu.parent=button;stampMenu.popup(0,button.height);}
+                    if (modelData.kind==="stamp" && app.fillTool==="stamp") {stampMenu.openBelow(button);}
                     else if (modelData.kind==="image" && app.fillTool==="image") chooseImage("image");
                 }
             }
@@ -41,12 +41,12 @@ ToolBar {
     function chooseDrawnSignature() {if(app.blockXfaWrite() || app.fillTool!=="signature")return;drawnSignature.prepare(app.currentReader);drawnSignature.open();}
     TypedSignatureDialog {id:typedSignature;app:tools.app}
     DrawnSignatureDialog {id:drawnSignature;app:tools.app}
-    Menu {
+    LyraMenu {
         id:stampMenu
         Repeater {
             model:[{style:"approved",name:qsTr("Approved")},{style:"reviewed",name:qsTr("Reviewed")},
                 {style:"draft",name:qsTr("Draft")},{style:"confidential",name:qsTr("Confidential")},{style:"date",name:qsTr("Date")}]
-            MenuItem {required property var modelData;text:modelData.name;objectName:"stampStyle"+modelData.style;onTriggered:app.armStamp(modelData.style)}
+            LyraMenuItem {required property var modelData;text:modelData.name;icon.source:"qrc:/icons/stamp.svg";objectName:"stampStyle"+modelData.style;onTriggered:app.armStamp(modelData.style)}
         }
     }
     FileDialog {

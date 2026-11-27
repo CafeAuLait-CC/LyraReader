@@ -2275,6 +2275,9 @@ private slots:
         auto *button=visualItem(window->contentItem(),buttonName);auto *menu=window->findChild<QObject *>(menuName);QVERIFY(button && menu);
         window->requestActivate();button->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(button->hasActiveFocus());
         QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());QTest::qWait(40);
+        QTRY_VERIFY(button->property("selected").toBool());
+        auto *buttonAccessibility=QAccessible::queryAccessibleInterface(button);QVERIFY(buttonAccessibility);
+        QVERIFY(buttonAccessibility->state().selected);QCOMPARE(buttonAccessibility->text(QAccessible::Description),QString("Expanded"));
         auto *body=menu->property("contentItem").value<QQuickItem *>();QVERIFY(body);
         if(buttonName=="moreCommands") {
             QQmlExpression itemAt(QQmlEngine::contextForObject(menu),menu,QStringLiteral("itemAt(0)"));
@@ -2283,12 +2286,19 @@ private slots:
             QCOMPARE(accessible->text(QAccessible::Name),QStringLiteral("Fill & Sign"));
             QCOMPARE(fill->property("text").toString(),QStringLiteral("Fill && Sign"));
         }
-        const auto actual=body->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto expected=button->mapToGlobal(QPointF(buttonName=="moreCommands"?button->width()-menu->property("width").toDouble():0,button->height()));
+        const auto actual=body->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));
+        // Mac toolbar commands align to the trailing edge, with a 5px gap.
+        // An in-window Qt popup also stays inside its owner's visible area.
+        auto anchor=button->mapToItem(window->contentItem(),QPointF(button->width()-menu->property("width").toDouble(),button->height()+5));
+        anchor.setX(qBound(5.,anchor.x(),window->width()-menu->property("width").toDouble()-5));
+        const auto expected=window->contentItem()->mapToGlobal(anchor);
         qInfo()<<"Toolbar popup anchor"<<buttonName<<actual<<expected<<"window"<<window->size();
         QVERIFY2(QLineF(actual,expected).length()<2,"The menu must open below its own toolbar button");
         QTRY_VERIFY(menu->property("activeFocus").toBool());
         const auto page=window->property("currentPage");QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTest::qWait(40);QCOMPARE(window->property("currentPage"),page);
         QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!menu->property("visible").toBool());QTRY_VERIFY(button->hasActiveFocus());
+        QVERIFY(!button->property("selected").toBool());
+        QVERIFY(!buttonAccessibility->state().selected);QCOMPARE(buttonAccessibility->text(QAccessible::Description),QString("Collapsed"));
         QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTRY_COMPARE(window->property("currentPage").toInt(),8);
         if(buttonName=="moreCommands") {
             button->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("visible").toBool());
@@ -3555,6 +3565,8 @@ private slots:
         for(int index:{0,1,3,4}){QQmlExpression entry(QQmlEngine::contextForObject(menu),menu,QString("itemAt(%1)").arg(index));auto *action=entry.evaluate().value<QObject *>();QVERIFY(action);const auto icon=QQmlProperty(action,"icon.source").read().toUrl();QVERIFY(!icon.isEmpty());QVERIFY(QFile::exists(":"+icon.path()));QCOMPARE(QQmlProperty(action,"icon.width").read().toInt(),14);QCOMPARE(QQmlProperty(action,"icon.color").read().value<QColor>(),colors->property("iconPrimary").value<QColor>());QCOMPARE(action->property("implicitHeight").toInt(),30);}
         QVERIFY(menu->setProperty("currentIndex",0));QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!menu->property("visible").toBool());auto *editor=window->findChild<QObject *>("bookmarkEditor");QVERIFY(editor);QTRY_VERIFY(editor->property("visible").toBool());QCOMPARE(editor->property("width").toDouble(),280.);QVERIFY(editor->property("x").toDouble()>=8);QVERIFY(editor->property("x").toDouble()+280<=window->width()-8);
         auto *dialogBackground=editor->property("background").value<QQuickItem *>();QVERIFY(dialogBackground);auto *dialogAccessible=QAccessible::queryAccessibleInterface(dialogBackground->parentItem());QVERIFY(dialogAccessible);QCOMPARE(dialogAccessible->role(),QAccessible::Dialog);QCOMPARE(dialogAccessible->text(QAccessible::Name),QString("Edit Bookmark"));
+        QCOMPARE(dialogBackground->property("color").value<QColor>(),colors->property("menuBg").value<QColor>());QCOMPARE(dialogBackground->property("radius").toDouble(),8.);
+        QCOMPARE(QQmlProperty(dialogBackground,"border.width").read().toInt(),1);QCOMPARE(QQmlProperty(dialogBackground,"border.color").read().value<QColor>(),colors->property("controlBorder").value<QColor>());
         auto *field=visualItem(window->contentItem(),"bookmarkNameField");QVERIFY(field);QTRY_VERIFY(field->hasActiveFocus());
         QCOMPARE(QQmlProperty(field,"font.pixelSize").read().toInt(),12);QCOMPARE(field->property("leftPadding").toDouble(),9.);QCOMPARE(field->property("topPadding").toDouble(),7.);
         auto *fieldBackground=field->property("background").value<QQuickItem *>();QVERIFY(fieldBackground);QCOMPARE(fieldBackground->property("radius").toDouble(),5.);QCOMPARE(fieldBackground->property("color").value<QColor>(),colors->property("fieldBg").value<QColor>());QCOMPARE(QQmlProperty(fieldBackground,"border.color").read().value<QColor>(),colors->property("focusRing").value<QColor>());
@@ -3743,6 +3755,157 @@ private slots:
         if(QTest::currentTestFailed())return;
         auto *paper=view.window->property("regionPaper").value<QObject *>();QVERIFY(paper);
         check(paper->property("revealAnimation").value<QObject *>(),220,true);
+    }
+
+    void commandMenusSelectTheFirstEnabledRowAndWrapWithoutOpeningDisabledCommands_data() {
+        QTest::addColumn<QString>("menuName");QTest::addColumn<QString>("buttonName");
+        QTest::addColumn<int>("first");QTest::addColumn<bool>("dark");
+        for(bool dark:{false,true}) {
+            QTest::newRow(dark?"view-dark":"view-light")<<QString("viewSettingsMenu")<<QString("viewMenuButton")<<2<<dark;
+            QTest::newRow(dark?"more-dark":"more-light")<<QString("moreCommandsMenu")<<QString("moreCommands")<<4<<dark;
+        }
+    }
+    void commandMenusSelectTheFirstEnabledRowAndWrapWithoutOpeningDisabledCommands() {
+        QFETCH(QString,menuName);QFETCH(QString,buttonName);QFETCH(int,first);QFETCH(bool,dark);
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        window->resize(900,700);window->setProperty("appearance",dark?"dark":"light");
+        QVERIFY(!view.workspace.activeReader()->pageCount());
+        auto *button=visualItem(window->contentItem(),buttonName);QVERIFY(button && button->isVisible());
+        auto *menu=window->findChild<QObject *>(menuName);QVERIFY(menu);
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        button->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(button->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(menu->property("opened").toBool());
+        // Mac opens on the first enabled command, rather than waiting for Down.
+        QTRY_COMPARE(menu->property("currentIndex").toInt(),first);
+        const int last=menu->property("count").toInt()-1;
+        QTest::keyClick(window,Qt::Key_Up);QCOMPARE(menu->property("currentIndex").toInt(),last);
+        QTest::keyClick(window,Qt::Key_Down);QCOMPARE(menu->property("currentIndex").toInt(),first);
+        QTest::keyClick(window,Qt::Key_Down);QCOMPARE(menu->property("currentIndex").toInt(),menuName=="moreCommandsMenu"?last:first+1);
+        QTest::keyClick(window,Qt::Key_Up);QCOMPARE(menu->property("currentIndex").toInt(),first);
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!menu->property("visible").toBool());
+        QTRY_VERIFY(button->hasActiveFocus());
+        QVERIFY(!view.workspace.activeReader()->pageCount());
+        QVERIFY(!view.workspace.activeReader()->hasUnsavedChanges());
+    }
+
+    void annotationColourMenusKeepMacSlotsAndActivateThePreviewedChoice_data() {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light")<<false;QTest::newRow("dark-narrow")<<true;
+    }
+    void annotationColourMenusKeepMacSlotsAndActivateThePreviewedChoice() {
+        QFETCH(bool,dark);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        window->resize(dark?700:1200,750);window->setProperty("appearance",dark?"dark":"light");window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(window));QTRY_VERIFY(!window->property("windowGeometryChanging").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"setSecondaryRow",Q_ARG(QVariant,"annotate"),Q_ARG(QVariant,false)));
+        auto *button=visualItem(window->contentItem(),"annotateColour");QVERIFY(button && button->isVisible());
+        auto *menu=window->findChild<QObject *>("annotationColourMenu");QVERIFY(menu);
+        const auto entry=[&](int index) {
+            QQmlExpression expression(QQmlEngine::contextForObject(menu),menu,QString("itemAt(%1)").arg(index));
+            return expression.evaluate().value<QQuickItem *>();
+        };
+        const auto open=[&] {
+            button->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);
+        };
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        open();QTRY_VERIFY(menu->property("opened").toBool());QCOMPARE(menu->property("currentIndex").toInt(),0);
+        const QList<QColor> colours{QColor("#E8BC55"),QColor("#EFA77D"),QColor("#90B79A"),QColor("#7DADD6"),QColor("#AB9ACB"),QColor("#D99A9B")};
+        QVERIFY(menu->property("hasCheckmarks").toBool());QCOMPARE(menu->property("padding").toDouble(),5.);
+        for(int index=0;index<colours.size();++index) {
+            auto *item=entry(index);QVERIFY(item);QCOMPARE(item->height(),30.);QCOMPARE(item->property("font").value<QFont>().pixelSize(),12);
+            QCOMPARE(QQmlProperty(item,"icon.width").read().toInt(),14);QCOMPARE(QQmlProperty(item,"icon.height").read().toInt(),14);
+            QVERIFY(QQmlProperty(item,"icon.source").read().toUrl().toString().endsWith("/circle-filled.svg"));
+            QCOMPARE(QQmlProperty(item,"icon.color").read().value<QColor>(),colours[index]);
+            QVERIFY(!item->property("indicator").value<QQuickItem *>());
+            auto *check=visualItem(item,"lyraMenuTrailingCheck");QVERIFY(check);
+            QCOMPARE(check->parentItem(),item);
+            QCOMPARE(check->x()+check->width(),item->width()-8);QCOMPARE(check->isVisible(),index==0);
+            auto *accessible=QAccessible::queryAccessibleInterface(item);QVERIFY(accessible && !accessible->text(QAccessible::Name).isEmpty());
+            QVERIFY(accessible->state().checkable);QCOMPARE(accessible->state().checked,index==0);
+        }
+        const auto capture=qEnvironmentVariable("LYRA_READER_MENU_EVIDENCE");
+        if(!capture.isEmpty())QVERIFY(window->grabWindow().save(capture+(dark?"-colour-dark.png":"-colour-light.png")));
+        QTest::keyClick(window,Qt::Key_Down);QCOMPARE(menu->property("currentIndex").toInt(),1);
+        QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(window->property("brushColor").toString(),QString("#EFA77D"));QTRY_VERIFY(button->hasActiveFocus());
+        open();QTRY_VERIFY(menu->property("opened").toBool());QCOMPARE(menu->property("currentIndex").toInt(),0);
+        QVERIFY(!entry(0)->property("checked").toBool());QVERIFY(entry(1)->property("checked").toBool());
+        QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(window->property("brushColor").toString(),QString("#E8BC55"));
+        open();QTRY_VERIFY(menu->property("opened").toBool());
+        window->resize(window->width()-24,window->height());QTRY_VERIFY(!menu->property("visible").toBool());
+        QVERIFY(!reader->hasUnsavedChanges());
+    }
+
+    void longCommandMenusScrollToKeyboardChoicesAndContainAnEmptyActionSet() {
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(800,700);window->setProperty("appearance","dark");
+        QTRY_VERIFY(!window->property("windowGeometryChanging").toBool());
+        const auto unobscured=window->grabWindow();QVERIFY(!unobscured.isNull());
+        QQmlComponent component(&view.engine);
+        component.setData(R"QML(import QtQuick
+import QtQuick.Controls
+LyraMenu {
+    id: commands
+    property bool allowCommands: true
+    property int activatedIndex: -1
+    Repeater {
+        model: 40
+        LyraMenuItem {
+            required property int index
+            text: "Command " + index
+            enabled: commands.allowCommands && index % 5 !== 0
+            checkable: true
+            checked: index === 3
+            onTriggered: commands.activatedIndex = index
+        }
+    }
+})QML",QUrl("qrc:/qml/CommandMenuFixture.qml"));
+        std::unique_ptr<QObject> menu(component.create());QVERIFY2(menu,qPrintable(component.errorString()));
+        QVERIFY(menu->setProperty("parent",QVariant::fromValue(window->contentItem())));
+        const auto open=[&] {
+            QQmlExpression expression(QQmlEngine::contextForObject(menu.get()),menu.get(),"popup(10, 10)");
+            expression.evaluate();return !expression.hasError();
+        };
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        QVERIFY(open());QTRY_VERIFY(menu->property("opened").toBool());QCOMPARE(menu->property("count").toInt(),40);
+        QCOMPARE(menu->property("currentIndex").toInt(),1);
+        auto *body=menu->property("contentItem").value<QQuickItem *>();QVERIFY(body);
+        QVERIFY(body->height()<body->property("contentHeight").toDouble());
+        QTest::keyClick(window,Qt::Key_Up);QCOMPARE(menu->property("currentIndex").toInt(),39);
+        QTest::keyClick(window,Qt::Key_Down);QCOMPARE(menu->property("currentIndex").toInt(),1);
+        QList<int> enabled;for(int i=0;i<40;++i)if(i%5)enabled.append(i);
+        for(int step=1;step<=20;++step) {
+            QTest::keyClick(window,Qt::Key_Down);QCOMPARE(menu->property("currentIndex").toInt(),enabled.at(step));
+        }
+        const auto visibleChoice=[&] {
+            auto *item=body->property("currentItem").value<QQuickItem *>();if(!item)return false;
+            const auto frame=item->mapRectToItem(body,item->boundingRect());
+            return frame.top()>=-.5 && frame.bottom()<=body->height()+.5;
+        };
+        QTRY_VERIFY(visibleChoice());QTRY_VERIFY(!body->property("moving").toBool());
+        QQmlExpression checkedRow(QQmlEngine::contextForObject(menu.get()),menu.get(),"itemAt(3)");
+        auto *checkedItem=checkedRow.evaluate().value<QQuickItem *>();QVERIFY(checkedItem);
+        auto *check=visualItem(checkedItem,"lyraMenuTrailingCheck");QVERIFY(check);
+        QVERIFY(check->mapRectToItem(body,check->boundingRect()).bottom()<0);
+        const auto noPaintAbovePopup=[&] {
+            const auto image=window->grabWindow();if(image.isNull())return false;
+            const double scale=double(image.width())/window->width();
+            const QRect band(qRound(143*scale),0,qRound(17*scale),qRound(4*scale));
+            return image.copy(band)==unobscured.copy(band);
+        };
+        QTRY_VERIFY2(noPaintAbovePopup(),"An offscreen checked row must not paint above the popup's clipped viewport");
+        const auto capture=qEnvironmentVariable("LYRA_READER_MENU_EVIDENCE");if(!capture.isEmpty())QVERIFY(window->grabWindow().save(capture+"-long-menu.png"));
+        QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!menu->property("visible").toBool());
+        QCOMPARE(menu->property("activatedIndex").toInt(),enabled.at(20));
+        QVERIFY(menu->setProperty("allowCommands",false));QVERIFY(open());QTRY_VERIFY(menu->property("opened").toBool());
+        QCOMPARE(menu->property("currentIndex").toInt(),-1);
+        for(const auto key:{Qt::Key_Up,Qt::Key_Down,Qt::Key_Return,Qt::Key_Space}) {QTest::keyClick(window,key);QVERIFY(menu->property("opened").toBool());}
+        QCOMPARE(menu->property("activatedIndex").toInt(),enabled.at(20));
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!menu->property("visible").toBool());
+        QVERIFY(!view.workspace.activeReader()->hasUnsavedChanges());
     }
 
     void nativeGeometryActivitySettlesHiddenWindowsAndRejectsOldTargets() {

@@ -174,28 +174,28 @@ Item {
         }
         Rectangle { Layout.fillWidth: true; height: 1; color: app.colors.separator }
     }
-    Menu {
+    LyraMenu {
         id: termsMenu
         objectName: "aiTranslationTermsMenu" + row.index
         property var snapshot: null
         onAboutToShow: snapshot = {reader: row.task.owner, generation: row.task.generation,
             record: row.recordId, terms: row.entry ? (row.entry.terms || []).slice() : []}
         focus: true
-        background: Rectangle {radius: 6; color: app.colors.menuBg; border.color: app.colors.separator}
-        MenuItem {
+
+        LyraMenuItem {
             text: qsTr("Copy")
             enabled: !!termsMenu.parent && typeof termsMenu.parent.copy === "function" && !!termsMenu.parent.selectedText
             onTriggered: termsMenu.parent.copy()
         }
-        MenuItem {
+        LyraMenuItem {
             text: qsTr("Select all")
             enabled: !!termsMenu.parent && typeof termsMenu.parent.selectAll === "function"
             onTriggered: termsMenu.parent.selectAll()
         }
-        MenuSeparator {}
+        LyraMenuSeparator {}
         Instantiator {
             model: termsMenu.snapshot ? termsMenu.snapshot.terms : []
-            delegate: MenuItem {
+            delegate: LyraMenuItem {
                 required property int index
                 required property string modelData
                 objectName: "explainAiTranslationTerm" + index

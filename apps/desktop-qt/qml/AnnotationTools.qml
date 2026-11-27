@@ -36,14 +36,16 @@ ToolBar {
             ToolToggle {kind:"eraser";symbol:"eraser";text:qsTr("Erase parts of ink strokes")}
             ToolToggle {kind:"textBox";symbol:"free-text";text:qsTr("Text Box")}
             LyraToolButton {
+                id: shapesButton
                 objectName:"annotateShapes";symbol:"square";text:qsTr("Shapes");width:34;height:32
-                selected:["line","arrow","square","circle"].indexOf(app.annotationTool)>=0
-                onClicked:shapes.popup(0,height)
-                Menu {
+                selected:shapes.visible
+                Accessible.description:shapes.visible ? qsTr("Expanded") : qsTr("Collapsed")
+                onClicked:shapes.openBelow(shapesButton)
+                LyraMenu {
                     id:shapes
                     Repeater {
                         model:[{kind:"line",name:qsTr("Line")},{kind:"arrow",name:qsTr("Arrow")},{kind:"square",name:qsTr("Rectangle")},{kind:"circle",name:qsTr("Ellipse")}]
-                        MenuItem {required property var modelData;objectName:"annotateShape"+modelData.kind;text:modelData.name;checkable:true;checked:app.annotationTool===modelData.kind;onTriggered:app.setAnnotationTool(modelData.kind)}
+                        LyraMenuItem {required property var modelData;objectName:"annotateShape"+modelData.kind;text:modelData.name;icon.source:"qrc:/icons/"+modelData.kind+".svg";checkable:true;checked:app.annotationTool===modelData.kind;onTriggered:app.setAnnotationTool(modelData.kind)}
                     }
                 }
             }
@@ -54,26 +56,30 @@ ToolBar {
             spacing:2
             ToolToggle {kind:"stickyNote";symbol:"note";text:qsTr("Sticky Note")}
             LyraToolButton {
+                id: stampsButton
                 objectName:"annotateStamp";symbol:"stamp";text:qsTr("Stamp");width:34;height:32
-                selected:app.annotationTool==="stamp"
-                onClicked:stamps.popup(0,height)
-                Menu {
+                selected:stamps.visible
+                Accessible.description:stamps.visible ? qsTr("Expanded") : qsTr("Collapsed")
+                onClicked:stamps.openBelow(stampsButton)
+                LyraMenu {
                     id:stamps
                     Repeater {
                         model:[{style:"approved",name:qsTr("Approved")},{style:"reviewed",name:qsTr("Reviewed")},{style:"draft",name:qsTr("Draft")},{style:"confidential",name:qsTr("Confidential")},{style:"date",name:qsTr("Date")}]
-                        MenuItem {required property var modelData;objectName:"annotateStamp"+modelData.style;text:modelData.name;checkable:true;checked:app.annotationTool==="stamp" && app.pendingStampStyle===modelData.style;onTriggered:app.armStampForRow(modelData.style,"annotate")}
+                        LyraMenuItem {required property var modelData;objectName:"annotateStamp"+modelData.style;text:modelData.name;icon.source:"qrc:/icons/stamp.svg";checkable:true;checked:app.annotationTool==="stamp" && app.pendingStampStyle===modelData.style;onTriggered:app.armStampForRow(modelData.style,"annotate")}
                     }
                 }
             }
             LyraToolButton {
+                id: signaturesButton
                 objectName:"annotateSignature";symbol:"signature";text:qsTr("Signature");width:34;height:32
-                selected:app.annotationTool==="signature"
-                onClicked:signatures.popup(0,height)
-                Menu {
+                selected:signatures.visible
+                Accessible.description:signatures.visible ? qsTr("Expanded") : qsTr("Collapsed")
+                onClicked:signatures.openBelow(signaturesButton)
+                LyraMenu {
                     id:signatures
-                    MenuItem {objectName:"annotateImageSignature";text:qsTr("Place Image Signature…");onTriggered:tools.chooseSignature()}
-                    MenuSeparator {}
-                    MenuItem {objectName:"annotateDrawSignature";text:qsTr("Draw with the Pen");checkable:true;checked:app.annotationTool==="ink";onTriggered:app.setAnnotationTool("ink")}
+                    LyraMenuItem {objectName:"annotateImageSignature";text:qsTr("Place Image Signature…");onTriggered:tools.chooseSignature()}
+                    LyraMenuSeparator {}
+                    LyraMenuItem {objectName:"annotateDrawSignature";text:qsTr("Draw with the Pen");icon.source:"qrc:/icons/pen.svg";checkable:true;checked:app.annotationTool==="ink";onTriggered:app.setAnnotationTool("ink")}
                 }
             }
         }
@@ -85,16 +91,17 @@ ToolBar {
             selected:colours.visible
             Accessible.description:colours.visible ? qsTr("Expanded") : qsTr("Collapsed")
             contentItem:Item {Rectangle {anchors.centerIn:parent;width:17;height:17;radius:9;color:app.brushColor;border.width:1;border.color:app.colors.controlBorder}}
-            onClicked:colours.popup(0,height)
-            Menu {
+            onClicked:colours.openBelow(colourButton)
+            LyraMenu {
                 id:colours
+                objectName:"annotationColourMenu"
                 Repeater {
                     model:[{color:"#E8BC55",name:qsTr("Amber")},{color:"#EFA77D",name:qsTr("Peach")},{color:"#90B79A",name:qsTr("Sage")},{color:"#7DADD6",name:qsTr("Sky")},{color:"#AB9ACB",name:qsTr("Lavender")},{color:"#D99A9B",name:qsTr("Rose")}]
-                    MenuItem {required property var modelData;text:modelData.name;checkable:true;checked:app.brushColor===modelData.color;onTriggered:app.brushColor=modelData.color}
+                    LyraMenuItem {required property var modelData;text:modelData.name;icon.source:"qrc:/icons/circle-filled.svg";icon.color:enabled ? modelData.color : app.colors.textDisabled;checkable:true;checked:app.brushColor===modelData.color;onTriggered:app.brushColor=modelData.color}
                 }
-                MenuSeparator {}
-                MenuItem {text:qsTr("Custom Colour…");onTriggered:customColor.open()}
-                MenuItem {objectName:"annotateStrokeOptions";text:qsTr("Stroke Width and Opacity…");onTriggered:strokeOptions.open()}
+                LyraMenuSeparator {}
+                LyraMenuItem {text:qsTr("Custom Colour…");icon.source:"qrc:/icons/circle-filled.svg";onTriggered:customColor.open()}
+                LyraMenuItem {objectName:"annotateStrokeOptions";text:qsTr("Stroke Width and Opacity…");icon.source:"qrc:/icons/settings.svg";onTriggered:strokeOptions.open()}
             }
         }
     }
