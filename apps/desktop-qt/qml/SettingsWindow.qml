@@ -161,6 +161,7 @@ ApplicationWindow {
                     currentIndex: ["light", "dark", "system"].indexOf(app.appearance)
                     Accessible.name: qsTr("Interface appearance")
                     displayText: currentIndex<0 ? qsTr("Unrecognized saved appearance") : currentText
+                    Accessible.description: displayText
                     onActivated: settings.appearanceEdited=true
                 }
                 CheckBox {
@@ -176,6 +177,7 @@ ApplicationWindow {
                     currentIndex: app.readingPresetIndex(app.paperAppearance)
                     Accessible.name: qsTr("Paper appearance preset")
                     displayText: currentIndex<0 ? qsTr("Unrecognized saved paper appearance") : currentText
+                    Accessible.description: displayText
                     onActivated: function(index) {
                         settings.paperPresetEdited=true;settings.appearanceEdited=false;
                         const preset=app.readingPresets[index];
@@ -197,6 +199,7 @@ ApplicationWindow {
                     currentIndex:app.regionConversationStyleIndex(app.regionConversationStyle)
                     displayText:currentIndex<0 ? qsTr("Unrecognized saved conversation style") : currentText
                     Accessible.name:qsTr("Region conversation style")
+                    Accessible.description:displayText
                     onActivated:settings.regionStyleEdited=true
                 }
                 Label {
