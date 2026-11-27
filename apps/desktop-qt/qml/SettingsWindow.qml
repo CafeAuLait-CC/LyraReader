@@ -349,8 +349,10 @@ ApplicationWindow {
                     visible: !settings.accounts || settings.accounts.connectionMode!=="chatGPT"
                     Layout.fillWidth: true; spacing: 12
                     Label {text:qsTr("Provider (OpenAI-compatible)");font.weight:Font.DemiBold;textFormat:Text.PlainText}
-                    TextField {
+                    ReadingTextField {
                         id: baseUrl
+                        app:settings.app
+                        font.pixelSize:13;topPadding:5;bottomPadding:5
                         objectName:"settingsBaseUrl"
                         Layout.fillWidth: true
                         placeholderText: qsTr("Base URL, e.g. http://localhost:11434/v1")
@@ -358,8 +360,10 @@ ApplicationWindow {
                         Accessible.name: qsTr("AI base URL")
                         onTextEdited:if(settings.connectionTest)settings.connectionTest.cancel()
                     }
-                    TextField {
+                    ReadingTextField {
                         id: modelName
+                        app:settings.app
+                        font.pixelSize:13;topPadding:5;bottomPadding:5
                         objectName: "settingsAiModel"
                         Layout.fillWidth: true
                         placeholderText: qsTr("Model name")
@@ -502,8 +506,10 @@ ApplicationWindow {
                         Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:settings.colors.textSecondary
                         text:qsTr("Unchecked options use the provider default. Custom values are sent as temperature and max_tokens; the provider may ignore or cap them.")
                     }
-                    TextField {
+                    ReadingTextField {
                         id: apiKey
+                        app:settings.app
+                        font.pixelSize:13;topPadding:5;bottomPadding:5
                         objectName:"settingsApiKey"
                         Layout.fillWidth: true
                         placeholderText: qsTr("API key — saved only in the system keychain")

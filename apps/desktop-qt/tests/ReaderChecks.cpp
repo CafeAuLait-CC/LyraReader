@@ -2019,6 +2019,109 @@ private slots:
         if(route=="close")QVERIFY(settings->close());else if(route=="cancel-test"){cancel->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(cancel->hasActiveFocus());QTest::keyClick(settings,Qt::Key_Space);}else if(route=="mode"){QVERIFY(workspace.chatGptAccounts()->selectConnectionMode("chatGPT"));}else if(route=="external-config"){auto changed=original;changed.insert("model","newer-window-model");window->setProperty("aiSettings",changed);}else {const auto name=route=="base-url"?"settingsBaseUrl":route=="model"?"settingsAiModel":"settingsApiKey";auto *field=visualItem(settings->contentItem(),name);QVERIFY(field);field->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(field->hasActiveFocus());QTest::keyClick(settings,Qt::Key_A,Qt::ControlModifier);for(const auto ch:QStringLiteral("synthetic-edited-draft"))QTest::keyClick(settings,ch.toLatin1());}
         QTRY_VERIFY(!test->busy());vault->reply(0,"SYNTHETIC_LATE_KEY");QCoreApplication::sendPostedEvents(test,QEvent::MetaCall);QTest::qWait(60);QTRY_VERIFY(test->findChildren<QFutureWatcherBase *>().isEmpty());QCOMPARE(server.requests.size(),0);QCOMPARE(test->state().value("phase").toString(),QString("idle"));QCOMPARE(workspace.preference("ai",{}).toMap(),original);if(settings->isVisible())QVERIFY(settings->close());QSignalSpy ownerFrames(window,&QQuickWindow::frameSwapped);window->update();QTRY_VERIFY(window->isExposed() && !ownerFrames.isEmpty());
     }
+    void settingsProviderFieldsHaveVisibleBoundariesAndKeepDraftsPrivate_data() {
+        QTest::addColumn<bool>("dark");
+        QTest::newRow("light") << false;
+        QTest::newRow("dark") << true;
+    }
+    void settingsProviderFieldsHaveVisibleBoundariesAndKeepDraftsPrivate() {
+        QFETCH(bool,dark);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property).*"));
+        ReadingPreferenceGuard preferences;
+        ChatGptPreferenceGuard profiles;
+        QSettings saved;
+        saved.setValue("chatGptPlan/connectionMode","apiKey");
+        saved.remove("chatGptPlan/accounts");
+        saved.sync();
+        auto *vault=new FakeCredentialStore;
+        WorkspaceController workspace(nullptr,vault);
+        const QVariantMap original{{"baseUrl","http://127.0.0.1:1/v1"},{"model","synthetic-settings-model"}};
+        workspace.setPreference("ai",original);
+        QQmlApplicationEngine engine;
+        engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);
+        engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());
+        auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+        QVERIFY(window);
+        window->setProperty("appearance",dark?"dark":"light");
+        QSignalSpy ownerFrames(window,&QQuickWindow::frameSwapped);
+        window->update();
+        QTRY_VERIFY(window->isExposed() && !ownerFrames.isEmpty());
+        window->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));
+        auto *settings=window->findChild<QQuickWindow *>("settingsWindow");
+        QVERIFY(settings);
+        QSignalSpy frames(settings,&QQuickWindow::frameSwapped);
+        settings->update();
+        QTRY_VERIFY(settings->isExposed() && !frames.isEmpty());
+        settings->requestActivate();
+        QTRY_COMPARE(QGuiApplication::focusWindow(),settings);
+        const auto luminance=[](const QColor &color) {
+            const auto linear=[](double value) {return value<=.04045 ? value/12.92 : std::pow((value+.055)/1.055,2.4);};
+            return .2126*linear(color.redF())+.7152*linear(color.greenF())+.0722*linear(color.blueF());
+        };
+        const auto contrast=[&](const QColor &a,const QColor &b) {
+            const auto x=luminance(a),y=luminance(b);
+            return (qMax(x,y)+.05)/(qMin(x,y)+.05);
+        };
+        for(const char *name:{"settingsBaseUrl","settingsAiModel","settingsApiKey"}) {
+            auto *field=visualItem(settings->contentItem(),name);
+            QVERIFY2(field,name);
+            field->setFocus(false);
+            auto *background=field->property("background").value<QQuickItem *>();
+            QVERIFY(background);
+            const auto border=QQmlProperty(background,"border.color").read().value<QColor>();
+            const auto fill=background->property("color").value<QColor>();
+            QVERIFY2(contrast(border,fill)>=3,qPrintable(QString("%1 boundary contrast is %2").arg(name).arg(contrast(border,fill))));
+            QVERIFY(contrast(field->property("color").value<QColor>(),fill)>=4.5);
+            if(QByteArray(name)=="settingsBaseUrl")field->forceActiveFocus(Qt::TabFocusReason);
+            else {
+                for(int step=0;step<40 && !field->hasActiveFocus();++step) {
+                    QTest::keyClick(settings,Qt::Key_Tab);
+                    QCoreApplication::processEvents();
+                }
+            }
+            QTRY_VERIFY(field->hasActiveFocus());
+            auto *scroll=visualItem(settings->contentItem(),"settingsScroll");
+            QVERIFY(scroll);
+            auto *flick=scroll->property("contentItem").value<QQuickItem *>();
+            QVERIFY(flick);
+            QTRY_VERIFY(field->mapRectToItem(flick,field->boundingRect()).top()>=-1
+                && field->mapRectToItem(flick,field->boundingRect()).bottom()<=flick->height()+1);
+            QVERIFY(contrast(QQmlProperty(background,"border.color").read().value<QColor>(),settings->color())>=3);
+            const auto prior=field->property("text").toString();
+            QTest::keyClick(settings,Qt::Key_A,Qt::ControlModifier);
+            const QString draft="SYNTHETIC_UNSAVED_DRAFT";
+            for(const auto ch:draft)QTest::keyClick(settings,ch.toLatin1());
+            QCOMPARE(field->property("text").toString(),draft);
+            if(QByteArray(name)=="settingsApiKey") {
+                QCOMPARE(field->property("echoMode").toInt(),2);
+                QVERIFY(!field->property("displayText").toString().contains(draft));
+            } else {
+                QTest::keyClick(settings,Qt::Key_Z,Qt::ControlModifier);
+                QCOMPARE(field->property("text").toString(),prior);
+            }
+            const auto capture=qEnvironmentVariable("LYRA_READER_SETTINGS_FIELDS_EVIDENCE");
+            if(!capture.isEmpty()) {
+                QSignalSpy ready(settings,&QQuickWindow::frameSwapped);
+                settings->update();
+                QTRY_VERIFY(!ready.isEmpty());
+                QVERIFY(settings->grabWindow().save(capture+"-"+name+(dark?"-dark.png":"-light.png")));
+            }
+        }
+        QTest::keyClick(settings,Qt::Key_Escape);
+        QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(workspace.preference("ai",{}).toMap(),original);
+        QCOMPARE(vault->requests.size(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));
+        QTRY_VERIFY(settings->isVisible());
+        QCOMPARE(visualItem(settings->contentItem(),"settingsBaseUrl")->property("text").toString(),original.value("baseUrl").toString());
+        QCOMPARE(visualItem(settings->contentItem(),"settingsAiModel")->property("text").toString(),original.value("model").toString());
+        QVERIFY(visualItem(settings->contentItem(),"settingsApiKey")->property("text").toString().isEmpty());
+        QVERIFY(settings->close());
+    }
     void settingsCheckboxesHaveVisibleBordersAndKeyboardFocus_data() {
         QTest::addColumn<bool>("dark");QTest::newRow("light")<<false;QTest::newRow("dark")<<true;
     }
