@@ -14,7 +14,55 @@ Item {
     readonly property var generation: owner.documentGeneration
     readonly property bool loading: owner.loading
     readonly property bool sourceCurrent: !!paperMap && paperMap.controller===owner && !loading
-    readonly property var entries: owner.translationOverlays.filter(function(e){return e.target.page===translationLayer.page;})
+    readonly property var entries: {
+        const rows=((owner.translationState || {}).rows || []).filter(function(row) {
+            return row.target.page===translationLayer.page && (row.state==="sending" || row.state==="failed");
+        });
+        function overlaps(a,b) {
+            if(a.page!==b.page)return false;
+            const x=a.rect,y=b.rect;
+            return (a.start<=b.end && b.start<=a.end)
+                || (x.x_pt<y.x_pt+y.width_pt && y.x_pt<x.x_pt+x.width_pt
+                    && x.y_pt<y.y_pt+y.height_pt && y.y_pt<x.y_pt+x.height_pt);
+        }
+        // A pending/failed replacement suppresses its older cover, as on Mac.
+        // The retained cache is unchanged and becomes visible again after cancellation.
+        const result=owner.translationOverlays.filter(function(entry) {
+            return entry.target.page===translationLayer.page && !rows.some(function(row){return overlaps(row.target,entry.target);});
+        });
+        for(const row of rows)result.push({id:row.id,target:row.target,text:"",language:row.language,model:row.model,
+            original:true,phase:row.state==="sending"?"translating":"failed",error:row.error || ""});
+        return result.sort(function(a,b){return a.target.start-b.target.start || a.target.rect.y_pt-b.target.rect.y_pt || a.id.localeCompare(b.id);});
+    }
+    readonly property var entryIndex: {
+        const result=Object.create(null);
+        for(const entry of entries)result[entry.id]=entry;
+        return result;
+    }
+    property var modelOwner: null
+    property var modelGeneration: null
+    property int modelPage: -1
+    ListModel { id: order }
+    function syncOrder() {
+        if(!order || !owner)return;
+        if(modelOwner!==owner || modelGeneration!==generation || modelPage!==page) {
+            order.clear();modelOwner=owner;modelGeneration=generation;modelPage=page;
+        }
+        // Keep native text controls alive when another response advances or completes.
+        // This follows the keyed insert/move pattern used by recent document cards.
+        const desired=entries.map(function(entry){return entry.id;});
+        for(let i=order.count-1;i>=0;--i)if(desired.indexOf(order.get(i).passageId)<0) {
+            const item=passages ? passages.itemAt(i) : null;
+            if(item && item.ownsFocus() && app.active && sourceCurrent)app.focusReadingView();
+            order.remove(i);
+        }
+        for(let i=0;i<desired.length;++i) {
+            let found=i;
+            while(found<order.count && order.get(found).passageId!==desired[i])++found;
+            if(found===order.count)order.insert(i,{passageId:desired[i]});
+            else if(found!==i)order.move(found,i,1);
+        }
+    }
     readonly property rect displayViewport: {
         const source=paperMap.visibleRegion;
         const view=app.pageList;
@@ -57,22 +105,38 @@ Item {
         disclosedAnchor=anchor;
         disclosure.open();
     }
-    Component.onCompleted: restore()
-    onOwnerChanged: {closeDisclosure();restore();}
-    onPageChanged: {closeDisclosure();restore();}
-    onGenerationChanged: {closeDisclosure();restore();}
+    Component.onCompleted: {syncOrder();restore();}
+    onOwnerChanged: {closeDisclosure();syncOrder();restore();}
+    onPageChanged: {closeDisclosure();syncOrder();restore();}
+    onGenerationChanged: {closeDisclosure();syncOrder();restore();}
     onLoadingChanged: restore()
     onSourceCurrentChanged: if(!sourceCurrent)closeDisclosure()
     onEntriesChanged: {
+        syncOrder();
         const context=disclosedContext;
         if(context && !entries.some(function(entry){return entry.id===context.id;}))closeDisclosure();
     }
     Repeater {
         id:passages
-        model: translationLayer.entries
+        model: order
         Item {
             id: overlay
-            required property var modelData
+            required property string passageId
+            objectName:"translationEntry_"+passageId
+            readonly property bool present: !!translationLayer.entryIndex[passageId]
+            // A removed delegate can settle its bindings before Qt destroys it.
+            // This inert view record is never rendered or written to a document/cache.
+            readonly property var retiredRecord: ({id:"",text:"",original:true,phase:"retired",language:"",model:"",
+                target:{page:translationLayer.page,start:0,end:0,source_text:"",source_font_pt:7,is_block:false,
+                    rect:{x_pt:0,y_pt:0,width_pt:0,height_pt:0}}})
+            readonly property var modelData: translationLayer.entryIndex[passageId] || retiredRecord
+            readonly property string phase: modelData.phase || (modelData.original ? "original" : "translated")
+            function ownsFocus() {
+                const window=translationLayer.Window.window;
+                let item=window ? window.activeFocusItem : null;
+                while(item){if(item===overlay)return true;item=item.parent;}
+                return false;
+            }
             property alias chipControl:chip
             readonly property var target: modelData.target
             readonly property var r: target.rect
@@ -81,14 +145,14 @@ Item {
                 const loaded=translationLayer.paperMap.loaded;
                 const refined=translationLayer.paperMap.refined;
                 const mode=translationLayer.paperMap.paperAppearance;
-                return translationLayer.sourceCurrent && loaded ? translationLayer.paperMap.translationPaperColor(source) : "transparent";
+                return present && translationLayer.sourceCurrent && loaded ? translationLayer.paperMap.translationPaperColor(source) : "transparent";
             }
             readonly property bool inViewport: {
                 const v=translationLayer.paperMap.visibleRegion;
                 return source.x<v.x+v.width && v.x<source.x+source.width && source.y<v.y+v.height && v.y<source.y+source.height;
             }
-            readonly property bool original: !!modelData.original
-            readonly property bool paintReady: translationLayer.sourceCurrent && translationLayer.paperMap.loaded && paper.a>0
+            readonly property bool original: phase!=="translated"
+            readonly property bool paintReady: present && translationLayer.sourceCurrent && translationLayer.paperMap.loaded && paper.a>0
             readonly property bool clipped: modelData.text.length > 8192
                 || fitProbe.contentHeight > fitProbe.height + 0.01
                 || fitProbe.contentWidth > fitProbe.width + 0.01
@@ -154,17 +218,23 @@ Item {
             TranslationChip {
                 id: chip
                 app: translationLayer.app
-                visible: translationLayer.sourceCurrent && !!overlay.chipRegion
+                visible: overlay.present && translationLayer.sourceCurrent && !!overlay.chipRegion
                 readonly property string placement: overlay.chipRegion ? overlay.chipRegion.position : ""
                 x: visible ? overlay.chipRegion.x : 0
                 y: visible ? overlay.chipRegion.y : 0
                 original: overlay.original
+                phase: overlay.phase
+                errorMessage: overlay.modelData.error || ""
+                cancelPending: (translationLayer.owner.translationCancellingRows || []).indexOf(overlay.passageId)>=0
+                retryAllowed: !((translationLayer.owner.aiState || {}).running) && !translationLayer.owner.pendingCommands
                 clipped: overlay.clipped
                 contextDescription: qsTr("Page %1 · %2 using %3. %4").arg(translationLayer.page+1)
                     .arg(overlay.modelData.language || "").arg(overlay.modelData.model || "")
                     .arg(Array.from(overlay.target.source_text.slice(0,162)).slice(0,80).join(""))
                 onToggleRequested: translationLayer.toggleOriginal(overlay.modelData.id)
                 onDisclosureRequested: translationLayer.showFull(overlay.modelData,chip)
+                onCancelRequested: if(translationLayer.sourceCurrent && overlay.present)translationLayer.owner.cancelTranslation(overlay.passageId)
+                onRetryRequested: if(translationLayer.sourceCurrent && overlay.present)translationLayer.app.previewTranslationRetry(translationLayer.owner,translationLayer.generation,overlay.passageId)
             }
 
         }

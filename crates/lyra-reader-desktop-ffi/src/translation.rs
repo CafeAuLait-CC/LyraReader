@@ -485,6 +485,33 @@ impl Translations {
         self.audit_root = None;
         self.running = self.rows.iter().any(|row| row.job.is_some());
     }
+    fn cancel_row(
+        &mut self,
+        document: &Arc<LyraReaderDocument>,
+        token: &str,
+        id: &str,
+        location: &DocumentCache,
+    ) -> Result<Value, String> {
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.view.id == id)
+            .ok_or("The translation row is no longer available.")?;
+        if matches!(
+            row.view.state,
+            State::Prepared | State::Queued | State::Sending
+        ) {
+            if let Some(job) = &row.job {
+                job.cancel();
+            }
+            // Keep the job until polling drains its audit/completion events. A late
+            // Done must not publish a cancelled answer, or cancel the other rows.
+            row.view.state = State::Cancelled;
+            row.view.translated_text.clear();
+            row.plan = None;
+        }
+        self.poll(document, token, location)
+    }
     fn poll(
         &mut self,
         document: &Arc<LyraReaderDocument>,
@@ -508,7 +535,9 @@ impl Translations {
             let events = job.poll();
             for event in events {
                 match event {
-                    AiEventRecord::Delta { text } if !row.limited => {
+                    AiEventRecord::Delta { text }
+                        if !row.limited && row.view.state != State::Cancelled =>
+                    {
                         if row
                             .view
                             .translated_text
@@ -531,11 +560,13 @@ impl Translations {
                         message, cancelled, ..
                     } => {
                         row.view.error = Some(message);
-                        row.view.state = if cancelled {
-                            State::Cancelled
-                        } else {
-                            State::Failed
-                        };
+                        if row.view.state != State::Cancelled {
+                            row.view.state = if cancelled {
+                                State::Cancelled
+                            } else {
+                                State::Failed
+                            };
+                        }
                     }
                     _ => {}
                 }
@@ -749,6 +780,17 @@ impl DesktopDocument {
                 self.translation_scope.cancel();
                 translations.poll(&document, token, location)
             }
+            "translation_cancel_row" => {
+                let token = r["token"].as_str().ok_or("Missing translation token.")?;
+                if token != translations.token {
+                    return Ok(json!({"cancelled":false,"obsolete":true}));
+                }
+                let id = r["row_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or("Missing translation row.")?;
+                translations.cancel_row(&document, token, id, location)
+            }
             "translation_inspect" => translations.inspect(
                 &document,
                 u32::try_from(r["page"].as_u64().ok_or("Missing translation page.")?)
@@ -871,6 +913,7 @@ mod tests {
         bodies: Arc<Mutex<Vec<Vec<u8>>>>,
         peak: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,
+        hold: Arc<AtomicBool>,
         worker: Option<thread::JoinHandle<()>>,
     }
     impl Server {
@@ -882,19 +925,27 @@ mod tests {
             let peak = Arc::new(AtomicUsize::new(0));
             let active = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
-            let (b, p, a, s) = (bodies.clone(), peak.clone(), active, stop.clone());
+            let hold = Arc::new(AtomicBool::new(false));
+            let (b, p, a, s, h) = (
+                bodies.clone(),
+                peak.clone(),
+                active,
+                stop.clone(),
+                hold.clone(),
+            );
             let worker = thread::spawn(move || {
                 let mut children = Vec::new();
                 while !s.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((mut socket, _)) => {
-                            let (b, p, a, s) = (b.clone(), p.clone(), a.clone(), s.clone());
+                            let (b, p, a, s, h) =
+                                (b.clone(), p.clone(), a.clone(), s.clone(), h.clone());
                             children.push(thread::spawn(move||{
                     socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut bytes=Vec::new();let mut buffer=[0;4096];let header_end=loop {let n=socket.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);if let Some(i)=bytes.windows(4).position(|v|v==b"\r\n\r\n"){break i+4;}assert!(bytes.len()<65536);};
                     let header=std::str::from_utf8(&bytes[..header_end]).unwrap();let count=header.lines().find_map(|l|l.split_once(':').filter(|(name,_)|name.eq_ignore_ascii_case("content-length")).map(|(_,v)|v.trim().parse::<usize>().unwrap())).unwrap();assert!(count<1024*1024);
                     while bytes.len()-header_end<count {let n=socket.read(&mut buffer).unwrap();assert!(n>0);bytes.extend_from_slice(&buffer[..n]);}
                     b.lock().unwrap().push(bytes[header_end..header_end+count].to_vec());let now=a.fetch_add(1,Ordering::SeqCst)+1;p.fetch_max(now,Ordering::SeqCst);
-                    let begun=Instant::now();while begun.elapsed()<delay && !s.load(Ordering::SeqCst){thread::sleep(Duration::from_millis(5));}
+                    let begun=Instant::now();while (begun.elapsed()<delay || h.load(Ordering::SeqCst)) && !s.load(Ordering::SeqCst){thread::sleep(Duration::from_millis(5));}
                     let done=if complete {"data: [DONE]\n\n"}else{""};let body=format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"Synthetic complete translation\"}}}}]}}\n\n{done}");let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());let _=socket.write_all(response.as_bytes());a.fetch_sub(1,Ordering::SeqCst);
                 }));
                         }
@@ -913,6 +964,7 @@ mod tests {
                 bodies,
                 peak,
                 stop,
+                hold,
                 worker: Some(worker),
             }
         }
@@ -1413,6 +1465,180 @@ mod tests {
         assert_eq!(audit.lines().count(), 6);
         assert!(!audit.contains("Synthetic paragraph"));
     }
+    #[test]
+    fn single_row_cancellation_keeps_other_jobs_and_audits_each_outbound_request() {
+        let fixture = Fixture::new();
+        let server = Server::new(Duration::ZERO, true);
+        server.hold.store(true, Ordering::SeqCst);
+        let preview = fixture
+            .document
+            .command(json!({"op":"translation_prepare","request":fixture.request(&server.url)}))
+            .unwrap();
+        let token = &preview["plan"]["token"];
+        let rows = preview["translation"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 6);
+        let active_id = rows[0]["id"].clone();
+        let queued_id = rows[5]["id"].clone();
+        fixture
+            .document
+            .command(json!({"op":"translation_start","token":token,"api_key":"synthetic"}))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while server.bodies.lock().unwrap().len() < 3 {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let queued = fixture
+            .document
+            .command(json!({"op":"translation_cancel_row","token":token,"row_id":queued_id}))
+            .unwrap();
+        assert_eq!(queued["rows"][5]["state"], "cancelled");
+        assert_eq!(queued["rows"][0]["state"], "sending");
+        let cancelled = fixture
+            .document
+            .command(json!({"op":"translation_cancel_row","token":token,"row_id":active_id}))
+            .unwrap();
+        assert_eq!(cancelled["rows"][0]["state"], "cancelled");
+        assert_eq!(cancelled["rows"][5]["state"], "cancelled");
+        server.hold.store(false, Ordering::SeqCst);
+        let complete = wait(&fixture.document, token);
+        let rows = complete["rows"].as_array().unwrap();
+        assert_eq!(rows.iter().filter(|row| row["state"] == "ready").count(), 4);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["state"] == "cancelled")
+                .count(),
+            2
+        );
+        let entries = fixture
+            .document
+            .command(json!({"op":"translation_inspect","page":0}))
+            .unwrap();
+        assert_eq!(entries["entries"].as_array().unwrap().len(), 4);
+        assert!(
+            entries["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["entry"]["key"] != active_id && row["entry"]["key"] != queued_id)
+        );
+        let expected = preview["plan"]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(5)
+            .map(|part| part["wire_body"].as_str().unwrap().as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let mut actual = server.bodies.lock().unwrap().clone();
+        let mut expected = expected;
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        let audit = fs::read_to_string(fixture.cache.root.join("Audit/ai-requests.jsonl")).unwrap();
+        assert_eq!(audit.lines().count(), 5);
+        assert!(!audit.contains("Synthetic paragraph"));
+    }
+
+    #[test]
+    fn single_row_cancellation_rejects_stale_owners_and_does_not_remove_ready_cache() {
+        let fixture = Fixture::new();
+        let server = Server::new(Duration::ZERO, true);
+        let request = fixture.request(&server.url);
+        let old = fixture
+            .document
+            .command(json!({"op":"translation_prepare","request":request}))
+            .unwrap();
+        let next = fixture
+            .document
+            .command(json!({"op":"translation_prepare","request":request}))
+            .unwrap();
+        let token = &next["plan"]["token"];
+        let id = &next["translation"]["rows"][0]["id"];
+        let obsolete = fixture
+            .document
+            .command(
+                json!({"op":"translation_cancel_row","token":old["plan"]["token"],"row_id":id}),
+            )
+            .unwrap();
+        assert_eq!(obsolete["obsolete"], true);
+        assert!(fixture.document.command(json!({"op":"translation_cancel_row","token":token,"row_id":"unknown-synthetic-row"})).is_err());
+        assert!(server.bodies.lock().unwrap().is_empty());
+        fixture
+            .document
+            .command(json!({"op":"translation_start","token":token,"api_key":"synthetic"}))
+            .unwrap();
+        let complete = wait(&fixture.document, token);
+        assert!(
+            complete["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] == "ready")
+        );
+        let before = fs::read(fixture.cache.directory.join(FILE)).unwrap();
+        let unchanged = fixture
+            .document
+            .command(json!({"op":"translation_cancel_row","token":token,"row_id":id}))
+            .unwrap();
+        assert_eq!(unchanged["rows"][0]["state"], "ready");
+        assert_eq!(
+            fs::read(fixture.cache.directory.join(FILE)).unwrap(),
+            before
+        );
+        assert_eq!(server.bodies.lock().unwrap().len(), 6);
+    }
+
+    #[test]
+    fn single_row_cancellation_wins_over_a_finished_but_unpublished_answer() {
+        for complete_response in [true, false] {
+            let fixture = Fixture::new();
+            let server = Server::new(Duration::ZERO, complete_response);
+            let preview = fixture
+                .document
+                .command(json!({"op":"translation_prepare","request":fixture.request(&server.url)}))
+                .unwrap();
+            let token = &preview["plan"]["token"];
+            let id = &preview["translation"]["rows"][0]["id"];
+            fixture
+                .document
+                .command(json!({"op":"translation_start","token":token,"api_key":"synthetic"}))
+                .unwrap();
+            let job = fixture.document.translations.lock().unwrap().rows[0]
+                .job
+                .as_ref()
+                .unwrap()
+                .clone();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !job.is_finished() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(!fixture.cache.directory.join(FILE).exists());
+            fixture
+                .document
+                .command(json!({"op":"translation_cancel_row","token":token,"row_id":id}))
+                .unwrap();
+            let complete = wait(&fixture.document, token);
+            assert_eq!(complete["rows"][0]["state"], "cancelled");
+            let entries = fixture
+                .document
+                .command(json!({"op":"translation_inspect","page":0}))
+                .unwrap();
+            assert_eq!(complete["rows"][0]["translated_text"], "");
+            assert_eq!(
+                entries["entries"].as_array().unwrap().len(),
+                if complete_response { 5 } else { 0 }
+            );
+            assert!(
+                entries["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["entry"]["key"] != *id)
+            );
+        }
+    }
+
     #[test]
     fn cancellation_drains_active_jobs_without_starting_queued_or_caching_partial_answers() {
         let fixture = Fixture::new();

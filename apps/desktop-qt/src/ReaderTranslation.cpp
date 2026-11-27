@@ -42,6 +42,7 @@ void ReaderController::resetTranslations(bool preserveViews) {
     if(!preserveViews){m_translationViews.clear();m_translationCarryModes.clear();m_translationViewOrder.clear();m_translationRestoreHistory=false;}
     abandonTranslations();m_translationState.clear();m_translationOverlays.clear();m_translationInspections.clear();m_translationInspectedPages.clear();
     m_translationPreparedToken.clear();m_translationActiveToken.clear();m_translationActive=false;m_translationCancelId=0;
+    m_translationRowCancellations.clear();m_translationRowsCancelling.clear();
     // resetAi is part of publishing a document revision. Defer these new notifications
     // until that enclosing publication has returned; a direct listener may delete the reader.
     QPointer<ReaderController> alive(this);const auto generation=m_generation;
@@ -107,6 +108,21 @@ void ReaderController::cancelInplaceTranslation() {
     const auto id=submit(QStringLiteral("translation_cancel"),{{QStringLiteral("token"),token}});
     if(alive && document==m_document && generation==m_generation)m_translationCancelId=id;
 }
+bool ReaderController::cancelTranslation(const QString &row) {
+    if(!m_document || m_loading || !m_translationActive || m_translationActiveToken.isEmpty() || m_translationRowsCancelling.contains(row))return false;
+    const auto rows=m_translationState.value(QStringLiteral("rows")).toList();
+    const bool cancellable=std::any_of(rows.begin(),rows.end(),[&](const QVariant &value){const auto item=value.toMap();const auto state=item.value(QStringLiteral("state")).toString();return item.value(QStringLiteral("id")).toString()==row && (state==QStringLiteral("queued") || state==QStringLiteral("sending"));});
+    if(!cancellable)return false;
+    const auto document=m_document;const auto token=m_translationActiveToken;
+    const auto generation=m_generation,epoch=m_aiPreviewEpoch;QPointer<ReaderController> alive(this);
+    const auto current=[&]{return alive && document==m_document && generation==m_generation && epoch==m_aiPreviewEpoch && token==m_translationActiveToken;};
+    m_translationRowsCancelling.insert(row);emit translationsChanged();
+    if(!current())return false;
+    const auto id=submit(QStringLiteral("translation_cancel_row"),{{QStringLiteral("token"),token},{QStringLiteral("row_id"),row}});
+    if(!current())return false;
+    if(!id){m_translationRowsCancelling.remove(row);emit translationsChanged();return false;}
+    m_translationRowCancellations.insert(id,{row,token,epoch});return true;
+}
 void ReaderController::toggleTranslation(const QString &id) {
     auto found=m_translationOverlays.find(id);if(found==m_translationOverlays.end())return;
     auto entry=found.value();entry.insert(QStringLiteral("original"),!entry.value(QStringLiteral("original")).toBool());found.value()=entry;emit translationOverlaysChanged();
@@ -151,6 +167,19 @@ void ReaderController::applyTranslationFrame(const QVariantMap &frame) {
 void ReaderController::handleTranslationCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error) {
     if(!operation.startsWith(QStringLiteral("translation_")))return;
     const auto frame=result.toMap();const auto previousOverlays=m_translationOverlays;
+    if(operation==QStringLiteral("translation_cancel_row")) {
+        if(!m_translationRowCancellations.contains(id))return;
+        const auto request=m_translationRowCancellations.take(id);m_translationRowsCancelling.remove(request.row);
+        if(request.token!=m_translationActiveToken || request.epoch!=m_aiPreviewEpoch){emit translationsChanged();return;}
+        QPointer<ReaderController> alive(this);const auto generation=m_generation;
+        if(error.isEmpty() && !frame.value(QStringLiteral("obsolete")).toBool()) {
+            applyTranslationFrame(frame);if(m_translationActive)m_aiTimer.start();
+        } else if(!error.isEmpty())m_aiState.insert(QStringLiteral("status"),error);
+        // A failed row command must not cancel unrelated requests in this batch.
+        if(previousOverlays!=m_translationOverlays)emit translationOverlaysChanged();
+        if(!alive || generation!=m_generation)return;emit translationsChanged();
+        if(!alive || generation!=m_generation)return;emit aiStateChanged();return;
+    }
     if(operation==QStringLiteral("translation_inspect")) {
         if(!m_translationInspections.contains(id))return;
         const auto page=m_translationInspections.take(id);

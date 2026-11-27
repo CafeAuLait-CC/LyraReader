@@ -173,6 +173,20 @@ ApplicationWindow {
         currentReader.setAiInput("view",value);
         showAiPanel(true);
     }
+    function previewTranslationRetry(reader,generation,id) {
+        if(reader!==currentReader || generation!==reader.documentGeneration || reader.loading
+                || reader.pendingCommands || reader.aiState.running)return false;
+        const row=(reader.translationState.rows || []).find(function(value){return value.id===id && value.state==="failed";});
+        if(!row)return false;
+        const source=row.target;
+        // Re-enter the existing request preview using the exact source character range.
+        // The chip never sends or reuses credentials from a failed request.
+        selection={page:source.page,start:source.start,end:source.end};
+        reader.setAiInput("action",3);reader.setAiInput("translationScope","selection");reader.setAiInput("inplace",true);
+        openAiWorkspace("translation");
+        if(reader!==currentReader || generation!==reader.documentGeneration || !aiPanelVisible || aiPanelMode!=="assistant")return false;
+        aiContent.prepareFromUi();return true;
+    }
     function finishReadingNoteInput() { savedNotes.finishInput(); aiContent.finishReadingNoteInput(); }
     function showAiPanel(show) {showAiPanelMode(show,"assistant");}
     function showAiPanelMode(show,mode) {

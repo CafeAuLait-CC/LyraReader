@@ -45,6 +45,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap documentReading READ documentReading NOTIFY documentReadingChanged)
     Q_PROPERTY(QVariantList translationOverlays READ translationOverlays NOTIFY translationOverlaysChanged)
     Q_PROPERTY(QVariantMap translationState READ translationState NOTIFY translationsChanged)
+    Q_PROPERTY(QStringList translationCancellingRows READ translationCancellingRows NOTIFY translationsChanged)
     Q_PROPERTY(QVariantMap aiRegion READ aiRegion NOTIFY aiRegionChanged)
     Q_PROPERTY(QVariantList aiRegionPreviousTurns READ aiRegionPreviousTurns NOTIFY aiRegionPreviousTurnsChanged)
     Q_PROPERTY(QVariantMap aiRegionPaper READ aiRegionPaper NOTIFY aiRegionPaperChanged)
@@ -95,6 +96,8 @@ public:
     Q_INVOKABLE bool prepareInplaceTranslation(const QVariantMap &request);
     Q_INVOKABLE void inspectTranslations(int page);
     Q_INVOKABLE void toggleTranslation(const QString &id);
+    Q_INVOKABLE bool cancelTranslation(const QString &id);
+    QStringList translationCancellingRows()const{return m_translationRowsCancelling.values();}
     QVariantMap aiState()const{return m_aiState;}
     QObject *readingTerm()const;
     Q_INVOKABLE bool startAiTerm(const QString &key,const QVariantMap &expectedPlan);
@@ -316,6 +319,9 @@ private:
     QString m_translationPreparedToken,m_translationActiveToken;
     bool m_translationActive=false;
     quint64 m_translationCancelId=0;
+    struct TranslationRowCancellation {QString row,token;quint64 epoch;};
+    QHash<quint64,TranslationRowCancellation> m_translationRowCancellations;
+    QSet<QString> m_translationRowsCancelling;
     void initSummaryBatch();
     void resetSummaryBatch();
     void abandonSummaryBatch();
