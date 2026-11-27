@@ -157,10 +157,51 @@ Item {
         onRejected: app.replacementContext=null
     }
     property var editingBookmark: null
-    function openBookmark(bookmark, index) {
-        editingBookmark = bookmark;
+    property var bookmarkOwner: null
+    property var bookmarkGeneration: null
+    property var bookmarkAnchor: null
+    property double bookmarkRequest: -1
+    property string bookmarkError: ""
+    function bookmarkContextCurrent() {
+        return bookmarkOwner && bookmarkOwner===app.currentReader && !bookmarkOwner.loading
+            && !bookmarkOwner.documentRevisionPending && bookmarkGeneration===bookmarkOwner.documentGeneration
+            && editingBookmark && app.bookmarks.some(function(b){return b.id===editingBookmark.id;});
+    }
+    function openBookmark(bookmark, index, anchor) {
+        if (!bookmark || !app.currentReader || app.currentReader.loading || app.currentReader.documentRevisionPending
+                || !app.bookmarks.some(function(b){return b.id===bookmark.id;})) return;
+        bookmarkOwner=app.currentReader;
+        bookmarkGeneration=bookmarkOwner.documentGeneration;
+        bookmarkAnchor=anchor;
+        bookmarkRequest=-1;
+        bookmarkError="";
+        editingBookmark = Object.assign({},bookmark);
         bookmarkTitle.text = bookmark.title;
         bookmarkEditor.open();
+    }
+    function saveBookmarkEditor(remove) {
+        if (bookmarkRequest>=0) return;
+        if (!bookmarkContextCurrent()) {bookmarkEditor.close();return;}
+        bookmarkError="";
+        const request={id:editingBookmark.id};
+        if (!remove) {
+            const title=bookmarkOwner.trimBookmarkEditorText(bookmarkTitle.text);
+            const current=app.bookmarks.find(function(b){return b.id===editingBookmark.id;});
+            if (current && title===current.title) {bookmarkEditor.close();return;}
+            request.patch={title:title};
+        }
+        bookmarkRequest=bookmarkOwner.submit(remove ? "bookmark_delete" : "bookmark_update",request);
+    }
+    Connections { target:app; function onCurrentReaderChanged(){bookmarkEditor.close();} }
+    Connections {
+        target:dialogs.bookmarkOwner
+        function onDocumentChanged(){if(bookmarkEditor.visible && !dialogs.bookmarkContextCurrent())bookmarkEditor.close();}
+        function onCommandFinished(id,op,result,error) {
+            if(id!==dialogs.bookmarkRequest)return;
+            dialogs.bookmarkRequest=-1;
+            if(error.length)dialogs.bookmarkError=error;
+            else bookmarkEditor.close();
+        }
     }
     function recoverSidecar() {
         sidecarRecovery.open();
@@ -182,53 +223,77 @@ Item {
     }
     Dialog {
         id: bookmarkEditor
+        objectName: "bookmarkEditor"
         title: qsTr("Edit Bookmark")
+        Binding {
+            target: bookmarkEditor.contentItem ? bookmarkEditor.contentItem.parent : null
+            property: "Accessible.name"
+            value: bookmarkEditor.title
+            when: bookmarkEditor.contentItem && bookmarkEditor.contentItem.parent
+        }
+        header: null
+        footer: null
+        standardButtons: Dialog.NoButton
+        modal: false
         parent: Overlay.overlay
-        anchors.centerIn: parent
-        modal: true
-        standardButtons: Dialog.Save | Dialog.Cancel
-        ColumnLayout {
-            TextField {
-                id: bookmarkTitle
-                Layout.fillWidth: true
-                Accessible.name: qsTr("Bookmark title")
+        width: Math.min(280, app.width - 16)
+        margins: 8
+        padding: 16
+        height: Math.min(implicitHeight, app.height - 16)
+        focus: true
+        closePolicy: dialogs.bookmarkRequest>=0 ? Popup.NoAutoClose : Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        onAboutToShow: {
+            const anchor=dialogs.bookmarkAnchor;
+            const p=anchor ? anchor.mapToItem(parent,0,anchor.height) : Qt.point((app.width-width)/2,(app.height-height)/2);
+            x=Math.max(8,Math.min(parent.width-width-8,p.x));
+            y=Math.max(8,Math.min(parent.height-height-8,p.y));
+        }
+        onOpened: {bookmarkTitle.forceActiveFocus();bookmarkTitle.selectAll();}
+        onClosed: {dialogs.editingBookmark=null;dialogs.bookmarkOwner=null;dialogs.bookmarkGeneration=null;dialogs.bookmarkAnchor=null;dialogs.bookmarkRequest=-1;}
+        background: Rectangle { color:app.colors.menuBg; radius:8; border.width:1; border.color:app.colors.controlBorder }
+        contentItem: ColumnLayout {
+            spacing: 14
+            RowLayout {
+                Label {
+                    textFormat: Text.PlainText
+                    text: dialogs.editingBookmark ? qsTr("Page %1 bookmark").arg(dialogs.editingBookmark.page+1) : ""
+                    font.pixelSize: 12
+                    color: app.colors.textSecondary
+                    Layout.fillWidth: true
+                }
+                LyraToolButton { symbol:"close";text:qsTr("Close bookmark editor");enabled:dialogs.bookmarkRequest<0;onClicked:bookmarkEditor.close() }
             }
+            Label { text:qsTr("Bookmark name");font.pixelSize:12;font.weight:Font.Medium;color:app.colors.textPrimary }
+            ReadingTextField {
+                id: bookmarkTitle
+                app: dialogs.app
+                objectName: "bookmarkNameField"
+                placeholderText: qsTr("Name")
+                Layout.fillWidth: true
+                enabled: dialogs.bookmarkRequest<0
+                Accessible.name: qsTr("Bookmark name")
+                onAccepted: dialogs.saveBookmarkEditor(false)
+            }
+            Label { textFormat:Text.PlainText;Layout.fillWidth:true;visible:dialogs.bookmarkError.length>0;text:dialogs.bookmarkError;color:app.colors.errorFg;wrapMode:Text.Wrap }
             RowLayout {
                 Button {
-                    text: qsTr("Move Up")
-                    onClicked: if (dialogs.editingBookmark)
-                        app.currentReader.submit("bookmark_move", {
-                            id: dialogs.editingBookmark.id,
-                            delta: -1
-                        })
+                    text: qsTr("Remove Bookmark")
+                    flat: true
+                    font.pixelSize: 12
+                    palette.buttonText: enabled ? app.colors.errorFg : app.colors.textDisabled
+                    enabled: dialogs.bookmarkRequest<0
+                    onClicked: dialogs.saveBookmarkEditor(true)
                 }
-                Button {
-                    text: qsTr("Move Down")
-                    onClicked: if (dialogs.editingBookmark)
-                        app.currentReader.submit("bookmark_move", {
-                            id: dialogs.editingBookmark.id,
-                            delta: 1
-                        })
-                }
-                Button {
-                    text: qsTr("Delete")
-                    onClicked: {
-                        if (dialogs.editingBookmark)
-                            app.currentReader.submit("bookmark_delete", {
-                                id: dialogs.editingBookmark.id
-                            });
-                        bookmarkEditor.close();
-                    }
+                Item { Layout.fillWidth:true }
+                ReadingPrimaryButton {
+                    app:dialogs.app
+                    text:qsTr("Done")
+                    Layout.preferredWidth:70
+                    enabled:dialogs.bookmarkRequest<0
+                    onClicked:dialogs.saveBookmarkEditor(false)
                 }
             }
         }
-        onAccepted: if (dialogs.editingBookmark)
-            app.currentReader.submit("bookmark_update", {
-                id: dialogs.editingBookmark.id,
-                patch: {
-                    title: bookmarkTitle.text
-                }
-            })
     }
     function confirmPageDeletion() {
         deletePages.open();

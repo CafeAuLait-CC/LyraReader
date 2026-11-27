@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Shapes
 import LyraReader 1.0
 import "ReaderLogic.js" as Logic
 
@@ -8,6 +9,13 @@ Pane {
     id: sidebarPanel
     required property var app
     padding: 0
+    component BookmarkOption: MenuItem {
+        implicitHeight: 30
+        font.pixelSize: 12
+        icon.width: 14
+        icon.height: 14
+        icon.color: sidebarPanel.app.colors.iconPrimary
+    }
     readonly property var passageInputs: {
         const result={},flags=app.currentReader.data.annotation_rules && app.currentReader.data.annotation_rules.kind_flags || [];
         for(const row of app.annotationThreads.rows) {
@@ -319,35 +327,109 @@ Pane {
                 model: app.bookmarks
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
+                    id: bookmarkRow
                     required property var modelData
                     required property int index
+                    readonly property var presentation: (app.markState.bookmark_presentation || {})[modelData.id] || null
+                    property var menuContext: null
+                    function contextCurrent() {
+                        const c=menuContext;
+                        return c && c.owner && c.owner===app.currentReader && !c.owner.loading && !c.owner.documentRevisionPending
+                            && c.generation===c.owner.documentGeneration && app.bookmarks.some(function(b){return b.id===c.bookmark.id;});
+                    }
+                    function command(operation, delta) {
+                        if (!contextCurrent()) return;
+                        const request={id:menuContext.bookmark.id};
+                        if (delta!==undefined) request.delta=delta;
+                        menuContext.owner.submit(operation,request);
+                    }
                     activeFocusOnTab: true
-                    Accessible.name: qsTr("%1 · page %2").arg(modelData.title || qsTr("Bookmark")).arg(modelData.page + 1)
+                    hoverEnabled: true
+                    Accessible.name: presentation ? presentation.title + " · " + presentation.page_label : qsTr("Bookmark title unavailable")
                     Accessible.onPressAction: if (enabled && visible)
                         clicked()
                     width: bookmarkList.width
-                    height: 62
+                    padding: 10
+                    leftPadding: 18
+                    rightPadding: 18
+                    leftInset: 8
+                    rightInset: 8
+                    height: Math.max(52, bookmarkBody.implicitHeight + 20)
+                    background: Rectangle {
+                        radius: 8
+                        color: bookmarkRow.down ? app.colors.pressedBg : bookmarkRow.modelData.page===app.currentPage ? app.colors.selectedBg : bookmarkRow.hovered ? app.colors.hoverBg : "transparent"
+                        border.width: bookmarkRow.visualFocus ? 2 : 0
+                        border.color: app.colors.focusRing
+                    }
                     contentItem: RowLayout {
+                        id: bookmarkBody
+                        spacing: 10
+                        Shape {
+                            objectName: "bookmarkFlag" + bookmarkRow.index
+                            Layout.preferredWidth: 16
+                            Layout.preferredHeight: 18
+                            Layout.alignment: Qt.AlignTop
+                            Accessible.ignored: true
+                            ShapePath {
+                                strokeWidth: 0
+                                strokeColor: "transparent"
+                                fillColor: app.colors.accent
+                                PathSvg { path: "M2 0 H14 V18 L8 14 L2 18 Z" }
+                            }
+                        }
                         ColumnLayout {
                             Layout.fillWidth: true
-                            spacing: 3
+                            Layout.minimumWidth: 0
+                            spacing: 5
                             Label {
+                                objectName: "bookmarkTitle" + bookmarkRow.index
                                 textFormat: Text.PlainText
-                                text: modelData.title
+                                text: bookmarkRow.presentation ? bookmarkRow.presentation.title : qsTr("Bookmark title unavailable")
                                 Layout.fillWidth: true
+                                Layout.minimumWidth: 0
+                                font.pixelSize: 13
+                                font.weight: Font.Medium
+                                wrapMode: Text.Wrap
+                                maximumLineCount: 2
                                 elide: Text.ElideRight
+                                color: app.colors.textPrimary
                             }
                             Label {
+                                objectName: "bookmarkPage" + bookmarkRow.index
                                 textFormat: Text.PlainText
-                                text: qsTr("Page %1").arg(modelData.page + 1)
-                                color: app.colors.textTertiary
-                                font.pixelSize: 11
+                                text: bookmarkRow.presentation ? bookmarkRow.presentation.page_label : ""
+                                color: app.colors.textSecondary
+                                font.pixelSize: 12
                             }
                         }
                         LyraToolButton {
+                            id: bookmarkOptions
+                            objectName: "bookmarkOptions" + bookmarkRow.index
+                            Layout.alignment: Qt.AlignTop
                             symbol: "more"
-                            text: qsTr("Edit bookmark")
-                            onClicked: app.editBookmark(modelData, index)
+                            text: qsTr("Bookmark options")
+                            selected: bookmarkMenu.visible
+                            Accessible.description: bookmarkMenu.visible ? qsTr("Expanded") : qsTr("Collapsed")
+                            onClicked: bookmarkMenu.popup(0,height)
+                            Menu {
+                                id: bookmarkMenu
+                                objectName: "bookmarkOptionsMenu" + bookmarkRow.index
+                                onAboutToShow: bookmarkRow.menuContext={owner:app.currentReader,generation:app.currentReader.documentGeneration,bookmark:Object.assign({},bookmarkRow.modelData)}
+                                BookmarkOption {
+                                    text: qsTr("Rename…")
+                                    icon.source: "qrc:/icons/pen.svg"
+                                    onTriggered: if(bookmarkRow.contextCurrent())app.editBookmarkAt(bookmarkRow.menuContext.bookmark,bookmarkRow.index,bookmarkOptions)
+                                }
+                                BookmarkOption { text: qsTr("Remove Bookmark"); icon.source:"qrc:/icons/delete.svg"; onTriggered: bookmarkRow.command("bookmark_delete") }
+                                MenuSeparator {}
+                                BookmarkOption { text: qsTr("Move Up"); icon.source:"qrc:/icons/arrow-up.svg"; onTriggered: bookmarkRow.command("bookmark_move",-1) }
+                                BookmarkOption { text: qsTr("Move Down"); icon.source:"qrc:/icons/arrow-down.svg"; onTriggered: bookmarkRow.command("bookmark_move",1) }
+                            }
+                            Connections { target:app; function onCurrentReaderChanged(){bookmarkMenu.close();bookmarkRow.menuContext=null;} }
+                            Connections {
+                                target:bookmarkRow.menuContext ? bookmarkRow.menuContext.owner : null
+                                function onDocumentChanged(){if(!bookmarkRow.contextCurrent())bookmarkMenu.close();}
+                            }
                         }
                     }
                     onClicked: app.navigate(modelData.page, modelData.yPt || 0)

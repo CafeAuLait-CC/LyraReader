@@ -1353,7 +1353,10 @@ ApplicationWindow {
         }
     }
     function editBookmark(bookmark, index) {
-        dialogs.openBookmark(bookmark, index);
+        dialogs.openBookmark(bookmark, index, null);
+    }
+    function editBookmarkAt(bookmark, index, anchor) {
+        dialogs.openBookmark(bookmark, index, anchor);
     }
     function annotationAt(page, x, y, inkOnly) {
         if(!inkOnly) {

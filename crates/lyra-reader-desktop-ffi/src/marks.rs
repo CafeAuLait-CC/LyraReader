@@ -121,6 +121,54 @@ fn string(v: &Value, k: &str) -> Result<String, String> {
         .map(str::to_string)
         .ok_or_else(|| format!("Missing {k}"))
 }
+// Display-only metadata stays beside the original records, never in the cache
+// entries. A legacy empty name is displayed using the same rule as macOS.
+fn bookmark_presentation(value: &Value) -> Result<Value, String> {
+    let title = string(value, "title")?;
+    let page = value["page"]
+        .as_u64()
+        .and_then(|page| u32::try_from(page).ok())
+        .ok_or("Invalid bookmark page")?;
+    let one_based = page.checked_add(1).ok_or("Invalid bookmark page")?;
+    let display_title = if title.trim().is_empty() {
+        bookmark_title(None, i64::from(page))
+    } else {
+        title
+    };
+    Ok(json!({"title":display_title,"page_label":page_label(vec![one_based])}))
+}
+fn bookmark_move_slots(
+    entries: &[Entry],
+    request: &Value,
+) -> Result<Option<(usize, usize)>, String> {
+    let id = string(request, "id")?;
+    let delta = request["delta"]
+        .as_i64()
+        .and_then(|delta| i32::try_from(delta).ok())
+        .ok_or("Invalid bookmark move")?;
+    let positions: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e,Entry::Known(v)if kind(v)=="bookmark").then_some(i))
+        .collect();
+    let index = positions
+        .iter()
+        .position(|i| matches!(&entries[*i],Entry::Known(v)if v["id"]==id))
+        .ok_or("Bookmark not found")?;
+    let count = u32::try_from(positions.len()).map_err(|_| "Too many bookmarks")?;
+    let next = bookmark_move_index(
+        u32::try_from(index).map_err(|_| "Too many bookmarks")?,
+        delta,
+        count,
+    );
+    let next = usize::try_from(next).map_err(|_| "Invalid bookmark move")?;
+    if index == next {
+        return Ok(None);
+    }
+    let from = *positions.get(index).ok_or("Invalid bookmark move")?;
+    let to = *positions.get(next).ok_or("Invalid bookmark move")?;
+    Ok(Some((from, to)))
+}
 fn color(v: &Value) -> Option<String> {
     if let Some(text) = v["color"].as_str() {
         return records::PaletteColor::from_hex(text).map(|c| c.hex());
@@ -1279,6 +1327,7 @@ impl Marks {
         let file = document.annotations().map_err(|e| e.to_string())?;
         let mut own = vec![];
         let mut bookmarks = vec![];
+        let mut bookmark_presentations = serde_json::Map::new();
         for entry in &self.entries {
             if let Entry::Known(v) = entry {
                 if v["id"]
@@ -1288,6 +1337,7 @@ impl Marks {
                     continue;
                 }
                 if kind(v) == "bookmark" {
+                    bookmark_presentations.insert(string(v, "id")?, bookmark_presentation(v)?);
                     bookmarks.push(v.clone())
                 } else {
                     own.push(self.display(v, document)?);
@@ -1335,7 +1385,7 @@ impl Marks {
             .collect();
         let file = crate::artwork::annotations(file)?;
         Ok(
-            json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error.as_ref().or(self.source_error.as_ref()),"path":self.path,"pdf_dirty":self.pending.dirty || !self.deletions.is_empty() || !self.hidden_ink.is_empty(),"pending_deletions":self.deletions.len()}),
+            json!({"annotations":own,"file_annotations":file,"bookmarks":bookmarks,"bookmark_presentation":bookmark_presentations,"can_undo":!self.undo.is_empty(),"can_redo":!self.redo.is_empty(),"preserved":self.entries.iter().filter(|e|matches!(e,Entry::Opaque(_))).count(),"error":self.error.as_ref().or(self.source_error.as_ref()),"path":self.path,"pdf_dirty":self.pending.dirty || !self.deletions.is_empty() || !self.hidden_ink.is_empty(),"pending_deletions":self.deletions.len()}),
         )
     }
     fn display(&self, v: &Value, document: &LyraReaderDocument) -> Result<Value, String> {
@@ -1388,6 +1438,15 @@ impl Marks {
         r: &Value,
         document: &LyraReaderDocument,
     ) -> Result<Value, String> {
+        let move_slots = if op == "bookmark_move" {
+            match bookmark_move_slots(&self.entries, r)? {
+                Some(slots) => Some(slots),
+                // A boundary action does not write, add history, or finish a text gesture.
+                None => return self.state(document),
+            }
+        } else {
+            None
+        };
         if op.starts_with("mark_text_") {
             return self.text_edit_command(op, r, document);
         }
@@ -1525,27 +1584,9 @@ impl Marks {
                 })?;
             }
             "bookmark_move" => {
-                let id = string(r, "id")?;
-                let delta = r["delta"].as_i64().ok_or("Invalid bookmark move")?;
+                let (from, to) = move_slots.ok_or("Invalid bookmark move")?;
                 self.change(|s| {
-                    let positions: Vec<_> = s
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, e)| {
-                            if matches!(e,Entry::Known(v)if kind(v)=="bookmark") {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    let index = positions
-                        .iter()
-                        .position(|i| matches!(&s.entries[*i],Entry::Known(v)if v["id"]==id))
-                        .ok_or("Bookmark not found")?;
-                    let next = (index as i64 + delta).clamp(0, positions.len() as i64 - 1) as usize;
-                    s.entries.swap(positions[index], positions[next]);
+                    s.entries.swap(from, to);
                     Ok(())
                 })?;
             }
@@ -1807,6 +1848,75 @@ impl Marks {
 #[cfg(test)]
 mod codec_checks {
     use super::*;
+
+    #[test]
+    fn bookmark_moves_use_shared_bounds_without_touching_foreign_slots() {
+        let entries = vec![
+            Entry::Known(json!({"id":"a","kind":"bookmark"})),
+            Entry::Opaque("foreign".into()),
+            Entry::Known(json!({"id":"note","kind":"stickyNote"})),
+            Entry::Known(json!({"id":"b","kind":"bookmark"})),
+        ];
+        assert_eq!(
+            bookmark_move_slots(&entries, &json!({"id":"a","delta":-1})).expect("boundary"),
+            None
+        );
+        assert_eq!(
+            bookmark_move_slots(&entries, &json!({"id":"b","delta":1})).expect("boundary"),
+            None
+        );
+        assert_eq!(
+            bookmark_move_slots(&entries, &json!({"id":"a","delta":1})).expect("move"),
+            Some((0, 3))
+        );
+        assert_eq!(
+            bookmark_move_slots(&entries, &json!({"id":"b","delta":-1})).expect("move"),
+            Some((3, 0))
+        );
+        assert!(bookmark_move_slots(&entries, &json!({"id":"missing","delta":1})).is_err());
+        assert!(bookmark_move_slots(&entries, &json!({"id":"a","delta":i64::MAX})).is_err());
+    }
+
+    #[test]
+    fn bookmark_display_metadata_uses_shared_labels_without_rewriting_records() {
+        for (title, expected) in [
+            ("", "Page 3"),
+            (" \t\n", "Page 3"),
+            ("  Named  ", "  Named  "),
+            ("章节 😀", "章节 😀"),
+            ("\u{feff}Kept BOM", "\u{feff}Kept BOM"),
+        ] {
+            let value = json!({"id":"FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF","kind":"bookmark","title":title,"page":2,"yPt":120,"createdAt":0,"foreign":{"text":"keep"}});
+            let before = encode_entries(&[Entry::Known(value.clone())], 3, &HashSet::new())
+                .expect("encode original bookmark");
+            let presentation = bookmark_presentation(&value).expect("bookmark display");
+            assert_eq!(
+                presentation,
+                json!({"title":expected,"page_label":"Page 3"})
+            );
+            assert_eq!(value["title"], title);
+            assert!(value.get("page_label").is_none());
+            assert_eq!(
+                encode_entries(&[Entry::Known(value)], 3, &HashSet::new())
+                    .expect("encode unchanged bookmark"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn bookmark_display_refuses_invalid_or_unrepresentable_pages() {
+        for page in [
+            json!(-1),
+            json!(u32::MAX),
+            json!(u64::MAX),
+            Value::Null,
+            json!("1"),
+        ] {
+            assert!(bookmark_presentation(&json!({"title":"name","page":page})).is_err());
+        }
+        assert!(bookmark_presentation(&json!({"page":0})).is_err());
+    }
 
     #[test]
     fn desktop_codec_round_trips_the_shared_foundation_goldens_byte_for_byte() {
