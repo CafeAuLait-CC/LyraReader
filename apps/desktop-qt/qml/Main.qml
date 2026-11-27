@@ -502,7 +502,7 @@ ApplicationWindow {
     property int positionRestoreEpoch: 0
     property alias searchDebounce: searchTimer
     property var selectedAnnotation: null
-    property var infoData: ({})
+    readonly property var infoData: currentReader ? currentReader.data.document_info || ({}) : ({})
     readonly property var formValues: currentReader.editDrafts.forms || ({})
     readonly property var pendingRedactions: currentReader.editDrafts.redactions || []
     readonly property bool canRedact: false // Annotation redaction is retired; content editing has its own tools.
@@ -553,7 +553,7 @@ ApplicationWindow {
         }
     }
     readonly property string bibtex: currentReader.data.bibtex || (currentReader.data.metadata ? currentReader.data.metadata.bibtex : "")
-    property var metadataDraft: null
+    readonly property var metadataDraft: currentReader ? currentReader.metadataDraft : ({})
     property string operationStatus: ""
     property string previewStatus: ""
     onOperationStatusChanged: previewStatus = ""
@@ -1374,7 +1374,7 @@ ApplicationWindow {
     function showAuditTrail(){dialogs.settingsDialog.openAudit();}
     function showDocumentInformation() {
         currentReader.submit("document_info");
-        currentReader.submit("metadata");
+        if (!currentReader.data.metadata) currentReader.submit("metadata");
         dialogs.informationDialog.open();
     }
     function showFormsDialog() {
@@ -1915,30 +1915,23 @@ ApplicationWindow {
         });
     }
     function editMetadata(key, text) {
-        if (!metadataDraft) {
-            const m = currentReader.data.metadata || ({});
-            const values = function (k) {
-                return m[k] ? m[k].values.join(" ") : "";
-            };
-            metadataDraft = {
-                title: values("title"),
-                authors: m.authors ? m.authors.values : [],
-                venue: values("venue"),
-                year: values("year"),
-                doi: values("doi"),
-                arxiv_id: values("arxiv_id")
-            };
-        }
-        const draft = Object.assign({}, metadataDraft);
-        draft[key] = key === "authors" ? text.split(";").map(function (s) {
-            return s.trim();
-        }).filter(function (s) {
-            return s.length;
-        }) : text;
-        metadataDraft = draft;
-        currentReader.submit("bibtex", {
-            draft: draft
+        const m = currentReader.data.metadata;
+        if (!m || ["title", "authors", "venue", "year", "doi", "arxiv_id"].indexOf(key) < 0) return;
+        const previous = currentReader.metadataDraft;
+        const values = function(k) { return m[k].values.join(" "); };
+        const draft = Object.assign({}, previous.values || {
+            title: values("title"), authors: m.authors.values, venue: values("venue"),
+            year: values("year"), doi: values("doi"), arxiv_id: values("arxiv_id")
         });
+        draft[key] = key === "authors" ? text.split(/[;\r\n]+/).map(function(s) {
+            return s.trim();
+        }).filter(function(s) { return s.length; }) : text;
+        // Preserve partial author separators and whitespace in the native editor;
+        // only the shared generator formats the resulting BibTeX entry.
+        const inputs = Object.assign({}, previous.texts || {});
+        inputs[key] = text;
+        currentReader.metadataDraft = {values: draft, texts: inputs};
+        currentReader.submit("bibtex", {draft: draft});
     }
     function exportTo(url) {
         if (!session)
@@ -2987,8 +2980,6 @@ ApplicationWindow {
             root.selectedSidebarAnnotationID = "";
             root.annotationDraft = null;
             root.redactionDraft = null;
-            root.metadataDraft = null;
-            root.infoData = {};
         }
         function onOpenFinished(success) {
             if (success) {
@@ -3146,9 +3137,7 @@ ApplicationWindow {
                 root.searchVisible = true;
                 if (root.activeSearchHit)
                     root.navigate(root.activeSearchHit.page);
-            } else if (op === "document_info")
-                root.infoData = result;
-            else if (op === "save_merge")
+            } else if (op === "save_merge")
                 root.operationStatus = qsTr("Merged %1 pages into %2. Appended outline entries not imported: %3.").arg(result.page_count).arg(result.destination_path).arg(result.dropped_outline_entries);
             else if (op === "save_split")
                 root.operationStatus = qsTr("Wrote %1 verified split PDFs with their application caches.").arg(result.parts.length);

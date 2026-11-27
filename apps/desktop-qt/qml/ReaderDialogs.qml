@@ -550,7 +550,7 @@ Item {
                         model: [
                             {label: qsTr("Pages"), value: String(app.currentReader.pageCount)},
                             {label: qsTr("PDF version"), value: app.infoData.pdf_version || "—"},
-                            {label: qsTr("Encrypted"), value: app.infoData.is_encrypted ? qsTr("Yes") : qsTr("No")}
+                            {label: qsTr("Encrypted"), value: typeof app.infoData.is_encrypted === "boolean" ? (app.infoData.is_encrypted ? qsTr("Yes") : qsTr("No")) : "—"}
                         ]
                         ColumnLayout {
                             required property var modelData
@@ -568,6 +568,7 @@ Item {
                     TextField {
                         id: titleField; Accessible.name: qsTr("Title")
                         readOnly: app.xfaReadOnly
+                        enabled: !!app.currentReader.data.document_info
                         Layout.fillWidth: true
                         text: app.infoData.title || ""
                         placeholderText: qsTr("Title")
@@ -579,6 +580,7 @@ Item {
                     TextField {
                         id: authorField; Accessible.name: qsTr("Author")
                         readOnly: app.xfaReadOnly
+                        enabled: !!app.currentReader.data.document_info
                         Layout.fillWidth: true
                         text: app.infoData.author || ""
                         placeholderText: qsTr("Author")
@@ -590,6 +592,7 @@ Item {
                     TextField {
                         id: subjectField; Accessible.name: qsTr("Subject")
                         readOnly: app.xfaReadOnly
+                        enabled: !!app.currentReader.data.document_info
                         Layout.fillWidth: true
                         text: app.infoData.subject || ""
                         placeholderText: qsTr("Subject")
@@ -601,6 +604,7 @@ Item {
                     TextField {
                         id: keywordsField; Accessible.name: qsTr("Keywords")
                         readOnly: app.xfaReadOnly
+                        enabled: !!app.currentReader.data.document_info
                         Layout.fillWidth: true
                         text: app.infoData.keywords || ""
                         placeholderText: qsTr("Keywords")
@@ -609,12 +613,12 @@ Item {
                 RowLayout {
                     Button {
                         text: qsTr("Save Copy…")
-                        enabled: app.canModifyPdf && !app.infoData.is_encrypted && !app.originalReadOnly
+                        enabled: app.canModifyPdf && !!app.currentReader.data.document_info && !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.chooseExport("properties")
                     }
                     Button {
                         text: qsTr("Write to This File…")
-                        enabled: app.canModifyPdf && !app.infoData.is_encrypted && !app.originalReadOnly
+                        enabled: app.canModifyPdf && !!app.currentReader.data.document_info && !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.confirmReplace("properties")
                     }
                 }
@@ -660,17 +664,26 @@ Item {
                     ColumnLayout {
                         required property var modelData
                         readonly property var field: app.currentReader.data.metadata ? app.currentReader.data.metadata[modelData.key] : null
+                        readonly property var inputs: app.metadataDraft.texts || ({})
+                        readonly property bool corrected: typeof inputs[modelData.key] !== "undefined"
                         Layout.fillWidth: true
-                        spacing: 2
-                        Label {
-                            textFormat: Text.PlainText
-                            text: modelData.label + " · " + (field ? field.source_label : "")
-                            font.pixelSize: 11
-                            color: app.colors.textTertiary
+                        spacing: 3
+                        RowLayout {
+                            Layout.fillWidth: true
+                            Label {text: modelData.label; font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
+                            Item {Layout.fillWidth: true}
+                            Label {
+                                textFormat: Text.PlainText
+                                text: corrected ? qsTr("Edited") : !field || field.trust === "none" ? qsTr("empty") : field.source_label
+                                font.pixelSize: 11
+                                color: !corrected && field && field.guessed ? app.colors.warningFg : app.colors.textSecondary
+                            }
                         }
                         TextField {
                             Layout.fillWidth: true
-                            text: field ? field.values.join(modelData.key === "authors" ? "; " : " ") : ""
+                            enabled: !!app.currentReader.data.metadata
+                            Accessible.name: qsTr("Recognised %1").arg(modelData.label)
+                            text: corrected ? inputs[modelData.key] : field ? field.values.join(modelData.key === "authors" ? "; " : " ") : ""
                             onTextEdited: app.editMetadata(modelData.key, text)
                         }
                     }

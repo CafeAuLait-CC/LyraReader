@@ -5299,6 +5299,52 @@ LyraMenu {
         QVERIFY(QMetaObject::invokeMethod(window,"showDocumentInformation"));QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(done->hasActiveFocus());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!dialog->property("visible").toBool());
         QVERIFY(!reader->hasUnsavedChanges());QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),bytes);
     }
+    void recognisedMetadataCorrectionsStayWithTheirDocument_data() {
+        QTest::addColumn<QString>("route");QTest::newRow("reopen")<<QString("reopen");QTest::newRow("other-tab")<<QString("other-tab");QTest::newRow("same-url-new-generation")<<QString("same-url-new-generation");QTest::newRow("author-separator")<<QString("author-separator");QTest::newRow("window-transfer")<<QString("window-transfer");
+    }
+    void recognisedMetadataCorrectionsStayWithTheirDocument() {
+        QFETCH(QString,route);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-metadata-draft.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/metadata-info.pdf",path));
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto bytes=file.readAll();file.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *first=view.workspace.activeReader();QTRY_VERIFY(first->pageCount()>0 && !first->loading() && !first->pendingCommands());
+        const auto show=[&]{return QMetaObject::invokeMethod(window,"showDocumentInformation");};QVERIFY(show());QTRY_COMPARE(first->pendingCommands(),0);QTRY_VERIFY(window->findChild<QObject *>("documentInformationDialog")->property("opened").toBool());
+        std::function<QQuickItem *(QQuickItem *,const QString &)> editor=[&](QQuickItem *item,const QString &key)->QQuickItem * {
+            if(item->property("modelData").toMap().value("key").toString()==key)
+                for(auto *child:item->childItems())if(child->metaObject()->indexOfSignal("textEdited()")>=0)return child;
+            for(auto *child:item->childItems())if(auto *found=editor(child,key))return found;
+            return nullptr;
+        };
+        auto *title=editor(window->contentItem(),"title");QVERIFY(title);const auto originalTitle=title->property("text").toString();QVERIFY(!originalTitle.isEmpty());
+        title->forceActiveFocus(Qt::TabFocusReason);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTRY_VERIFY(title->hasActiveFocus());QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);for(char key:QByteArray("Corrected synthetic reader A"))QTest::keyClick(window,key);QTRY_COMPARE(first->pendingCommands(),0);
+        const auto corrected=window->property("bibtex").toString();qInfo()<<"Metadata native input"<<title->property("text")<<corrected;QVERIFY(corrected.contains("Corrected synthetic reader A"));
+        std::unique_ptr<NativeCorpus::Viewer> destination;
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!window->findChild<QObject *>("documentInformationDialog")->property("visible").toBool());
+        if(route=="reopen") {
+            QVERIFY(show());QTRY_COMPARE(first->pendingCommands(),0);title=editor(window->contentItem(),"title");QVERIFY(title);QCOMPARE(title->property("text").toString(),QString("Corrected synthetic reader A"));QCOMPARE(window->property("bibtex").toString(),corrected);
+            bool edited=false;for(auto *label:title->parentItem()->findChildren<QQuickItem *>())edited|=label->property("text").toString()=="Edited";QVERIFY2(edited,"The corrected field must show Edited rather than its original provenance");
+        } else if(route=="other-tab") {
+            view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *second=view.workspace.activeReader();QVERIFY(second!=first);QTRY_VERIFY(second->pageCount()>0 && !second->loading() && !second->pendingCommands());QCOMPARE(window->property("infoData").toMap(),second->data().value("document_info").toMap());QVERIFY(show());QTRY_COMPARE(second->pendingCommands(),0);
+            QVERIFY(QMetaObject::invokeMethod(window,"editMetadata",Q_ARG(QVariant,QString("year")),Q_ARG(QVariant,QString("2099"))));QTRY_COMPARE(second->pendingCommands(),0);QVERIFY(!window->property("bibtex").toString().contains("Corrected synthetic reader A"));QVERIFY(window->property("bibtex").toString().contains("2099"));QVERIFY(!second->hasUnsavedChanges());
+            QTest::keyClick(window,Qt::Key_Escape);view.workspace.selectTab(0);QTRY_COMPARE(view.workspace.activeReader(),first);QVERIFY(show());QTRY_COMPARE(first->pendingCommands(),0);QCOMPARE(window->property("bibtex").toString(),corrected);title=editor(window->contentItem(),"title");QVERIFY(title);QCOMPARE(title->property("text").toString(),QString("Corrected synthetic reader A"));
+        } else if(route=="author-separator") {
+            QVERIFY(show());QTRY_VERIFY(window->findChild<QObject *>("documentInformationDialog")->property("opened").toBool());auto *authors=editor(window->contentItem(),"authors");QVERIFY(authors);authors->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(authors->hasActiveFocus());QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);
+            for(char key:QByteArray("Alpha; "))QTest::keyClick(window,key);QTRY_COMPARE(first->pendingCommands(),0);QCOMPARE(authors->property("text").toString(),QString("Alpha; "));
+            for(char key:QByteArray("Beta"))QTest::keyClick(window,key);QTRY_COMPARE(first->pendingCommands(),0);QCOMPARE(authors->property("text").toString(),QString("Alpha; Beta"));QVERIFY(window->property("bibtex").toString().contains("author = {Alpha and Beta}"));
+        } else if(route=="window-transfer") {
+            view.workspace.newTab();view.workspace.selectTab(0);QTRY_COMPARE(view.workspace.activeReader(),first);destination=std::make_unique<NativeCorpus::Viewer>();QVERIFY(destination->window);const auto draft=first->metadataDraft();QVERIFY(!draft.isEmpty());
+            QVERIFY(settleReaderViewport(window));const auto error=view.workspace.transferActiveTabTo(&destination->workspace);QVERIFY2(error.isEmpty(),qPrintable(error));QTRY_COMPARE(destination->workspace.activeReader(),first);QCOMPARE(first->metadataDraft(),draft);window=destination->window;window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+            QVERIFY(show());QTRY_COMPARE(first->pendingCommands(),0);QCOMPARE(window->property("bibtex").toString(),corrected);title=editor(window->contentItem(),"title");QVERIFY(title);QCOMPARE(title->property("text").toString(),QString("Corrected synthetic reader A"));
+        } else {
+            const auto generation=first->documentGeneration();first->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(first->documentGeneration()!=generation && !first->loading() && !first->pendingCommands());QVERIFY(show());QTRY_COMPARE(first->pendingCommands(),0);title=editor(window->contentItem(),"title");QVERIFY(title);QCOMPARE(title->property("text").toString(),originalTitle);QVERIFY(!window->property("bibtex").toString().contains("Corrected synthetic reader A"));
+        }
+        QVERIFY(!first->hasUnsavedChanges());QTest::keyClick(window,Qt::Key_Escape);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),bytes);
+    }
+    void metadataDraftResetRetainsANewerReentrantDocument() {
+        ReaderController reader;const auto original=QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"),replacement=QUrl::fromLocalFile(root+"/tests/fixtures/metadata-info.pdf");reader.openFile(original);QTRY_VERIFY(reader.pageCount()>0 && !reader.loading() && !reader.pendingCommands());
+        reader.setMetadataDraft({{"texts",QVariantMap{{"title","Synthetic panel correction"}}}});bool replaced=false;
+        const auto connection=connect(&reader,&ReaderController::metadataDraftChanged,&reader,[&]{if(!replaced && reader.metadataDraft().isEmpty()){replaced=true;reader.openFile(replacement);}});
+        reader.openFile(original);QTRY_VERIFY(replaced && reader.pageCount()>0 && !reader.loading() && !reader.pendingCommands());QObject::disconnect(connection);
+        QCOMPARE(reader.fileUrl(),replacement);QCOMPARE(reader.title(),QString("metadata-info.pdf"));QVERIFY(reader.metadataDraft().isEmpty());QVERIFY(!reader.hasUnsavedChanges());
+    }
     void documentQuestionUsesRetrievedSourcesAndRejectsUnsentCitations() {
         MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Document answer [p.1], invented [p.99], invalid [p.0]."}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},20,200});
         QTemporaryDir scratch;const auto path=scratch.path()+"/question.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));

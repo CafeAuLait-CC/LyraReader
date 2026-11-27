@@ -157,7 +157,11 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     m_requests.clear();
     m_documentWidth = 0;
     m_documentHeight = 0;
-    m_data.clear(); m_textPages.clear(); m_textPending.clear();m_noteDrafts.clear();emit noteDraftsChanged();m_editDrafts.clear();emit editDraftsChanged();
+    m_data.clear();
+    QPointer<ReaderController> metadataOwner(this);
+    setMetadataDraft({});
+    if(!metadataOwner || m_generation!=generation)return;
+    m_textPages.clear(); m_textPending.clear();m_noteDrafts.clear();emit noteDraftsChanged();m_editDrafts.clear();emit editDraftsChanged();
     emit dataChanged(); emit textPagesChanged();
     m_title = QFileInfo(url.toLocalFile()).fileName();
     m_loading = true;
@@ -436,6 +440,7 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
             m_data.insert(QStringLiteral("document_id"),info.value(QStringLiteral("document_id")));
             m_data.insert(QStringLiteral("annotation_rules"),info.value(QStringLiteral("annotation_rules")));
             m_data.insert(QStringLiteral("ai_history_limit"),info.value(QStringLiteral("ai_history_limit")));
+            setMetadataDraft({});if(!current())return;
             emit documentReset();if(!current())return;emit documentChanged();if(!current())return;emit dataChanged();if(!current())return;emit textPagesChanged();if(!current())return;
             submit(QStringLiteral("outline"));if(!current())return;submit(QStringLiteral("metadata"));if(!current())return;
             if(reloadForms){submit(QStringLiteral("forms"));if(!current())return;}
