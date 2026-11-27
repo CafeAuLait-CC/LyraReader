@@ -158,7 +158,7 @@ Item {
                 TextArea {
                     id:body;objectName:"annotationNoteBody";width:scroll.availableWidth
                     text:paper.editing ? paper.editor.text : paper.savedText.slice(0,paper.textLimit)
-                    readOnly:!paper.editing || paper.editor.closing;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
+                    readOnly:!paper.editing || paper.editor.closing;selectByMouse:true;selectByKeyboard:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
                     font.pixelSize:13;rightPadding:14;color:app.colors.noteFg;selectionColor:app.colors.selectedBg;selectedTextColor:app.colors.selectedFg
                     background:Rectangle {color:app.colors.noteBg}
                     onTextChanged:if(paper.editing && activeFocus && !readOnly)paper.editor.change(text)
