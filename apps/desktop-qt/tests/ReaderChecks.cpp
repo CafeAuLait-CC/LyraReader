@@ -2040,7 +2040,7 @@ private slots:
         QCOMPARE(wire.value("messages").toArray().at(1).toObject().value("content").toString(),QString("ping"));
         probe->cancel();QTRY_COMPARE(server.activeConnections(),0);
     }
-      void unreadableGlobalOutputLanguageIsKeptUntilRecovery() {
+    void unreadableGlobalOutputLanguageIsKeptUntilRecovery() {
         QVERIFY(WorkspaceController::allWorkspaces().isEmpty());
         QSettings stored;const QString key=QStringLiteral("reader/preferences/aiOutputLanguage");
         const bool existed=stored.contains(key);const auto previous=stored.value(key);
@@ -4964,7 +4964,7 @@ LyraMenu {
     }
     void sidePanelsUseDocumentWheelUnits() {
         QFETCH(QString,panel);
-        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
         const int previous=QGuiApplication::styleHints()->wheelScrollLines();
         const auto restore=qScopeGuard([&]{QGuiApplication::styleHints()->setWheelScrollLines(previous);});
         QGuiApplication::styleHints()->setWheelScrollLines(3);
@@ -4982,15 +4982,19 @@ LyraMenu {
         if(panel!="thumbnails") {
             QVariantList rows;
             for(int i=0;i<40;++i)rows.append(QVariantMap{{"title",QString("Public synthetic row %1").arg(i)},
+                {"number",QString::number(i+1)},
                 {"snippet","A public synthetic search result with text that can wrap."},{"page",i%9},{"depth",0}});
             QVERIFY(QQmlProperty::write(viewport,"model",rows));
         }
         QTRY_VERIFY(viewport->property("contentHeight").toDouble()>viewport->height()+200);
-        QTest::qWait(80);
+        auto *drawer=visualItem(view.window->contentItem(),panel=="search"?"searchSidebarDrawer":"leftSidebarDrawer");QVERIFY(drawer);
+        QTRY_VERIFY(!drawer->property("moving").toBool() && qAbs(drawer->property("reveal").toDouble()-1)<.000001);
+        QVERIFY(settleReaderViewport(view.window));
         const auto position=[&]{return viewport->property("contentY").toDouble()-viewport->property("originY").toDouble();};
         auto *document=visualItem(view.window->contentItem(),"pageList");QVERIFY(document);
         const auto documentY=document->property("contentY"),zoom=view.window->property("zoom");
         const auto point=viewport->mapToScene(QPointF(viewport->width()/2,viewport->height()/2));
+        QVERIFY(drawer->contains(drawer->mapFromScene(point)));
         const auto wheel=[&](QPoint pixel,QPoint angle) {
             QWheelEvent event(point,view.window->mapToGlobal(point.toPoint()),pixel,angle,
                               Qt::NoButton,Qt::NoModifier,Qt::NoScrollPhase,false);
