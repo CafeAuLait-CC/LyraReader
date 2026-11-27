@@ -463,13 +463,39 @@ Item {
     SettingsWindow {id:settings;app:dialogs.app}
     Dialog {
         id: information
+        objectName: "documentInformationDialog"
         title: qsTr("Document Information")
         parent: Overlay.overlay
         anchors.centerIn: parent
-        width: Math.min(640, app.width - 40)
-        height: Math.min(650, app.height - 40)
+        width: Math.min(600, app.width - 32)
+        height: Math.min(580, app.height - 32)
         modal: true
-        standardButtons: Dialog.Close
+        focus: true
+        padding: 0
+        standardButtons: Dialog.NoButton
+        background: Rectangle {color: app.colors.panelBg; border.color: app.colors.separator; radius: 8}
+        header: Item {
+            implicitHeight: 68
+            RowLayout {
+                anchors.fill: parent; anchors.margins: 18; spacing: 8
+                LyraToolButton {
+                    symbol: "info"; implicitWidth: 18; implicitHeight: 18
+                    icon.width: 18; icon.height: 18; padding: 0; background: null
+                    focusPolicy: Qt.NoFocus; hoverEnabled: false; Accessible.ignored: true
+                }
+                Label {text: information.title; textFormat: Text.PlainText; font.pixelSize: 14; font.weight: Font.DemiBold; color: app.colors.textPrimary; Layout.fillWidth: true; elide: Text.ElideRight}
+                ReadingPrimaryButton {
+                    id: informationDone; objectName: "documentInformationDone"; app: dialogs.app
+                    text: qsTr("Done"); implicitWidth: 72
+                    onClicked: information.accept()
+                    Keys.onReturnPressed: information.accept()
+                    Keys.onEnterPressed: information.accept()
+                }
+            }
+            Rectangle {anchors.left: parent.left; anchors.right: parent.right; anchors.bottom: parent.bottom; height: 1; color: app.colors.separator}
+        }
+        footer: null
+        onOpened: informationDone.forceActiveFocus(Qt.TabFocusReason)
         function draft() {
             return {
                 title: titleField.text,
@@ -478,9 +504,10 @@ Item {
                 keywords: keywordsField.text
             };
         }
-        ScrollView {
+        contentItem: ScrollView {
             id: informationScroll
-            anchors.fill: parent
+            padding: 18
+            clip: true
             contentWidth: availableWidth
             function revealFocus() {
                 if(!information.visible)return;
@@ -510,61 +537,96 @@ Item {
             Connections {target:dialogs.app;function onActiveFocusItemChanged(){informationScroll.revealFocus();}}
             Connections {target:informationScroll.contentItem;function onContentHeightChanged(){informationScroll.revealFocus();}}
             ColumnLayout {
-                width: parent.width
-                spacing: 9
+                width: informationScroll.availableWidth
+                spacing: 10
                 Label {
                     textFormat: Text.PlainText
-                    text: qsTr("PDF properties")
+                    text: qsTr("Document properties in the PDF")
                     font.weight: Font.DemiBold
                 }
-                TextField {
-                    id: titleField
-                    readOnly: app.xfaReadOnly
-                    Layout.fillWidth: true
-                    text: app.infoData.title || ""
-                    placeholderText: qsTr("Title")
+                RowLayout {
+                    Layout.fillWidth: true; spacing: 18
+                    Repeater {
+                        model: [
+                            {label: qsTr("Pages"), value: String(app.currentReader.pageCount)},
+                            {label: qsTr("PDF version"), value: app.infoData.pdf_version || "—"},
+                            {label: qsTr("Encrypted"), value: app.infoData.is_encrypted ? qsTr("Yes") : qsTr("No")}
+                        ]
+                        ColumnLayout {
+                            required property var modelData
+                            Layout.fillWidth: true; spacing: 1
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: modelData.label + ": " + modelData.value
+                            Label {text: modelData.label; font.pixelSize: 11; color: app.colors.textSecondary; Accessible.ignored: true}
+                            Label {text: modelData.value; font.pixelSize: 12; font.weight: Font.Medium; color: app.colors.textPrimary; Accessible.ignored: true}
+                        }
+                    }
                 }
-                TextField {
-                    id: authorField
-                    readOnly: app.xfaReadOnly
-                    Layout.fillWidth: true
-                    text: app.infoData.author || ""
-                    placeholderText: qsTr("Author")
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 3
+                    Label {text: qsTr("Title"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
+                    TextField {
+                        id: titleField; Accessible.name: qsTr("Title")
+                        readOnly: app.xfaReadOnly
+                        Layout.fillWidth: true
+                        text: app.infoData.title || ""
+                        placeholderText: qsTr("Title")
+                    }
                 }
-                TextField {
-                    id: subjectField
-                    readOnly: app.xfaReadOnly
-                    Layout.fillWidth: true
-                    text: app.infoData.subject || ""
-                    placeholderText: qsTr("Subject")
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 3
+                    Label {text: qsTr("Author"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
+                    TextField {
+                        id: authorField; Accessible.name: qsTr("Author")
+                        readOnly: app.xfaReadOnly
+                        Layout.fillWidth: true
+                        text: app.infoData.author || ""
+                        placeholderText: qsTr("Author")
+                    }
                 }
-                TextField {
-                    id: keywordsField
-                    readOnly: app.xfaReadOnly
-                    Layout.fillWidth: true
-                    text: app.infoData.keywords || ""
-                    placeholderText: qsTr("Keywords")
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 3
+                    Label {text: qsTr("Subject"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
+                    TextField {
+                        id: subjectField; Accessible.name: qsTr("Subject")
+                        readOnly: app.xfaReadOnly
+                        Layout.fillWidth: true
+                        text: app.infoData.subject || ""
+                        placeholderText: qsTr("Subject")
+                    }
                 }
-                Label {
-                    textFormat: Text.PlainText
-                    text: qsTr("%1 pages · PDF %2%3").arg(app.currentReader.pageCount).arg(app.infoData.pdf_version || "").arg(app.infoData.is_encrypted ? qsTr(" · encrypted") : "")
-                    color: app.colors.textTertiary
+                ColumnLayout {
+                    Layout.fillWidth: true; spacing: 3
+                    Label {text: qsTr("Keywords"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
+                    TextField {
+                        id: keywordsField; Accessible.name: qsTr("Keywords")
+                        readOnly: app.xfaReadOnly
+                        Layout.fillWidth: true
+                        text: app.infoData.keywords || ""
+                        placeholderText: qsTr("Keywords")
+                    }
                 }
                 RowLayout {
                     Button {
-                        text: qsTr("Save Properties Copy…")
+                        text: qsTr("Save Copy…")
                         enabled: app.canModifyPdf && !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.chooseExport("properties")
                     }
                     Button {
-                        text: qsTr("Write to Original…")
+                        text: qsTr("Write to This File…")
                         enabled: app.canModifyPdf && !app.infoData.is_encrypted && !app.originalReadOnly
                         onClicked: app.confirmReplace("properties")
                     }
                 }
                 Label {
+                    Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                    text: app.xfaReadOnly ? app.readOnlyReason : qsTr("Save Copy writes these properties to a new PDF. Write to This File backs up the original before replacing it.")
+                    font.pixelSize: 11; color: app.colors.textSecondary
+                }
+                Rectangle {Layout.fillWidth: true; height: 1; color: app.colors.separator; Layout.topMargin: 6}
+                Label {
                     textFormat: Text.PlainText
-                    text: qsTr("Recognised paper metadata")
+                    text: qsTr("Found in this PDF")
                     font.weight: Font.DemiBold
                     Layout.topMargin: 12
                 }
@@ -613,6 +675,13 @@ Item {
                         }
                     }
                 }
+                Label {
+                    Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                    text: qsTr("“Guessed” fields come from the page layout. Correct anything that is wrong; edits regenerate the entry below without writing the PDF.")
+                    font.pixelSize: 11; color: app.colors.textSecondary
+                }
+                Rectangle {Layout.fillWidth: true; height: 1; color: app.colors.separator; Layout.topMargin: 6}
+                Label {text: qsTr("Generated BibTeX"); font.weight: Font.DemiBold; color: app.colors.textPrimary}
                 TextArea {
                     textFormat: TextEdit.PlainText
                     text: app.bibtex
@@ -623,16 +692,25 @@ Item {
                     wrapMode: Text.WrapAnywhere
                     Layout.fillWidth: true
                     font.family: "monospace"
-                    implicitHeight: 120
+                    font.pixelSize: 11
+                    background: null
+                    padding: 0
+                    color: app.colors.textPrimary
+                    implicitHeight: Math.ceil(contentHeight + topPadding + bottomPadding)
+                    onCursorRectangleChanged: informationScroll.revealFocus()
                 }
                 RowLayout {
-                    Button {
-                        text: qsTr("Copy BibTeX")
+                    LyraToolButton {
+                        text: qsTr("Copy"); symbol: "copy"; fitLabel: true; display: AbstractButton.TextBesideIcon
+                        Accessible.name: qsTr("Copy BibTeX")
+                        enabled: app.bibtex.length > 0
                         onClicked: if (app.session)
                             app.session.copyText(app.bibtex)
                     }
-                    Button {
-                        text: qsTr("Export BibTeX…")
+                    LyraToolButton {
+                        text: qsTr("Save…"); symbol: "export"; fitLabel: true; display: AbstractButton.TextBesideIcon
+                        Accessible.name: qsTr("Save BibTeX")
+                        enabled: app.bibtex.length > 0
                         onClicked: app.chooseExport("bibtex")
                     }
                 }

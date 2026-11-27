@@ -5249,6 +5249,56 @@ LyraMenu {
         verifyReadOnlyKeyboard(window,body);QVERIFY(!QTest::currentTestFailed());QVERIFY(!reader->hasUnsavedChanges());
         QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!body->isVisible());QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
     }
+    void documentInformationLongBibtexFlowsWithoutObscuringActions_data() {
+        QTest::addColumn<QString>("appearance");
+        QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void documentInformationLongBibtexFlowsWithoutObscuringActions() {
+        QFETCH(QString,appearance);QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-long-bibtex.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/metadata-info.pdf",path));
+        QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(590,580);window->setProperty("appearance",appearance);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"showDocumentInformation"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto title=QString("Synthetic paper: ")+QString("long title with Unicode α and original wording ").repeated(80);
+        QVERIFY(QMetaObject::invokeMethod(window,"editMetadata",Q_ARG(QVariant,QString("title")),Q_ARG(QVariant,title)));
+        QTRY_COMPARE(reader->pendingCommands(),0);const auto bibtex=window->property("bibtex").toString();QVERIFY(bibtex.contains(title.trimmed()));
+        auto *body=visibleReadOnlyText(window->contentItem(),bibtex);QVERIFY(body);
+        qInfo()<<"Long BibTeX geometry"<<body->height()<<body->property("contentHeight")<<body->width();
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");
+        if(!evidence.isEmpty())QVERIFY(QDir().mkpath(evidence));
+        QVERIFY2(body->height()+1>=body->property("contentHeight").toDouble(),"The entire generated entry must take its place in the outer scroll flow instead of painting over following actions");
+        body->forceActiveFocus(Qt::TabFocusReason);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+        const auto cursorVisible=[&]{auto rect=body->property("cursorRectangle").toRectF();auto *item=body;while(item){if(item->clip() && !item->boundingRect().adjusted(-1,-1,1,1).contains(rect))return false;auto *parent=item->parentItem();if(parent)rect=item->mapRectToItem(parent,rect);item=parent;}return true;};
+        QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTRY_COMPARE(body->property("cursorPosition").toInt(),bibtex.size());QTRY_VERIFY(cursorVisible());
+        QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);QTRY_COMPARE(body->property("cursorPosition").toInt(),0);QTRY_VERIFY(cursorVisible());
+        QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTRY_VERIFY(cursorVisible());
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"/information-long-narrow-"+appearance+".png"));
+        window->resize(820,700);QTRY_VERIFY(body->width()>500);QTRY_VERIFY(body->height()+1>=body->property("contentHeight").toDouble());QTRY_VERIFY(cursorVisible());
+        if(!evidence.isEmpty())QVERIFY(window->grabWindow().save(evidence+"/information-long-wide-"+appearance+".png"));
+        verifyReadOnlyKeyboard(window,body);QVERIFY(!QTest::currentTestFailed());QVERIFY(!reader->hasUnsavedChanges());
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!body->isVisible());QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
+    }
+    void documentInformationHeaderAndPropertiesStayReadableWithoutWriting_data() {
+        QTest::addColumn<QString>("appearance");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void documentInformationHeaderAndPropertiesStayReadableWithoutWriting() {
+        QFETCH(QString,appearance);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-information-layout.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/metadata-info.pdf",path));QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto bytes=file.readAll();file.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(590,580);window->setProperty("appearance",appearance);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"showDocumentInformation"));QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *dialog=window->findChild<QObject *>("documentInformationDialog");QVERIFY(dialog);QTRY_VERIFY(dialog->property("visible").toBool());
+        auto *done=visualItem(window->contentItem(),"documentInformationDone");QVERIFY(done);QTRY_VERIFY(done->hasActiveFocus());QCOMPARE(done->property("text").toString(),QString("Done"));
+        auto *header=dialog->property("header").value<QQuickItem *>();auto *body=dialog->property("contentItem").value<QQuickItem *>();auto *background=dialog->property("background").value<QQuickItem *>();auto *colors=window->property("colors").value<QObject *>();QVERIFY(header && body && background && colors);
+        QCOMPARE(background->property("color").value<QColor>(),colors->property("panelBg").value<QColor>());
+        const auto headerRect=header->mapRectToScene(header->boundingRect()),bodyRect=body->mapRectToScene(body->boundingRect()),doneRect=done->mapRectToScene(done->boundingRect());
+        QVERIFY(headerRect.contains(doneRect));QVERIFY(headerRect.bottom()<=bodyRect.top()+1);QVERIFY(QRectF(QPointF(),window->size()).contains(headerRect));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_TOOLBAR_EVIDENCE");if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/information-header-"+appearance+".png"));}
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTest::keyClick(window,Qt::Key_Return);QTRY_VERIFY(!dialog->property("visible").toBool());
+        QVERIFY(QMetaObject::invokeMethod(window,"showDocumentInformation"));QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(done->hasActiveFocus());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!dialog->property("visible").toBool());
+        QVERIFY(!reader->hasUnsavedChanges());QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),bytes);
+    }
     void documentQuestionUsesRetrievedSourcesAndRejectsUnsentCitations() {
         MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Document answer [p.1], invented [p.99], invalid [p.0]."}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},20,200});
         QTemporaryDir scratch;const auto path=scratch.path()+"/question.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
