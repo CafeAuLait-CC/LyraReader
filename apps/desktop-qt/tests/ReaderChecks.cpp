@@ -1898,6 +1898,46 @@ private slots:
         QVariant accepted;QVERIFY(QMetaObject::invokeMethod(view.window,"applyReadingPreset",Q_RETURN_ARG(QVariant,accepted),Q_ARG(QVariant,"unsupported-future-preset")));QVERIFY(!accepted.toBool());QCOMPARE(view.workspace.preference("paper").toString(),preset);
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
     }
+    void settingsReasoningControlsNameTheirValuesAndRevealKeyboardFocus_data() {
+        QTest::addColumn<QString>("route");QTest::addColumn<bool>("dark");for(bool dark:{false,true})for(const auto *route:{"labels","missing","unknown-string","unknown-bool","unknown-null","unknown-object","choose-wire-values","cancel","keyboard-reveal","newer-window"})QTest::newRow(qPrintable(QString(route)+(dark?"-dark":"-light")))<<QString(route)<<dark;
+    }
+    void settingsReasoningControlsNameTheirValuesAndRevealKeyboardFocus() {
+        QFETCH(QString,route);QFETCH(bool,dark);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property).*"));ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profileGuard;QSettings saved;saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");saved.sync();
+        MockChatServer sentinel;QVERIFY(sentinel.listen());auto *vault=new FakeCredentialStore;WorkspaceController workspace(nullptr,vault);QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        const QVariant futureMode=route=="unknown-bool" ? QVariant(false) : route=="unknown-null" ? QVariant::fromValue(nullptr) : route=="unknown-object" ? QVariant(QVariantMap{{"future","keep"}}) : QVariant("future-mode");const bool unknown=route.startsWith("unknown");
+        QVariantMap original{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-settings-only"},{"reasoningMode",unknown?futureMode:QVariant("default")},{"reasoningEncoding",unknown?QVariant("future-encoding"):QVariant("none")},{"opaque",QVariantMap{{"keep",true}}}};if(route=="missing"){original.remove("reasoningMode");original.remove("reasoningEncoding");}workspace.setPreference("ai",original);window->setProperty("aiSettings",original);window->setProperty("appearance",dark?"dark":"light");
+        QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));auto *settings=window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());settings->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),settings);
+        std::function<QQuickItem *(QQuickItem *,const QString &,const QString &)> find=[&](QQuickItem *item,const QString &name,const QString &first)->QQuickItem * {if(item->objectName()==name)return item;if(!first.isEmpty() && item->inherits("QQuickComboBox") && item->property("model").toStringList().value(0)==first)return item;if(name=="settingsPageGap" && item->inherits("QQuickSpinBox"))return item;for(auto *child:item->childItems())if(auto *found=find(child,name,first))return found;return nullptr;};
+        auto *mode=find(settings->contentItem(),"settingsReasoningMode","default"),*encoding=find(settings->contentItem(),"settingsReasoningEncoding","none"),*gap=find(settings->contentItem(),"settingsPageGap",QString{});QVERIFY(mode && encoding && gap);
+        const auto currentSettings=[&]{const auto value=window->property("aiSettings");return value.metaType()==QMetaType::fromType<QJSValue>()?value.value<QJSValue>().toVariant().toMap():value.toMap();};
+        if(route=="labels") {
+            for(const auto &entry:QList<QPair<QQuickItem *,QString>>{{mode,"AI reasoning"},{encoding,"AI reasoning encoding"},{gap,"Page gap in points"}}){auto *interface=QAccessible::queryAccessibleInterface(entry.first);QVERIFY(interface);QCOMPARE(interface->text(QAccessible::Name),entry.second);}
+            QCOMPARE(mode->property("currentText").toString(),QString("Provider default (send nothing)"));QCOMPARE(encoding->property("currentText").toString(),QString("None"));
+            QCOMPARE(QAccessible::queryAccessibleInterface(mode)->text(QAccessible::Description),QString("Provider default (send nothing)"));QCOMPARE(QAccessible::queryAccessibleInterface(encoding)->text(QAccessible::Description),QString("None"));
+        } else if(route=="missing") {
+            QCOMPARE(mode->property("currentIndex").toInt(),0);QCOMPARE(encoding->property("currentIndex").toInt(),0);QVERIFY(QMetaObject::invokeMethod(settings,"save"));QCOMPARE(currentSettings(),original);QCOMPARE(workspace.preference("ai",{}).toMap(),original);
+        } else if(unknown) {
+            QCOMPARE(mode->property("currentIndex").toInt(),-1);QCOMPARE(encoding->property("currentIndex").toInt(),-1);QVERIFY(mode->property("displayText").toString().contains("Unrecognized"));QVERIFY(encoding->property("displayText").toString().contains("Unrecognized"));
+            QVERIFY(QMetaObject::invokeMethod(settings,"save"));QCOMPARE(currentSettings(),original);QCOMPARE(workspace.preference("ai",{}).toMap(),original);
+        } else if(route=="choose-wire-values") {
+            mode->forceActiveFocus();QTRY_VERIFY(mode->hasActiveFocus());QTest::keyClick(settings,Qt::Key_Home);QTest::keyClick(settings,Qt::Key_Down);QTest::keyClick(settings,Qt::Key_Down);QTRY_COMPARE(mode->property("currentIndex").toInt(),2);
+            auto *modeInterface=QAccessible::queryAccessibleInterface(mode);QVERIFY(modeInterface);QCOMPARE(modeInterface->text(QAccessible::Description),QString("Low effort"));
+            encoding->forceActiveFocus();QTRY_VERIFY(encoding->hasActiveFocus());QTest::keyClick(settings,Qt::Key_Home);QTest::keyClick(settings,Qt::Key_Down);QTest::keyClick(settings,Qt::Key_Down);QTRY_COMPARE(encoding->property("currentIndex").toInt(),2);QVERIFY(QMetaObject::invokeMethod(settings,"save"));QCOMPARE(currentSettings().value("reasoningMode").toString(),QString("low"));QCOMPARE(currentSettings().value("reasoningEncoding").toString(),QString("reasoning_effort"));QCOMPARE(currentSettings().value("opaque"),original.value("opaque"));
+        } else if(route=="newer-window") {
+            auto newer=original;newer.insert("reasoningMode","high");newer.insert("reasoningEncoding","output_config");workspace.setPreference("ai",newer);window->setProperty("aiSettings",newer);QVERIFY(QMetaObject::invokeMethod(settings,"save"));QCOMPARE(currentSettings(),newer);QCOMPARE(workspace.preference("ai",{}).toMap(),newer);
+        } else if(route=="cancel") {
+            mode->setProperty("currentIndex",3);encoding->setProperty("currentIndex",2);QTest::keyClick(settings,Qt::Key_Escape);QTRY_VERIFY(!settings->isVisible());QCOMPARE(currentSettings(),original);QVERIFY(QMetaObject::invokeMethod(window,"showSettings"));QTRY_VERIFY(settings->isVisible());QCOMPARE(mode->property("currentIndex").toInt(),0);QCOMPARE(encoding->property("currentIndex").toInt(),0);
+        } else {
+            settings->resize(360,320);auto *scroll=visualItem(settings->contentItem(),"settingsScroll");QVERIFY(scroll);auto *flick=scroll->property("contentItem").value<QQuickItem *>();QVERIFY(flick);flick->setProperty("contentY",0);
+            mode->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(mode->hasActiveFocus());QTRY_VERIFY_WITH_TIMEOUT(mode->mapRectToItem(flick,mode->boundingRect()).top()>=-1 && mode->mapRectToItem(flick,mode->boundingRect()).bottom()<=flick->height()+1,3000);
+            for(int step=0;step<10 && !encoding->hasActiveFocus();++step)QTest::keyClick(settings,Qt::Key_Tab);QVERIFY(encoding->hasActiveFocus());QTRY_VERIFY(encoding->mapRectToItem(flick,encoding->boundingRect()).bottom()<=flick->height()+1);QVERIFY(flick->property("contentY").toDouble()>0);
+        }
+        const auto capture=qEnvironmentVariable("LYRA_READER_SETTINGS_CONTROLS_EVIDENCE");
+        if(!capture.isEmpty() && settings->isVisible() && (route=="labels" || route=="keyboard-reveal")) {
+            mode->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(mode->hasActiveFocus());auto *scroll=visualItem(settings->contentItem(),"settingsScroll");QVERIFY(scroll);auto *flick=scroll->property("contentItem").value<QQuickItem *>();QVERIFY(flick);QTRY_VERIFY(mode->mapRectToItem(flick,mode->boundingRect()).bottom()<=flick->height()+1);QSignalSpy frames(settings,&QQuickWindow::frameSwapped);settings->update();QTRY_VERIFY(settings->isExposed() && !frames.isEmpty());QVERIFY(settings->grabWindow().save(capture+"-"+route+(dark?"-dark.png":"-light.png")));
+        }
+        QCOMPARE(sentinel.requests.size(),0);QVERIFY(settings->close());
+    }
     void readingPresetSettingsKeepDraftsUnknownValuesAndNewerWindowChoices() {
         ReadingPreferenceGuard preferences;NativeCorpus::Viewer view,other;QVERIFY(view.window && other.window);
         QVERIFY(QMetaObject::invokeMethod(view.window,"showSettings"));auto *settings=view.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);QTRY_VERIFY(settings->isVisible());

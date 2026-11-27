@@ -14,6 +14,10 @@ ApplicationWindow {
     property bool initialReduceMotion: false
     property int initialGap: 0
     property var initialAiDraft: ({})
+    property var initialReasoningMode: "default"
+    property var initialReasoningEncoding: "none"
+    readonly property var reasoningValues: ["default", "off", "low", "high", "max"]
+    readonly property var encodingValues: ["none", "thinking", "reasoning_effort", "output_config", "reasoning.effort"]
     property bool auditOnOpen: false
     objectName:"settingsWindow"
     required property var app
@@ -42,8 +46,10 @@ ApplicationWindow {
         gap.value=app.pageGap;baseUrl.text=app.aiSettings.baseUrl || "http://localhost:11434/v1";
         modelName.text=app.aiSettings.model || "";
         imageInput.checked=!!app.aiSettings.imageInput;
-        reasoning.currentIndex=Math.max(0,reasoning.model.indexOf(app.aiSettings.reasoningMode || "default"));
-        encoding.currentIndex=Math.max(0,encoding.model.indexOf(app.aiSettings.reasoningEncoding || "none"));
+        initialReasoningMode=Object.prototype.hasOwnProperty.call(app.aiSettings,"reasoningMode") ? app.aiSettings.reasoningMode : "default";
+        initialReasoningEncoding=Object.prototype.hasOwnProperty.call(app.aiSettings,"reasoningEncoding") ? app.aiSettings.reasoningEncoding : "none";
+        reasoning.currentIndex=reasoningValues.indexOf(initialReasoningMode);
+        encoding.currentIndex=encodingValues.indexOf(initialReasoningEncoding);
         initialReduceMotion=reduceMotion.checked;initialGap=gap.value;initialAiDraft=aiDraft();
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
@@ -66,8 +72,10 @@ ApplicationWindow {
         }
     }
     function aiDraft() {
-        return {baseUrl:baseUrl.text,model:modelName.text,reasoningMode:reasoning.currentText,
-            reasoningEncoding:encoding.currentText,imageInput:imageInput.checked};
+        return {baseUrl:baseUrl.text,model:modelName.text,
+            reasoningMode:reasoning.currentIndex>=0 ? reasoningValues[reasoning.currentIndex] : initialReasoningMode,
+            reasoningEncoding:encoding.currentIndex>=0 ? encodingValues[encoding.currentIndex] : initialReasoningEncoding,
+            imageInput:imageInput.checked};
     }
     function save() {
         const selectedPaper=app.readingPresets[paper.currentIndex];
@@ -107,6 +115,16 @@ ApplicationWindow {
         target: settings.accounts
         function onConnectionModeChanged() {settings.connectionError="";if(settings.accounts.connectionMode==="chatGPT")apiKey.clear();}
     }
+    function revealFocusedControl() {
+        const item=activeFocusItem;
+        Qt.callLater(function() {
+            if(!settings.visible || !item || !item.visible || settings.activeFocusItem!==item)return;
+            let ancestor=item;
+            while(ancestor && ancestor!==settingsScroll.contentItem)ancestor=ancestor.parent;
+            if(ancestor)settingsScroll.revealItem(item);
+        });
+    }
+    onActiveFocusItemChanged:revealFocusedControl()
     onClosing: {
         policy.cancelPresentation();
         auditOnOpen=false;
@@ -118,12 +136,15 @@ ApplicationWindow {
     ColumnLayout {
         anchors.fill:parent
         anchors.margins:16
-        ScrollView {
+        AiReadingScrollView {
             id: settingsScroll
             objectName: "settingsScroll"
             Layout.fillWidth:true
             Layout.fillHeight:true
             contentWidth: availableWidth
+            onAvailableHeightChanged:settings.revealFocusedControl()
+            onAvailableWidthChanged:settings.revealFocusedControl()
+            Connections {target:settingsScroll.contentItem;function onContentHeightChanged(){settings.revealFocusedControl();}}
             ColumnLayout {
                 width: settingsScroll.availableWidth
                 spacing: 12
@@ -190,6 +211,8 @@ ApplicationWindow {
                     }
                     SpinBox {
                         id: gap
+                        objectName:"settingsPageGap"
+                        Accessible.name:qsTr("Page gap in points")
                         from: 0
                         to: 100
                         value: app.pageGap
@@ -254,12 +277,6 @@ ApplicationWindow {
                         text: app.aiSettings.model || ""
                         Accessible.name: qsTr("AI model")
                     }
-                    ComboBox {
-                        id: reasoning
-                        Layout.fillWidth: true
-                        model: ["default", "off", "low", "high", "max"]
-                        currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningMode || "default"))
-                    }
                     CheckBox {
                         id:imageInput
                         objectName:"settingsAiImageInput"
@@ -267,11 +284,34 @@ ApplicationWindow {
                         checked:!!app.aiSettings.imageInput
                         Layout.fillWidth:true
                     }
-                    ComboBox {
-                        id: encoding
-                        Layout.fillWidth: true
-                        model: ["none", "thinking", "reasoning_effort", "output_config", "reasoning.effort"]
-                        currentIndex: Math.max(0, model.indexOf(app.aiSettings.reasoningEncoding || "none"))
+                    Label {text:qsTr("Reasoning control");font.weight:Font.DemiBold}
+                    RowLayout {
+                        Layout.fillWidth:true
+                        Label {text:qsTr("Reasoning");textFormat:Text.PlainText}
+                        ComboBox {
+                            id:reasoning
+                            objectName:"settingsReasoningMode"
+                            Layout.fillWidth:true;Layout.minimumWidth:0
+                            model:[qsTr("Provider default (send nothing)"),qsTr("Off"),qsTr("Low effort"),qsTr("High effort"),qsTr("Max effort")]
+                            currentIndex:-1
+                            displayText:currentIndex<0 ? qsTr("Unrecognized saved reasoning control") : currentText
+                            Accessible.name:qsTr("AI reasoning")
+                            Accessible.description:displayText
+                        }
+                    }
+                    RowLayout {
+                        Layout.fillWidth:true
+                        Label {text:qsTr("Encoding");textFormat:Text.PlainText}
+                        ComboBox {
+                            id:encoding
+                            objectName:"settingsReasoningEncoding"
+                            Layout.fillWidth:true;Layout.minimumWidth:0
+                            model:[qsTr("None"),"thinking","reasoning_effort","output_config","reasoning.effort"]
+                            currentIndex:-1
+                            displayText:currentIndex<0 ? qsTr("Unrecognized saved reasoning encoding") : currentText
+                            Accessible.name:qsTr("AI reasoning encoding")
+                            Accessible.description:displayText
+                        }
                     }
                     TextField {
                         id: apiKey
