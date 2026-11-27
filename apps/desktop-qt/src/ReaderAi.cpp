@@ -293,7 +293,8 @@ void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledg
         {QStringLiteral("language"),QVariant{}},{QStringLiteral("history"),QVariantList{}},{QStringLiteral("region"),region},
         {QStringLiteral("document_knowledge"),false},{QStringLiteral("document_knowledge_text"),QVariant{}},{QStringLiteral("document_knowledge_pages"),QVariantList{}},
         {QStringLiteral("base_url"),settings.value(QStringLiteral("baseUrl"),QStringLiteral("http://localhost:11434/v1"))},{QStringLiteral("model"),settings.value(QStringLiteral("model"),QString{})},
-        {QStringLiteral("temperature"),QVariant{}},{QStringLiteral("max_tokens"),QVariant{}},
+        {QStringLiteral("temperature"),chatgptAccount.isEmpty()?settings.value(QStringLiteral("temperature")):QVariant{}},
+        {QStringLiteral("max_tokens"),chatgptAccount.isEmpty()?settings.value(QStringLiteral("maxTokens")):QVariant{}},
         {QStringLiteral("reasoning_mode"),settings.value(QStringLiteral("reasoningMode"),QStringLiteral("default"))},{QStringLiteral("reasoning_encoding"),settings.value(QStringLiteral("reasoningEncoding"),QStringLiteral("none"))}};
     if(!chatgptAccount.isEmpty())request.insert(QStringLiteral("chatgpt_account"),chatgptAccount);
     if(!knowledgeNote) {

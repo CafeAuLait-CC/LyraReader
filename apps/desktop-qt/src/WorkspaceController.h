@@ -74,6 +74,7 @@ public:
     QString regionConversationStyle() const;
     Q_INVOKABLE bool applyRegionConversationStyle(const QString &id);
     Q_INVOKABLE QVariantMap inspectReasoning(const QString &mode, const QString &encoding) const;
+    Q_INVOKABLE QVariantMap generationDefaults() const;
     Q_INVOKABLE QVariant preference(const QString &key, const QVariant &fallback = {}) const;
     Q_INVOKABLE void setPreference(const QString &key, const QVariant &value);
     Q_INVOKABLE QString localPath(const QUrl &url) const { return url.toLocalFile(); }

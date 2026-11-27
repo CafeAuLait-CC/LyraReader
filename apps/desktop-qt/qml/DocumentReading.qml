@@ -30,11 +30,15 @@ Popup {
         const settings=app.aiSettings;
         const request={action:"SummarizeDocument",document_knowledge:true,document_knowledge_text:null,document_knowledge_pages:[],
             current_page:0,selection:null,question:null,language:null,history:[],region:null,
-            base_url:settings.baseUrl || "http://localhost:11434/v1",model:settings.model || "",temperature:null,max_tokens:null,
+            base_url:settings.baseUrl || "http://localhost:11434/v1",model:settings.model || "",
+            temperature:Object.prototype.hasOwnProperty.call(settings,"temperature") ? settings.temperature : null,
+            max_tokens:Object.prototype.hasOwnProperty.call(settings,"maxTokens") ? settings.maxTokens : null,
             reasoning_mode:settings.reasoningMode || "default",reasoning_encoding:settings.reasoningEncoding || "none"};
         if (useChatGpt) {
             request.chatgpt_account=accounts.accountId;
             request.model=accounts.model;
+            request.temperature=null;request.max_tokens=null;
+            request.reasoning_mode="default";request.reasoning_encoding="none";
         }
         owner.prepareDocumentReading(request);
     }

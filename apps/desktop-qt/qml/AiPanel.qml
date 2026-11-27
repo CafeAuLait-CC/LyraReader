@@ -263,7 +263,8 @@ Pane {
             question: (requestAction === "AskSelection" || requestAction === "DocumentChat") ? input.question || null : null,
             language: requestAction === "TranslateSelection" ? (input.language === undefined ? "English" : input.language) : null,
             base_url: settings.baseUrl || "http://localhost:11434/v1", model: settings.model || "",
-            temperature: null, max_tokens: null,
+            temperature: Object.prototype.hasOwnProperty.call(settings,"temperature") ? settings.temperature : null,
+            max_tokens: Object.prototype.hasOwnProperty.call(settings,"maxTokens") ? settings.maxTokens : null,
             reasoning_mode: settings.reasoningMode || "default", reasoning_encoding: settings.reasoningEncoding || "none"
         };
     }
@@ -279,6 +280,8 @@ Pane {
         request.model = accounts.model;
         request.reasoning_mode = "default";
         request.reasoning_encoding = "none";
+        request.temperature = null;
+        request.max_tokens = null;
         return true;
     }
     function prepareUnit(id) {

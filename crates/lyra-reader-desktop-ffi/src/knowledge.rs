@@ -348,7 +348,23 @@ impl DesktopDocument {
         if state.phase != "preview"
             || state.source_hash != hash
             || r["token"].as_str() != Some(&state.token)
-            || &state.reviewed_plan()? != expected
+        {
+            return Err(
+                "The document reading preview changed. Preview before reading again.".into(),
+            );
+        }
+        let reviewed = state.reviewed_plan()?;
+        let submitted: AiPlanRecord = serde_json::from_value(expected.clone())
+            .map_err(|_| "The document reading preview changed. Preview before reading again.")?;
+        // Qt's JSON bridge can encode 0.0 as 0. Compare the typed DTO, preserving
+        // exact wire bodies, identity metadata and the reviewed set of fields.
+        let mut canonical = serde_json::to_value(submitted).map_err(|e| e.to_string())?;
+        if let Some(account) = expected.get("chatgpt_account") {
+            canonical["chatgpt_account"] = account.clone();
+        }
+        if canonical != reviewed
+            || expected.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                != reviewed.as_object().map(|o| o.keys().collect::<Vec<_>>())
         {
             return Err(
                 "The document reading preview changed. Preview before reading again.".into(),
@@ -697,6 +713,57 @@ mod tests {
     }
     fn input() -> Value {
         json!({"action":"SummarizePage","document_knowledge":false,"current_page":0,"selection":null,"question":null,"language":null,"history":[],"region":null,"base_url":"http://127.0.0.1:1/v1","model":"mock","temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none","document_knowledge_text":null,"document_knowledge_pages":[]})
+    }
+    #[test]
+    fn integer_zero_roundtrip_preserves_the_reviewed_plan_without_weakening_identity() {
+        let f = Fixture::new();
+        let mut request = input();
+        request["temperature"] = json!(0.0);
+        let preview = f
+            .doc
+            .command(json!({"op":"knowledge_prepare","request":request}))
+            .unwrap();
+        let mut start = json!({
+            "op":"knowledge_start","plan":preview["plan"],"token":preview["token"]
+        });
+        start["plan"]["temperature"] = json!(0);
+        // No credential is provided: successful review validation must stop before any I/O.
+        assert_eq!(
+            f.doc.command(start.clone()).unwrap_err(),
+            "A valid API key is required to start document reading"
+        );
+        for field in [
+            "token",
+            "body",
+            "source",
+            "account",
+            "temperature",
+            "extra",
+            "missing",
+        ] {
+            let mut changed = start.clone();
+            match field {
+                "token" => changed["token"] = json!("another-preview"),
+                "body" => changed["plan"]["parts"][0]["wire_body"] = json!("changed"),
+                "source" => changed["plan"]["source_pages"] = json!([999]),
+                "account" => changed["plan"]["chatgpt_account"] = json!("another-account"),
+                "temperature" => changed["plan"]["temperature"] = json!(0.1),
+                "extra" => changed["plan"]["unknown"] = json!(true),
+                "missing" => {
+                    changed["plan"].as_object_mut().unwrap().remove("note");
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                f.doc
+                    .command(changed)
+                    .unwrap_err()
+                    .contains("preview changed"),
+                "{field} must remain part of the reviewed snapshot"
+            );
+        }
+        assert!(!f.file().exists());
+        assert!(f.doc.knowledge.lock().unwrap().job.is_none());
     }
     #[test]
     fn cache_hit_is_network_free_unchanged_and_enriches_only_new_eligible_previews() {

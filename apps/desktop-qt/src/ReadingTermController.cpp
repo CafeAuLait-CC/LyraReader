@@ -1,5 +1,6 @@
 #include "ReadingTermController.h"
 #include "ReaderController.h"
+#include "AiRequestOptions.h"
 #include <QDebug>
 #include <QFutureWatcher>
 #include <QJsonDocument>
@@ -12,6 +13,8 @@ using Handle=std::shared_ptr<LyraReaderDesktopTerm>;
 struct Outcome {Handle handle;QVariantMap value;QString error;};
 Outcome command(const Handle &handle,const QVariantMap &arguments) {
     Outcome result;result.handle=handle;
+    result.error=aiGenerationSerializationError(arguments.value(QStringLiteral("request")).toMap());
+    if(!result.error.isEmpty())return result;
     const auto bytes=QJsonDocument(QJsonObject::fromVariantMap(arguments)).toJson(QJsonDocument::Compact);
     LyraReaderBuffer output{},error{};
     const auto cleanup=qScopeGuard([&]{lyra_reader_desktop_buffer_free(output);lyra_reader_desktop_buffer_free(error);});

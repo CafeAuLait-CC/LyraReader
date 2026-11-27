@@ -1,13 +1,49 @@
 //! Settings presentation uses the same reasoning parameter as the request builder.
 use crate::{Buffer, bytes, run};
 use lyra_reader_ai::{
-    AiError,
+    AiError, ChatSettings,
     chat::{ReasoningEncoding, ReasoningMode, inspect_reasoning},
 };
 use serde::Serialize;
 use serde_json::Value;
 
 const MAX_IDENTIFIER_BYTES: usize = 64;
+
+#[derive(Serialize)]
+struct GenerationDefaults {
+    valid: bool,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+/// Default editor seeds only. An absent saved option still means provider default.
+/// # Safety
+/// Output/error are distinct writable empty buffers, freed once with buffer_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lyra_reader_desktop_generation_defaults(
+    output: *mut Buffer,
+    error: *mut Buffer,
+) -> bool {
+    // SAFETY: the caller keeps both non-aliased output buffers valid for this call.
+    unsafe {
+        run(error, || {
+            if output.is_null() {
+                return Err("Generation defaults output is null.".into());
+            }
+            let defaults = ChatSettings::default();
+            output.write(Buffer::owned(
+                serde_json::to_vec(&GenerationDefaults {
+                    valid: true,
+                    temperature: defaults.temperature,
+                    max_tokens: defaults.max_tokens,
+                })
+                .map_err(|e| e.to_string())?,
+            ));
+            Ok(())
+        })
+    }
+    .is_some()
+}
 
 #[derive(Serialize)]
 struct Inspection {
@@ -96,6 +132,38 @@ pub unsafe extern "C" fn lyra_reader_desktop_inspect_reasoning(
 mod tests {
     use super::*;
     use lyra_reader_ai::{ChatSettings, PromptPlanRequest, build_prompt_plan};
+
+    #[test]
+    fn generation_editor_seeds_keep_the_shared_defaults_without_configuring_a_request() {
+        let mut output = Buffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        let mut error = Buffer {
+            data: std::ptr::null_mut(),
+            len: 0,
+        };
+        // SAFETY: both outputs are live, distinct empty buffers.
+        assert!(unsafe { lyra_reader_desktop_generation_defaults(&mut output, &mut error) });
+        assert!(error.data.is_null());
+        // SAFETY: output is the readable unique allocation returned above.
+        let shown: Value =
+            serde_json::from_slice(unsafe { std::slice::from_raw_parts(output.data, output.len) })
+                .unwrap();
+        assert_eq!(
+            shown,
+            serde_json::json!({"valid":true,"temperature":0.2,"max_tokens":900})
+        );
+        // SAFETY: retire the unique returned allocation once.
+        unsafe { crate::lyra_reader_desktop_buffer_free(output) };
+        // SAFETY: null output is rejected before access; error is still empty.
+        assert!(!unsafe {
+            lyra_reader_desktop_generation_defaults(std::ptr::null_mut(), &mut error)
+        });
+        assert!(!error.data.is_null());
+        // SAFETY: retire the unique error allocation once.
+        unsafe { crate::lyra_reader_desktop_buffer_free(error) };
+    }
 
     #[test]
     fn inspection_matches_the_actual_request_for_every_reasoning_combination() {

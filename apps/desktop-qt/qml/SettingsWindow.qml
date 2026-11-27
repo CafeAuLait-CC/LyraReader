@@ -16,6 +16,16 @@ ApplicationWindow {
     property var initialAiDraft: ({})
     property var initialReasoningMode: "default"
     property var initialReasoningEncoding: "none"
+    property bool initialHasTemperature:false
+    property bool initialHasMaxTokens:false
+    property var initialTemperature:null
+    property var initialMaxTokens:null
+    property bool temperatureEdited:false
+    property bool maxTokensEdited:false
+    readonly property var generationSeeds:app.session ? app.session.generationDefaults() : ({valid:false})
+    readonly property bool generationSeedsReady:!!generationSeeds.valid && validTemperature(generationSeeds.temperature) && validMaxTokens(generationSeeds.max_tokens)
+    readonly property bool unknownTemperature:initialHasTemperature && initialTemperature!==null && !validTemperature(initialTemperature) && !temperatureEdited
+    readonly property bool unknownMaxTokens:initialHasMaxTokens && initialMaxTokens!==null && !validMaxTokens(initialMaxTokens) && !maxTokensEdited
     readonly property var reasoningValues: ["default", "off", "low", "high", "max"]
     readonly property var encodingValues: ["none", "thinking", "reasoning_effort", "output_config", "reasoning.effort"]
     readonly property bool providerSettingsVisible:!accounts || accounts.connectionMode!=="chatGPT"
@@ -59,6 +69,7 @@ ApplicationWindow {
         initialReasoningEncoding=Object.prototype.hasOwnProperty.call(app.aiSettings,"reasoningEncoding") ? app.aiSettings.reasoningEncoding : "none";
         reasoning.currentIndex=reasoningValues.indexOf(initialReasoningMode);
         encoding.currentIndex=encodingValues.indexOf(initialReasoningEncoding);
+        loadGenerationDraft();
         initialReduceMotion=reduceMotion.checked;initialGap=gap.value;initialAiDraft=aiDraft();
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
@@ -81,10 +92,28 @@ ApplicationWindow {
         }
     }
     function aiDraft() {
-        return {baseUrl:baseUrl.text,model:modelName.text,
+        const draft={baseUrl:baseUrl.text,model:modelName.text,
             reasoningMode:reasoning.currentIndex>=0 ? reasoningValues[reasoning.currentIndex] : initialReasoningMode,
             reasoningEncoding:encoding.currentIndex>=0 ? encodingValues[encoding.currentIndex] : initialReasoningEncoding,
             imageInput:imageInput.checked};
+        if(initialHasTemperature || temperatureEdited)draft.temperature=temperatureEdited ? (temperatureEnabled.checked ? temperature.value : null) : initialTemperature;
+        if(initialHasMaxTokens || maxTokensEdited)draft.maxTokens=maxTokensEdited ? (tokensEnabled.checked ? maxTokens.value : null) : initialMaxTokens;
+        return draft;
+    }
+    function validTemperature(value) {return typeof value==="number" && isFinite(value) && value>=0 && value<=2;}
+    function validMaxTokens(value) {return typeof value==="number" && isFinite(value) && Math.floor(value)===value && value>=64 && value<=8192;}
+    function loadGenerationDraft() {
+        initialHasTemperature=Object.prototype.hasOwnProperty.call(app.aiSettings,"temperature");
+        initialHasMaxTokens=Object.prototype.hasOwnProperty.call(app.aiSettings,"maxTokens");
+        initialTemperature=initialHasTemperature ? app.aiSettings.temperature : null;
+        initialMaxTokens=initialHasMaxTokens ? app.aiSettings.maxTokens : null;
+        temperatureEnabled.checked=initialHasTemperature && initialTemperature!==null;
+        tokensEnabled.checked=initialHasMaxTokens && initialMaxTokens!==null;
+        // Seeds position the disabled editor; they do not replace saved values
+        // or become request options until the reader explicitly edits a control.
+        temperature.value=validTemperature(initialTemperature) ? initialTemperature : generationSeedsReady ? generationSeeds.temperature : temperature.from;
+        maxTokens.value=validMaxTokens(initialMaxTokens) ? initialMaxTokens : generationSeedsReady ? generationSeeds.max_tokens : maxTokens.from;
+        temperatureEdited=false;maxTokensEdited=false;
     }
     function inspectReasoningDraft() {
         if(reasoning.currentIndex<0 || encoding.currentIndex<0)
@@ -192,7 +221,8 @@ ApplicationWindow {
                     Accessible.description: displayText
                     onActivated: settings.appearanceEdited=true
                 }
-                CheckBox {
+                LyraCheckBox {
+                    colors:settings.colors
                     id:reduceMotion;objectName:"settingsReduceMotion"
                     text:qsTr("Reduce motion");Layout.fillWidth:true
                 }
@@ -308,7 +338,8 @@ ApplicationWindow {
                         text: app.aiSettings.model || ""
                         Accessible.name: qsTr("AI model")
                     }
-                    CheckBox {
+                    LyraCheckBox {
+                        colors:settings.colors
                         id:imageInput
                         objectName:"settingsAiImageInput"
                         text:qsTr("This model accepts region images")
@@ -353,6 +384,62 @@ ApplicationWindow {
                             : settings.reasoningInspection.field ? qsTr("Reasoning JSON field: %1. Value: %2").arg(settings.reasoningInspection.field).arg(JSON.stringify(settings.reasoningInspection.value))
                             : qsTr("No reasoning JSON field is sent.")
                         Accessible.name:text
+                    }
+                    Label {text:qsTr("Generation");font.weight:Font.DemiBold}
+                    Label {
+                        visible:!settings.generationSeedsReady;Layout.fillWidth:true;wrapMode:Text.Wrap
+                        text:qsTr("The generation controls could not load their defaults.");color:settings.colors.errorFg
+                    }
+                    RowLayout {
+                        Layout.fillWidth:true
+                        LyraCheckBox {
+                            colors:settings.colors
+                            id:temperatureEnabled;objectName:"settingsUseTemperature";text:qsTr("Temperature")
+                            enabled:settings.generationSeedsReady;Accessible.name:qsTr("Use custom temperature")
+                            onToggled:settings.temperatureEdited=true
+                        }
+                        Item {Layout.fillWidth:true}
+                        Label {
+                            id:temperatureValue
+                            text:!temperatureEnabled.checked ? qsTr("Provider default") : settings.unknownTemperature ? qsTr("Unrecognized saved value") : Number(temperature.value.toFixed(4)).toString()
+                            color:settings.colors.textSecondary;textFormat:Text.PlainText
+                        }
+                    }
+                    Slider {
+                        id:temperature;objectName:"settingsTemperature";Layout.fillWidth:true
+                        from:0;to:2;stepSize:0.1;snapMode:Slider.SnapOnRelease
+                        enabled:temperatureEnabled.checked && settings.generationSeedsReady
+                        onMoved:settings.temperatureEdited=true
+                        Accessible.name:qsTr("Temperature value");Accessible.description:temperatureValue.text
+                    }
+                    Label {
+                        visible:settings.unknownTemperature;Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:settings.colors.errorFg
+                        text:qsTr("The saved temperature is not supported here. Adjust it to replace it, or clear the checkbox to use the provider default.")
+                    }
+                    RowLayout {
+                        Layout.fillWidth:true
+                        LyraCheckBox {
+                            colors:settings.colors
+                            id:tokensEnabled;objectName:"settingsUseMaxTokens";text:qsTr("Max tokens")
+                            Layout.fillWidth:true;enabled:settings.generationSeedsReady
+                            Accessible.name:qsTr("Use custom maximum output tokens");onToggled:settings.maxTokensEdited=true
+                        }
+                        SpinBox {
+                            id:maxTokens;objectName:"settingsMaxTokens";from:64;to:8192;stepSize:64;editable:true
+                            enabled:tokensEnabled.checked && settings.generationSeedsReady
+                            Accessible.name:qsTr("Maximum output tokens")
+                            Accessible.description:!tokensEnabled.checked ? qsTr("Provider default") : settings.unknownMaxTokens ? qsTr("Unrecognized saved value") : displayText
+                            onValueModified:settings.maxTokensEdited=true
+                        }
+                    }
+                    Label {
+                        visible:!tokensEnabled.checked || settings.unknownMaxTokens;Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11
+                        color:settings.unknownMaxTokens ? settings.colors.errorFg : settings.colors.textSecondary
+                        text:settings.unknownMaxTokens ? qsTr("The saved token limit is not supported here. Adjust it to replace it, or clear the checkbox to use the provider default.") : qsTr("Provider default")
+                    }
+                    Label {
+                        Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:settings.colors.textSecondary
+                        text:qsTr("Unchecked options use the provider default. Custom values are sent as temperature and max_tokens; the provider may ignore or cap them.")
                     }
                     TextField {
                         id: apiKey

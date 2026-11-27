@@ -1,5 +1,6 @@
 #include "ReaderController.h"
 #include "ReadingTermController.h"
+#include "AiRequestOptions.h"
 #include "DateFormatting.h"
 #include "NativeRaster.h"
 #include "RasterCache.h"
@@ -377,8 +378,9 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
     // Region snapshots and complete document-reading previews can be large. Their
     // controller-built maps contain plain values; serialize the immutable copy on the worker.
     const bool regionPayload=operation==QStringLiteral("region_create") || operation==QStringLiteral("region_snapshot") || operation==QStringLiteral("region_note") || operation==QStringLiteral("region_save_generated_note") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("ai_reading_note_update");
+    const auto generationError=aiGenerationSerializationError(arguments.value(QStringLiteral("request")).toMap());
     QByteArray bytes;
-    if(!regionPayload) {
+    if(!regionPayload && generationError.isEmpty()) {
         auto request=QJsonObject::fromVariantMap(arguments);request.insert(QStringLiteral("op"),operation);
         bytes=QJsonDocument(request).toJson(QJsonDocument::Compact);
     }
@@ -483,7 +485,8 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
         emit commandFinished(id, operation, outcome.result, outcome.error);
     });
     const auto regionArguments=regionPayload ? arguments : QVariantMap{};
-    auto task=[document,bytes,operation,regionArguments,regionPayload] {
+    auto task=[document,bytes,operation,regionArguments,regionPayload,generationError] {
+        if(!generationError.isEmpty())return CommandResult{{},generationError,{}};
         auto payload=bytes;
         if(regionPayload) {
             auto request=QJsonObject::fromVariantMap(regionArguments);request.insert(QStringLiteral("op"),operation);
