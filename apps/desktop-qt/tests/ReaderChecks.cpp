@@ -1,4 +1,5 @@
 #include <QEventLoop>
+#include <QEasingCurve>
 #include "DisplayCalibration.h"
 #include "ReadingTextGeometry.h"
 #include "ReadingMarkdown.h"
@@ -3708,6 +3709,39 @@ private slots:
             }
         }
     }
+    void nativeRevealCurvesFollowMacTimingInsteadOfPolynomialApproximation() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        const auto check=[&](QObject *animation,int duration,bool symmetric) {
+            QVERIFY2(animation,"The actual reader animation must be available");
+            QCOMPARE(animation->property("duration").toInt(),duration);
+            const auto curve=animation->property("easing").value<QEasingCurve>();
+            QCOMPARE(curve.type(),QEasingCurve::BezierSpline);
+            const QList<QPointF> points{{symmetric?.42:0.,0.},{.58,1.},{1.,1.}};
+            QCOMPARE(curve.toCubicSpline(),points);
+            // Apple UnitCurve easeOut/easeInOut golden samples, evaluated in
+            // time space rather than substituting a polynomial of progress.
+            const QList<double> values=symmetric?QList<double>{.129161931,.5,.870838069}
+                :QList<double>{.378138131,.684643187,.906535349};
+            // Qt evaluates the spline approximately. Bound the resulting
+            // displacement to a quarter logical pixel at the largest drawer
+            // span (520 px), while requiring the exact control points above.
+            for(int i=0;i<values.size();++i)
+                QVERIFY2(qAbs(curve.valueForProgress((i+1)*.25)-values[i])*520.<.25,
+                    qPrintable(QString("Mac easing sample %1: %2 instead of %3 (520 px span)")
+                        .arg(i).arg(curve.valueForProgress((i+1)*.25)).arg(values[i])));
+        };
+        for(const auto &name:{"leftSidebarDrawer","aiSidebarDrawer","editSidebarDrawer","fillSidebarDrawer","searchSidebarDrawer"}) {
+            auto *drawer=visualItem(view.window->contentItem(),name);QVERIFY(drawer);
+            check(drawer->property("animation").value<QObject *>(),220,false);
+            if(QTest::currentTestFailed())return;
+        }
+        auto *secondary=visualItem(view.window->contentItem(),"secondaryTools");QVERIFY(secondary);
+        check(secondary->property("revealAnimation").value<QObject *>(),180,false);
+        if(QTest::currentTestFailed())return;
+        auto *paper=view.window->property("regionPaper").value<QObject *>();QVERIFY(paper);
+        check(paper->property("revealAnimation").value<QObject *>(),220,true);
+    }
+
     void sidePanelDrawersKeepFixedContentAndPauseRasterDemand_data() {
         QTest::addColumn<bool>("left");QTest::newRow("left")<<true;QTest::newRow("right-ai")<<false;
     }

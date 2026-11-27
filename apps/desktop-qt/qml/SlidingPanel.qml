@@ -55,6 +55,8 @@ Item {
         target: drawer
         property: "progress"
         duration: 220
-        easing.type: Easing.OutCubic
+        // Match the macOS ReaderMotion easeOut curve in time space.
+        easing.type: Easing.BezierSpline
+        easing.bezierCurve: [0, 0, .58, 1, 1, 1]
     }
 }

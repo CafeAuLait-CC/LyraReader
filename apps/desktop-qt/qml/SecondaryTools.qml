@@ -5,6 +5,7 @@ Item {
     id:rows
     required property var app
     property alias fillTools:fill
+    readonly property NumberAnimation revealAnimation: heightReveal
     readonly property string requestedRow: app.currentReader.pageCount > 0 && !app.overviewVisible && !app.textViewVisible ? app.secondaryRow : ""
     property string presentedRow: ""
     onRequestedRowChanged: if (requestedRow.length) presentedRow = requestedRow
@@ -17,7 +18,13 @@ Item {
     clip: true
     Behavior on height {
         enabled: !rows.app.reduceMotion
-        NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
+        NumberAnimation {
+            id: heightReveal
+            objectName: "secondaryRowRevealMotion"
+            duration: 180
+            easing.type: Easing.BezierSpline
+            easing.bezierCurve: [0, 0, .58, 1, 1, 1]
+        }
     }
     // Reveal above the reader without changing its viewport or the adjoining panels.
     Item {

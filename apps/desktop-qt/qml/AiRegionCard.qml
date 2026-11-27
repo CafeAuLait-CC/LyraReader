@@ -85,6 +85,7 @@ Item {
         streamViewport=Qt.size(app.documentCanvas.width,app.documentCanvas.height);
     }
     property real revealProgress:1
+    readonly property NumberAnimation revealAnimation:reveal
     property bool closing:false
     readonly property bool motionActive:opened && (needsReveal || reveal.running || closing)
     readonly property bool canAnimate:!app.reduceMotion && app.visible
@@ -95,7 +96,9 @@ Item {
     height:Math.min(fullHeight,allocatedHeight)*revealProgress
     clip:true;focus:true
     NumberAnimation {
-        id:reveal;objectName:"paperRevealMotion";target:card;property:"revealProgress";duration:220;easing.type:Easing.InOutCubic
+        id:reveal;objectName:"paperRevealMotion";target:card;property:"revealProgress";duration:220
+        easing.type:Easing.BezierSpline
+        easing.bezierCurve:[.42,0,.58,1,1,1]
         onFinished:card.completeMotion(true)
     }
     function completeMotion(revealCard) {
