@@ -31,6 +31,7 @@ mod render_source;
 mod saving;
 mod selection;
 mod session;
+mod settings;
 mod summary;
 mod summary_batch;
 mod summary_store;
@@ -47,7 +48,7 @@ use std::{
 /// Version of the Qt boundary, including cache-only text selection geometry.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    21
+    22
 }
 
 /// Worker-only immutable capture for an independent term popover.
@@ -1623,7 +1624,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 21);
+        assert_eq!(lyra_reader_desktop_abi_version(), 22);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

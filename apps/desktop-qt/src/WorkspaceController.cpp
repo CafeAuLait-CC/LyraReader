@@ -12,6 +12,8 @@
 #include <QUuid>
 #include <QSettings>
 #include <QJSValue>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QQmlEngine>
 #include <QScopeGuard>
 #include <QClipboard>
@@ -571,6 +573,21 @@ bool WorkspaceController::applyRegionConversationStyle(const QString &id) {
         if(workspace)emit workspace->regionConversationStyleChanged();
     }
     return true;
+}
+QVariantMap WorkspaceController::inspectReasoning(const QString &mode,const QString &encoding) const {
+    const auto failed=[](const QString &message){return QVariantMap{{"valid",false},{"code","inspection_failed"},{"message",message}};};
+    if(mode.size()>64 || encoding.size()>64)return failed(tr("Invalid reasoning inspection input."));
+    const auto modeBytes=mode.toUtf8(),encodingBytes=encoding.toUtf8();
+    LyraReaderBuffer output{},error{};
+    const auto cleanup=qScopeGuard([&]{lyra_reader_desktop_buffer_free(output);lyra_reader_desktop_buffer_free(error);});
+    if(!lyra_reader_desktop_inspect_reasoning(reinterpret_cast<const std::uint8_t *>(modeBytes.constData()),std::size_t(modeBytes.size()),
+            reinterpret_cast<const std::uint8_t *>(encodingBytes.constData()),std::size_t(encodingBytes.size()),&output,&error))
+        return failed(error.data ? QString::fromUtf8(reinterpret_cast<const char *>(error.data),qsizetype(error.len)) : tr("The reasoning settings could not be inspected."));
+    QJsonParseError parse;
+    const auto result=QJsonDocument::fromJson(QByteArray::fromRawData(reinterpret_cast<const char *>(output.data),qsizetype(output.len)),&parse);
+    if(parse.error!=QJsonParseError::NoError || !result.isObject() || !result.object().value("valid").isBool())
+        return failed(tr("The reasoning inspection returned an invalid response."));
+    return result.object().toVariantMap();
 }
 QVariant WorkspaceController::preference(const QString &key,const QVariant &fallback) const {
     QSettings settings;

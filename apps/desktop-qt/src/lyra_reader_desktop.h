@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 21;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 22;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -33,6 +33,9 @@ void lyra_reader_desktop_chatgpt_auth_free(LyraReaderDesktopChatGptAuth *auth);
 // Bounded in-memory conversion. Offsets in the returned JSON are UTF-16.
 bool lyra_reader_desktop_math_markup(const std::uint8_t *text,std::size_t len,
     LyraReaderBuffer *output,LyraReaderBuffer *error);
+// Pure inspection of bounded wire identifiers; no document, credential or I/O.
+bool lyra_reader_desktop_inspect_reasoning(const std::uint8_t *mode,std::size_t mode_len,
+    const std::uint8_t *encoding,std::size_t encoding_len,LyraReaderBuffer *output,LyraReaderBuffer *error);
 struct LyraReaderBitmap {
     std::uint32_t width, height, stride;
     double scale;

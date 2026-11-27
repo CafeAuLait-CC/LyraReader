@@ -238,7 +238,10 @@ impl Default for ChatSettings {
     }
 }
 
-fn reasoning_request(
+/// Inspect the one selected vendor parameter without document context or I/O.
+/// Request builders use this same validation and value, so Settings can explain
+/// a choice without constructing or sending a prompt.
+pub fn inspect_reasoning(
     mode: ReasoningMode,
     encoding: ReasoningEncoding,
 ) -> Result<Option<ReasoningField>, AiError> {
@@ -1063,7 +1066,7 @@ fn validate_settings(settings: &ChatSettings) -> Result<ValidatedSettings, AiErr
         }
         value => value,
     };
-    let reasoning = reasoning_request(settings.reasoning_mode, settings.reasoning_encoding)?;
+    let reasoning = inspect_reasoning(settings.reasoning_mode, settings.reasoning_encoding)?;
     Ok((endpoint, model, temperature, max_tokens, reasoning))
 }
 

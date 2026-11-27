@@ -18,6 +18,15 @@ ApplicationWindow {
     property var initialReasoningEncoding: "none"
     readonly property var reasoningValues: ["default", "off", "low", "high", "max"]
     readonly property var encodingValues: ["none", "thinking", "reasoning_effort", "output_config", "reasoning.effort"]
+    readonly property bool providerSettingsVisible:!accounts || accounts.connectionMode!=="chatGPT"
+    readonly property bool reasoningEdited:(reasoning.currentIndex>=0 && reasoningValues[reasoning.currentIndex]!==initialReasoningMode)
+        || (encoding.currentIndex>=0 && encodingValues[encoding.currentIndex]!==initialReasoningEncoding)
+    readonly property var reasoningInspection:inspectReasoningDraft()
+    readonly property bool reasoningConflict:hasReasoningConflict()
+    readonly property string reasoningIssue:reasoningInspection.valid && reasoningConflict
+        ? qsTr("Reasoning settings changed in another window. Cancel and reopen Settings before saving.")
+        : reasoningInspection.valid ? "" : reasoningInspection.message
+    readonly property bool reasoningBlocksSave:providerSettingsVisible && reasoningEdited && (!reasoningInspection.valid || reasoningConflict)
     property bool auditOnOpen: false
     objectName:"settingsWindow"
     required property var app
@@ -77,7 +86,26 @@ ApplicationWindow {
             reasoningEncoding:encoding.currentIndex>=0 ? encodingValues[encoding.currentIndex] : initialReasoningEncoding,
             imageInput:imageInput.checked};
     }
+    function inspectReasoningDraft() {
+        if(reasoning.currentIndex<0 || encoding.currentIndex<0)
+            return {valid:false,message:qsTr("The saved reasoning control is unrecognized. Choose supported values to change it.")};
+        if(!app.session)return {valid:false,message:qsTr("The reasoning settings could not be inspected.")};
+        return app.session.inspectReasoning(reasoningValues[reasoning.currentIndex],encodingValues[encoding.currentIndex]);
+    }
+    function hasReasoningConflict() {
+        if(!reasoningEdited)return false;
+        const saved=app.aiSettings || {};
+        const currentMode=Object.prototype.hasOwnProperty.call(saved,"reasoningMode") ? saved.reasoningMode : "default";
+        const currentEncoding=Object.prototype.hasOwnProperty.call(saved,"reasoningEncoding") ? saved.reasoningEncoding : "none";
+        // These two fields describe one wire parameter. A newer unedited half
+        // must not silently change the parameter explained by this form.
+        const mode=reasoning.currentIndex>=0 ? reasoningValues[reasoning.currentIndex] : initialReasoningMode;
+        const field=encoding.currentIndex>=0 ? encodingValues[encoding.currentIndex] : initialReasoningEncoding;
+        return (mode===initialReasoningMode && currentMode!==initialReasoningMode)
+            || (field===initialReasoningEncoding && currentEncoding!==initialReasoningEncoding);
+    }
     function save() {
+        if(reasoningBlocksSave)return;
         const selectedPaper=app.readingPresets[paper.currentIndex];
         const selectedAppearance=["light","dark","system"][appearance.currentIndex];
         if(selectedPaper && (paperPresetEdited || selectedPaper.id!==initialPaper)
@@ -313,8 +341,18 @@ ApplicationWindow {
                             currentIndex:-1
                             displayText:currentIndex<0 ? qsTr("Unrecognized saved reasoning encoding") : currentText
                             Accessible.name:qsTr("AI reasoning encoding")
-                            Accessible.description:displayText
+                            Accessible.description:displayText+(settings.reasoningIssue.length ? ". "+settings.reasoningIssue : "")
                         }
+                    }
+                    Label {
+                        objectName:"settingsReasoningInspection"
+                        Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText
+                        font.pixelSize:11
+                        color:settings.reasoningIssue.length ? settings.colors.errorFg : settings.colors.textSecondary
+                        text:settings.reasoningIssue.length ? settings.reasoningIssue
+                            : settings.reasoningInspection.field ? qsTr("Reasoning JSON field: %1. Value: %2").arg(settings.reasoningInspection.field).arg(JSON.stringify(settings.reasoningInspection.value))
+                            : qsTr("No reasoning JSON field is sent.")
+                        Accessible.name:text
                     }
                     TextField {
                         id: apiKey
@@ -432,8 +470,16 @@ ApplicationWindow {
         }
 
         DialogButtonBox {
+            id:settingsButtons
             Layout.fillWidth:true
             standardButtons:DialogButtonBox.Save | DialogButtonBox.Cancel
+            Component.onCompleted: {
+                const saveButton=standardButton(DialogButtonBox.Save);
+                if(saveButton) {
+                    saveButton.enabled=Qt.binding(function(){return !settings.reasoningBlocksSave;});
+                    saveButton.palette.buttonText=Qt.binding(function(){return saveButton.enabled ? settings.colors.textPrimary : settings.colors.textDisabled;});
+                }
+            }
             onAccepted:settings.save()
             onRejected:settings.close()
         }
