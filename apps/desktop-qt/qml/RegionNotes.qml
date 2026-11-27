@@ -93,6 +93,27 @@ Pane {
         }
         app.navigate(page-1,0);app.focusReadingView();
     }
+    function revealReadCursor(area,expected,generation,id) {
+        if(!active || !area || !area.activeFocus || owner!==expected || owner!==app.currentReader
+                || generation!==owner.documentGeneration || selectedId!==id || !detail)return;
+        const f=noteDetail.contentItem;if(!f || f.height<=0)return;
+        const cursor=area.cursorRectangle;
+        const rect=area.mapToItem(f.contentItem,cursor.x,cursor.y,cursor.width,cursor.height);
+        let next=f.contentY;
+        if(rect.y<next+2)next=rect.y-2;
+        else if(rect.y+rect.height>next+f.height-2)next=rect.y+rect.height-f.height+2;
+        f.contentY=Math.max(0,Math.min(Math.max(0,f.contentHeight-f.height),next));
+    }
+    component SavedRegionText:TextArea {
+        Layout.fillWidth:true;readOnly:true;selectByMouse:true;selectByKeyboard:true
+        wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
+        onActiveFocusChanged:if(activeFocus)Qt.callLater(notes.revealReadCursor,this,notes.owner,notes.ownerGeneration,notes.selectedId)
+        Keys.onPressed:function(event) {
+            if([Qt.Key_Left,Qt.Key_Right,Qt.Key_Up,Qt.Key_Down,Qt.Key_Home,Qt.Key_End,Qt.Key_PageUp,Qt.Key_PageDown].indexOf(event.key)>=0)
+                Qt.callLater(notes.revealReadCursor,this,notes.owner,notes.ownerGeneration,notes.selectedId);
+            event.accepted=false;
+        }
+    }
     function clearExportPresentation(){exportReader=null;exportId=0;}
     function beginExport() {
         if(!canExport)return;
@@ -271,6 +292,7 @@ Pane {
         BusyIndicator {visible:!!notes.readId || (!!notes.listLoadId && !list.count);running:visible;Layout.alignment:Qt.AlignHCenter}
         AiReadingScrollView {
             id: noteDetail
+            objectName:"regionNoteDetail"
             visible:!!notes.detail;Layout.fillWidth:true;Layout.fillHeight:true;clip:true
             ColumnLayout {
                 width:noteDetail.availableWidth;spacing:8
@@ -293,11 +315,11 @@ Pane {
                         Accessible.role:Accessible.Graphic;Accessible.name:qsTr("Saved region capture")
                     }
                 }
-                TextArea {objectName:"regionNoteCapturedText";Layout.fillWidth:true;readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;text:notes.detail ? notes.detail.attachment.text.slice(0,120000) : "";Accessible.name:qsTr("Captured text")}
+                SavedRegionText {objectName:"regionNoteCapturedText";text:notes.detail ? notes.detail.attachment.text.slice(0,120000) : "";Accessible.name:qsTr("Captured text")}
                 Label {text:notes.detail ? qsTr("Saved question draft: %1").arg((notes.detail.draftQuestion || "").slice(0,120000)) : "";wrapMode:Text.Wrap;Layout.fillWidth:true;textFormat:Text.PlainText}
                 ComboBox {visible:notes.turns.length>1;Layout.fillWidth:true;model:notes.turns.map((t,i)=>qsTr("Turn %1 · %2").arg(i+1).arg(notes.stateLabel(t.state)));onActivated:notes.turnIndex=currentIndex;Accessible.name:qsTr("Conversation turn")}
                 Label {text:notes.turn ? qsTr("%1 · %2").arg(notes.stateLabel(notes.turn.state)).arg(notes.turn.question.slice(0,120000)) : "";wrapMode:Text.Wrap;Layout.fillWidth:true;textFormat:Text.PlainText}
-                TextArea {objectName:"regionNoteAnswer";visible:!!notes.turn;Layout.fillWidth:true;readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;text:notes.turn ? notes.turn.answer.slice(0,120000) : "";Accessible.name:qsTr("Saved answer")}
+                SavedRegionText {objectName:"regionNoteAnswer";visible:!!notes.turn;text:notes.turn ? notes.turn.answer.slice(0,120000) : "";Accessible.name:qsTr("Saved answer")}
                 Label {visible:!!notes.turn && notes.turn.answer.length>120000;text:qsTr("Long answer preview limited to 120,000 characters. Copy answer keeps the complete text.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
                 Label {visible:!!notes.turn;text:notes.verifiedPages.length ? qsTr("Pages sent with this turn. Answer page markers remain plain text.") : qsTr("No verified source pages for this turn. Answer page markers remain plain text.");wrapMode:Text.Wrap;Layout.fillWidth:true;color:notes.app.colors.textSecondary}
                 ListView {
