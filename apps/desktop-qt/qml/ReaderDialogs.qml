@@ -194,7 +194,14 @@ Item {
         }
         bookmarkRequest=bookmarkOwner.submit(remove ? "bookmark_delete" : "bookmark_update",request);
     }
-    Connections { target:app; function onCurrentReaderChanged(){bookmarkEditor.close();} }
+    Connections {
+        target:app
+        function onCurrentReaderChanged(){bookmarkEditor.close();selection.close();}
+        function onTranslationSelectionContextChanged(){
+            if(selection.visible && (!app.translationSelectionContext || !selection.translationContext
+                    || app.translationSelectionContext.signature!==selection.translationContext.signature))selection.close();
+        }
+    }
     Connections {
         target:dialogs.bookmarkOwner
         function onDocumentChanged(){if(bookmarkEditor.visible && !dialogs.bookmarkContextCurrent())bookmarkEditor.close();}
@@ -361,7 +368,14 @@ Item {
     }
     LyraMenu {
         id: selection
+        objectName:"selectionContextMenu"
+        property var translationContext:null
         parent: Overlay.overlay
+        onAboutToShow:translationContext=app.translationSelectionContext
+        onClosed: {
+            const previous=translationContext;
+            Qt.callLater(function(){if(!selection.visible && selection.translationContext===previous)selection.translationContext=null;});
+        }
         LyraMenuItem {
             objectName:"editAnnotationTextAction"
             text:qsTr("Edit Annotation Text")
@@ -397,10 +411,11 @@ Item {
         }
         LyraMenuSeparator {}
         LyraMenuItem {
-            text: qsTr("Translate in Place…")
-            Accessible.description:qsTr("With page focus, Control+Shift+L opens translation previews.")
-            enabled: !!app.selection
-            onTriggered: {app.currentReader.setAiInput("action",3);app.currentReader.setAiInput("inplace",true);app.showAiPanel(true);}
+            objectName:"selectionTranslationAction"
+            text:app.translationSelectionTitle
+            Accessible.description:qsTr("Control+Shift+L. Saved translations switch locally; new requests require preview and Send.")
+            enabled:!!app.translationSelectionContext && app.translationSelectionContext.enabled
+            onTriggered:if(selection.translationContext)app.performTranslationAction(selection.translationContext)
         }
         LyraMenuItem {
             text: qsTr("Ask AI about Selection")

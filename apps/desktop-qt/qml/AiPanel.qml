@@ -94,6 +94,14 @@ Pane {
         const account = app.session ? app.session.chatGptAccounts : null;
         return account && account.useForChat ? account.connected && !!String(account.model || "").trim() : !!String(app.aiSettings.model || "").trim();
     }
+    function prepareInplaceRetry(ids) {
+        const request=baseRequest("TranslateSelection");
+        const reader=owner,generation=ownerGeneration;
+        const accounts=app.session ? app.session.chatGptAccounts : null;
+        if(accounts && !connectChatGpt(request,accounts,accounts.useForSelection))return false;
+        if(reader!==owner || generation!==ownerGeneration)return false;
+        return reader.prepareInplaceTranslationRetry(request,ids);
+    }
     function prepareFromUi() {
         if (workspace !== "chat" && !referenceSummary && !referenceTranslation) { prepare(); return; }
         if (running) { owner.cancelAi(); return; }

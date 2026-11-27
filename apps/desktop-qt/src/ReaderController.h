@@ -93,7 +93,12 @@ public:
     QUrl fileUrl() const { return m_lastUrl; }
     QVariantList translationOverlays()const;
     QVariantMap translationState()const{return m_translationState;}
+    enum TranslationSelectionAction { NoTranslationAction, ShowTranslationOriginal, ShowCachedTranslation, CancelSelectionTranslation, RetrySelectionTranslation, PrepareSelectionTranslation };
+    Q_ENUM(TranslationSelectionAction)
+    Q_INVOKABLE QVariantMap translationSelectionAction(int page,int start,int end,const QString &language,const QString &model)const;
+    Q_INVOKABLE bool setTranslationOriginal(const QStringList &ids,bool original,qulonglong generation);
     Q_INVOKABLE bool prepareInplaceTranslation(const QVariantMap &request);
+    Q_INVOKABLE bool prepareInplaceTranslationRetry(const QVariantMap &request,const QStringList &ids);
     Q_INVOKABLE void inspectTranslations(int page);
     Q_INVOKABLE void toggleTranslation(const QString &id);
     Q_INVOKABLE bool cancelTranslation(const QString &id);
@@ -304,8 +309,9 @@ private:
     void abandonTranslations();
     bool startInplaceTranslation(const QString &key,const QVariantMap &plan);
     void cancelInplaceTranslation();
+    bool prepareInplaceTranslationImpl(const QVariantMap &request,const QStringList &retryIds);
     void applyTranslationFrame(const QVariantMap &frame);
-    void acceptTranslationOverlay(const QVariantMap &target,const QString &id,const QString &text,const QString &language,const QString &model,const QString &viewKey,bool restoreView);
+    void acceptTranslationOverlay(const QVariantMap &target,const QString &id,const QString &text,const QString &language,const QString &model,const QString &viewKey,const QString &promptVersion,bool restoreView);
     void handleTranslationCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
     using TranslationViewMode=QPair<QString,int>;
     QHash<QString,QSet<TranslationViewMode>> m_translationViews;

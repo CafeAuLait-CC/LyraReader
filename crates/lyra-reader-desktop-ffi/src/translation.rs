@@ -30,6 +30,7 @@ mod revisions;
 pub(crate) use revisions::RevisionChange;
 
 const FILE: &str = "translations.json";
+const DEFAULT_LANGUAGE: &str = "English";
 
 #[derive(Default)]
 struct Store {
@@ -191,7 +192,7 @@ impl Translations {
         self.store.warning().or_else(|| self.notice.clone())
     }
     fn snapshot(&mut self) -> Value {
-        let value = json!({"token":self.token,"running":self.running,"rows":self.rows.iter().map(|r|&r.view).collect::<Vec<_>>(),"max_concurrent":MAX_CONCURRENT,"cache_warning":self.display_warning()});
+        let value = json!({"token":self.token,"running":self.running,"rows":self.rows.iter().map(|r|&r.view).collect::<Vec<_>>(),"max_concurrent":MAX_CONCURRENT,"prompt_version":PROMPT_VERSION,"default_language":DEFAULT_LANGUAGE,"cache_warning":self.display_warning()});
         // The native shell retains completed overlays. Deliver full answers once, rather
         // than reserializing every completed 512 KiB answer on every streaming poll.
         for row in &mut self.rows {
@@ -201,33 +202,127 @@ impl Translations {
         }
         value
     }
+    fn begin_prepare(&mut self) -> Result<(), String> {
+        self.rows.clear();
+        self.token.clear();
+        self.account = None;
+        self.source = Weak::new();
+        self.id = self.scope.begin()?;
+        Ok(())
+    }
+    // Retry IDs identify previously validated rows, never caller-supplied geometry.
+    // Resolve them again against the active source before retiring the old preview.
+    fn retry_targets(
+        &self,
+        document: &Arc<LyraReaderDocument>,
+        request: &AiPlanRequestRecord,
+        retry: &Value,
+    ) -> Result<Vec<TranslationTargetRecord>, String> {
+        if retry["retry_token"].as_str() != Some(self.token.as_str())
+            || self.token.is_empty()
+            || !self.source.ptr_eq(&Arc::downgrade(document))
+        {
+            return Err(
+                "The failed translation belongs to an earlier preview. Select it again.".into(),
+            );
+        }
+        let values = retry["retry_ids"]
+            .as_array()
+            .ok_or("Invalid translation retry rows.")?;
+        if values.is_empty() || values.len() > self.rows.len() {
+            return Err("Select at least one failed translation to retry.".into());
+        }
+        let mut ids = std::collections::HashSet::with_capacity(values.len());
+        for value in values {
+            let id = value
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or("Invalid translation retry row.")?;
+            if !ids.insert(id) {
+                return Err("Duplicate translation retry row.".into());
+            }
+        }
+        let selection = request
+            .selection
+            .ok_or("Select the failed text to retry.")?;
+        if !document.text_page_prepared(selection.page) {
+            document
+                .text_page(selection.page)
+                .map_err(|e| e.to_string())?;
+        }
+        // The ordinary shared resolver validates the complete selection first.
+        document
+            .text_translation_targets(selection.page, selection.start, selection.end)
+            .map_err(|e| e.to_string())?
+            .ok_or("The translation text page is not prepared.")?;
+        let first = selection.start.min(selection.end);
+        let last = selection.start.max(selection.end);
+        let mut targets = Vec::with_capacity(ids.len());
+        for row in &self.rows {
+            if !ids.contains(row.view.id.as_str()) {
+                continue;
+            }
+            let old = &row.view.target;
+            if row.view.state != State::Failed
+                || old.page != selection.page
+                || old.start > last
+                || old.end < first
+            {
+                return Err(
+                    "Only failed passages inside the current selection can be retried.".into(),
+                );
+            }
+            let current = document
+                .text_translation_targets(old.page, old.start, old.end)
+                .map_err(|e| e.to_string())?
+                .ok_or("The translation text page was evicted.")?;
+            let expected = serde_json::to_value(old).map_err(|e| e.to_string())?;
+            let mut found = None;
+            for target in current {
+                if serde_json::to_value(&target).map_err(|e| e.to_string())? == expected {
+                    found = Some(target);
+                    break;
+                }
+            }
+            targets.push(
+                found.ok_or("The failed passage changed. Select it again before translating.")?,
+            );
+        }
+        if targets.len() != ids.len() {
+            return Err("A failed translation row is no longer available.".into());
+        }
+        Ok(targets)
+    }
     fn prepare(
         &mut self,
         document: &Arc<LyraReaderDocument>,
         mut request: AiPlanRequestRecord,
         account: Option<String>,
         location: &DocumentCache,
+        retry: Option<&Value>,
     ) -> Result<Value, String> {
         if self.running {
             return Err("Stop the current translation before preparing another.".into());
         }
-        self.rows.clear();
-        self.token.clear();
-        self.account = None;
-        self.source = Weak::new();
-        self.id = self.scope.begin()?;
-        let selection = request
-            .selection
-            .ok_or("Select text to translate in place.")?;
-        if !document.text_page_prepared(selection.page) {
+        let targets = if let Some(retry) = retry {
+            let targets = self.retry_targets(document, &request, retry)?;
+            self.begin_prepare()?;
+            targets
+        } else {
+            self.begin_prepare()?;
+            let selection = request
+                .selection
+                .ok_or("Select text to translate in place.")?;
+            if !document.text_page_prepared(selection.page) {
+                document
+                    .text_page(selection.page)
+                    .map_err(|e| e.to_string())?;
+            }
             document
-                .text_page(selection.page)
-                .map_err(|e| e.to_string())?;
-        }
-        let targets = document
-            .text_translation_targets(selection.page, selection.start, selection.end)
-            .map_err(|e| e.to_string())?
-            .ok_or("The translation text page is not prepared.")?;
+                .text_translation_targets(selection.page, selection.start, selection.end)
+                .map_err(|e| e.to_string())?
+                .ok_or("The translation text page is not prepared.")?
+        };
         if targets.is_empty() {
             return Err("The selection has no text to translate.".into());
         }
@@ -245,7 +340,7 @@ impl Translations {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("English")
+            .unwrap_or(DEFAULT_LANGUAGE)
             .to_owned();
         request.language = Some(language.clone());
         let warning = self
@@ -620,7 +715,9 @@ impl Translations {
         self.capture_base(location)?;
         self.store.load(location)?;
         if let Some(error) = &self.store.protection {
-            return Ok(json!({"entries":[],"cache_warning":error}));
+            return Ok(
+                json!({"entries":[],"prompt_version":PROMPT_VERSION,"default_language":DEFAULT_LANGUAGE,"cache_warning":error}),
+            );
         }
         if let Some(error) = self
             .store
@@ -628,7 +725,9 @@ impl Translations {
             .as_ref()
             .or(self.store.error.as_ref())
         {
-            return Ok(json!({"entries":[],"cache_warning":error}));
+            return Ok(
+                json!({"entries":[],"prompt_version":PROMPT_VERSION,"default_language":DEFAULT_LANGUAGE,"cache_warning":error}),
+            );
         }
         let entries = self
             .store
@@ -638,7 +737,9 @@ impl Translations {
             .cloned()
             .collect::<Vec<_>>();
         if entries.is_empty() {
-            return Ok(json!({"entries":[],"cache_warning":self.display_warning()}));
+            return Ok(
+                json!({"entries":[],"prompt_version":PROMPT_VERSION,"default_language":DEFAULT_LANGUAGE,"cache_warning":self.display_warning()}),
+            );
         }
         if !document.text_page_prepared(page) {
             document.text_page(page).map_err(|e| e.to_string())?;
@@ -694,7 +795,9 @@ impl Translations {
         }
         // A working revision may still be undone. Hide invalid overlays without destroying
         // the original cache; its source- and geometry-derived identities cannot be reused.
-        Ok(json!({"entries":valid,"stale":stale,"cache_warning":self.display_warning()}))
+        Ok(
+            json!({"entries":valid,"stale":stale,"prompt_version":PROMPT_VERSION,"default_language":DEFAULT_LANGUAGE,"cache_warning":self.display_warning()}),
+        )
     }
 }
 
@@ -748,6 +851,7 @@ impl DesktopDocument {
                 crate::region::request(r["request"].clone())?,
                 chatgpt_account(&r["request"])?.map(str::to_owned),
                 location,
+                (r.get("retry_ids").is_some() || r.get("retry_token").is_some()).then_some(r),
             ),
             "translation_start" => {
                 location.validate_pdf_source()?;
@@ -1362,6 +1466,113 @@ mod tests {
         assert_eq!(stopped["running"], false);
         assert!(!f.cache.directory.join(FILE).exists());
     }
+    #[test]
+    fn translation_control_metadata_identifies_the_current_cache_contract() {
+        let fixture = Fixture::new();
+        let inspect = fixture
+            .document
+            .command(json!({"op":"translation_inspect","page":0}))
+            .unwrap();
+        assert_eq!(inspect["prompt_version"], PROMPT_VERSION);
+        assert_eq!(inspect["default_language"], "English");
+        let preview = fixture.document.command(json!({"op":"translation_prepare","request":fixture.request("http://127.0.0.1:9/v1")})).unwrap();
+        assert_eq!(preview["translation"]["prompt_version"], PROMPT_VERSION);
+        assert_eq!(
+            preview["translation"]["default_language"],
+            inspect["default_language"]
+        );
+    }
+
+    #[test]
+    fn translation_retry_selection_only_prepares_validated_failed_passages() {
+        let fixture = Fixture::new();
+        let failed = Server::new(Duration::ZERO, false);
+        let request = fixture.request(&failed.url);
+        let first = fixture
+            .document
+            .command(json!({"op":"translation_prepare","request":request}))
+            .unwrap();
+        let token = &first["plan"]["token"];
+        fixture
+            .document
+            .command(json!({"op":"translation_start","token":token,"api_key":"synthetic"}))
+            .unwrap();
+        let state = wait(&fixture.document, token);
+        assert!(
+            state["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] == "failed")
+        );
+        let rows = state["rows"].as_array().unwrap();
+        let ids = json!([rows[1]["id"], rows[4]["id"]]);
+        let fresh = Server::new(Duration::ZERO, true);
+        let mut retry = fixture.request(&fresh.url);
+        retry["model"] = json!("synthetic-current-model");
+        for invalid in [
+            json!([]),
+            json!([rows[1]["id"], rows[1]["id"]]),
+            json!(["unknown-row"]),
+            json!([42]),
+            json!([""]),
+        ] {
+            assert!(fixture.document.command(json!({"op":"translation_prepare","request":retry,"retry_ids":invalid,"retry_token":token})).is_err());
+            let old = fixture
+                .document
+                .command(json!({"op":"translation_poll","token":token}))
+                .unwrap();
+            assert_eq!(old["token"], *token);
+            assert_eq!(old["rows"].as_array().unwrap().len(), 6);
+        }
+        assert!(fixture.document.command(json!({"op":"translation_prepare","request":retry,"retry_ids":ids,"retry_token":"obsolete"})).is_err());
+        let mut outside = retry.clone();
+        outside["selection"] =
+            json!({"page":0,"start":rows[0]["target"]["start"],"end":rows[0]["target"]["end"]});
+        assert!(fixture.document.command(json!({"op":"translation_prepare","request":outside,"retry_ids":ids,"retry_token":token})).is_err());
+        let preview = fixture.document.command(json!({"op":"translation_prepare","request":retry,"retry_ids":ids,"retry_token":token})).unwrap();
+        assert!(fresh.bodies.lock().unwrap().is_empty());
+        assert_eq!(preview["plan"]["parts"].as_array().unwrap().len(), 2);
+        let targets = preview["translation"]["rows"].as_array().unwrap();
+        assert_eq!(targets.len(), 2);
+        for (actual, original) in targets.iter().zip([&rows[1], &rows[4]]) {
+            assert_eq!(actual["target"], original["target"]);
+            assert_eq!(actual["state"], "prepared");
+            assert_eq!(actual["model"], "synthetic-current-model");
+        }
+        let fresh_token = &preview["plan"]["token"];
+        fixture
+            .document
+            .command(json!({"op":"translation_start","token":fresh_token,"api_key":"synthetic"}))
+            .unwrap();
+        let done = wait(&fixture.document, fresh_token);
+        assert!(
+            done["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["state"] == "ready")
+        );
+        let bodies = fresh.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        for part in preview["plan"]["parts"].as_array().unwrap() {
+            assert!(
+                bodies
+                    .iter()
+                    .any(|body| body == part["wire_body"].as_str().unwrap().as_bytes())
+            );
+        }
+        assert_eq!(failed.bodies.lock().unwrap().len(), 6);
+        assert_eq!(
+            Cache::decode(&fs::read(fixture.cache.directory.join(FILE)).unwrap())
+                .unwrap()
+                .entries()
+                .count(),
+            2
+        );
+        assert!(fixture.document.command(json!({"op":"translation_prepare","request":retry,"retry_ids":[targets[0]["id"]],"retry_token":fresh_token})).is_err());
+    }
+
     #[test]
     fn translation_preview_and_cancel_admission_do_not_send_or_create_a_cache() {
         let fixture = Fixture::new();

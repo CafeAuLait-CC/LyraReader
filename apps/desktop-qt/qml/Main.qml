@@ -173,19 +173,76 @@ ApplicationWindow {
         currentReader.setAiInput("view",value);
         showAiPanel(true);
     }
+    readonly property var translationSelectionContext: {
+        const reader=currentReader,range=selection;
+        if(!reader || !range)return null;
+        // Published target ranges and cache metadata come from Rust. This binding only
+        // resolves the native action and never refreshes a connection or creates a plan.
+        const state=reader.translationState,overlays=reader.translationOverlays,text=reader.textPages;
+        const generation=reader.documentGeneration,loading=reader.loading;
+        const input=reader.aiState.input || {};
+        const accounts=session ? session.chatGptAccounts : null;
+        const language=input.language===undefined ? state.default_language || "" : String(input.language);
+        const model=accounts && accounts.useForSelection ? accounts.model : aiSettings.model || "";
+        const action=reader.translationSelectionAction(range.page,range.start,range.end,language,String(model));
+        if(action.kind===ReaderController.NoTranslationAction)return null;
+        const source={page:range.page,start:Math.min(range.start,range.end),end:Math.max(range.start,range.end)};
+        const local=action.kind===ReaderController.ShowTranslationOriginal || action.kind===ReaderController.ShowCachedTranslation;
+        const cancel=action.kind===ReaderController.CancelSelectionTranslation;
+        const enabled=local || cancel || (!reader.pendingCommands && !reader.aiState.running);
+        return {reader:reader,generation:generation,source:source,kind:action.kind,ids:action.ids,enabled:enabled,
+            signature:JSON.stringify([generation,source,action.kind,action.ids,String(language),String(model),state.prompt_version,
+                cancel || action.kind===ReaderController.RetrySelectionTranslation ? state.token : ""])};
+    }
+    readonly property string translationSelectionTitle: {
+        const value=translationSelectionContext;
+        if(!value)return qsTr("Translate");
+        if(value.kind===ReaderController.ShowTranslationOriginal)return qsTr("Show original");
+        if(value.kind===ReaderController.CancelSelectionTranslation)return qsTr("Cancel Translation");
+        if(value.kind===ReaderController.RetrySelectionTranslation)return qsTr("Retry Translation");
+        return qsTr("Translate");
+    }
+    function performTranslationAction(context) {
+        const live=translationSelectionContext;
+        if(!context)context=live;
+        if(!context || !live || context.reader!==currentReader || context.generation!==live.generation
+                || context.signature!==live.signature || !live.enabled)return false;
+        const reader=context.reader,kind=context.kind;
+        if(kind===ReaderController.ShowTranslationOriginal || kind===ReaderController.ShowCachedTranslation)
+            return reader.setTranslationOriginal(context.ids,kind===ReaderController.ShowTranslationOriginal,context.generation);
+        if(kind===ReaderController.CancelSelectionTranslation) {
+            let cancelled=false;
+            for(const id of context.ids) {
+                if(reader!==currentReader || context.generation!==reader.documentGeneration)return cancelled;
+                if(reader.cancelTranslation(id))cancelled=true;
+            }
+            return cancelled;
+        }
+        return previewSelectionTranslation(context.reader,context.generation,
+            kind===ReaderController.RetrySelectionTranslation ? context.ids : []);
+    }
+    function previewSelectionTranslation(reader,generation,retryIds) {
+        if(reader!==currentReader || generation!==reader.documentGeneration || reader.loading
+                || reader.pendingCommands || reader.aiState.running || !selection)return false;
+        const range=selection;
+        const current=function(){return reader===currentReader && generation===reader.documentGeneration && !reader.loading
+            && selection && selection.page===range.page && selection.start===range.start && selection.end===range.end;};
+        reader.setAiInput("action",3);if(!current())return false;
+        reader.setAiInput("translationScope","selection");if(!current())return false;
+        reader.setAiInput("inplace",true);if(!current())return false;
+        openAiWorkspace("translation");
+        if(!current() || !aiPanelVisible || aiPanelMode!=="assistant")return false;
+        if(retryIds.length)return aiContent.prepareInplaceRetry(retryIds);
+        aiContent.prepareFromUi();return true;
+    }
     function previewTranslationRetry(reader,generation,id) {
         if(reader!==currentReader || generation!==reader.documentGeneration || reader.loading
                 || reader.pendingCommands || reader.aiState.running)return false;
         const row=(reader.translationState.rows || []).find(function(value){return value.id===id && value.state==="failed";});
         if(!row)return false;
         const source=row.target;
-        // Re-enter the existing request preview using the exact source character range.
-        // The chip never sends or reuses credentials from a failed request.
         selection={page:source.page,start:source.start,end:source.end};
-        reader.setAiInput("action",3);reader.setAiInput("translationScope","selection");reader.setAiInput("inplace",true);
-        openAiWorkspace("translation");
-        if(reader!==currentReader || generation!==reader.documentGeneration || !aiPanelVisible || aiPanelMode!=="assistant")return false;
-        aiContent.prepareFromUi();return true;
+        return previewSelectionTranslation(reader,generation,[id]);
     }
     function finishReadingNoteInput() { savedNotes.finishInput(); aiContent.finishReadingNoteInput(); }
     function showAiPanel(show) {showAiPanelMode(show,"assistant");}

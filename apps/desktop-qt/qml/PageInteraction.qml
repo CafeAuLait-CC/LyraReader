@@ -125,7 +125,7 @@ Item {
                     event.accepted=true;return;
                 }
                 if(event.key===Qt.Key_L && (event.modifiers & Qt.ShiftModifier) && app.selection && app.selection.page===page) {
-                    app.currentReader.setAiInput("action",3);app.currentReader.setAiInput("inplace",true);app.showAiPanel(true);
+                    app.performTranslationAction(app.translationSelectionContext);
                     event.accepted=true;return;
                 }
             }

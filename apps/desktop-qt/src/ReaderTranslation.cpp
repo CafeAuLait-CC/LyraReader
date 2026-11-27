@@ -60,7 +60,23 @@ void ReaderController::inspectTranslations(int page) {
     if(alive && document==m_document && generation==m_generation && id)m_translationInspections.insert(id,page);
 }
 bool ReaderController::prepareInplaceTranslation(const QVariantMap &request) {
+    return prepareInplaceTranslationImpl(request,{});
+}
+bool ReaderController::prepareInplaceTranslationRetry(const QVariantMap &request,const QStringList &ids) {
+    if(ids.isEmpty())return false;
+    return prepareInplaceTranslationImpl(request,ids);
+}
+bool ReaderController::prepareInplaceTranslationImpl(const QVariantMap &request,const QStringList &retryIds) {
     if(!m_document || m_loading || m_snapshotMode || m_pendingCommands || m_aiState.value(QStringLiteral("running")).toBool())return false;
+    const auto retryToken=m_translationState.value(QStringLiteral("token")).toString();
+    if(!retryIds.isEmpty()) {
+        if(retryToken.isEmpty())return false;
+        QSet<QString> remaining(retryIds.begin(),retryIds.end());if(remaining.size()!=retryIds.size())return false;
+        for(const auto &value:m_translationState.value(QStringLiteral("rows")).toList()) {
+            const auto row=value.toMap();if(row.value(QStringLiteral("state")).toString()==QStringLiteral("failed"))remaining.remove(row.value(QStringLiteral("id")).toString());
+        }
+        if(!remaining.isEmpty())return false;
+    }
     if(!m_translationPreparedToken.isEmpty())lyra_reader_desktop_cancel_translation(m_document.get());
     m_translationPreparedToken.clear();m_aiPreviewId=0;
     const auto document=m_document;const auto generation=m_generation,epoch=++m_aiPreviewEpoch;QPointer<ReaderController> alive(this);
@@ -71,7 +87,9 @@ bool ReaderController::prepareInplaceTranslation(const QVariantMap &request) {
     m_aiState.remove(QStringLiteral("previewWholeDocument"));
     m_aiState.insert(QStringLiteral("planSent"),false);m_aiState.insert(QStringLiteral("status"),tr("Preparing in-place translations locally…"));m_aiPlanGeneration=generation;
     emit aiStateChanged();if(!current())return false;
-    const auto id=submit(QStringLiteral("translation_prepare"),{{QStringLiteral("request"),request}});
+    QVariantMap command{{QStringLiteral("request"),request}};
+    if(!retryIds.isEmpty()){command.insert(QStringLiteral("retry_ids"),retryIds);command.insert(QStringLiteral("retry_token"),retryToken);}
+    const auto id=submit(QStringLiteral("translation_prepare"),command);
     if(!current())return false;m_aiPreviewId=id;return id!=0;
 }
 bool ReaderController::startInplaceTranslation(const QString &key,const QVariantMap &plan) {
@@ -123,11 +141,44 @@ bool ReaderController::cancelTranslation(const QString &row) {
     if(!id){m_translationRowsCancelling.remove(row);emit translationsChanged();return false;}
     m_translationRowCancellations.insert(id,{row,token,epoch});return true;
 }
-void ReaderController::toggleTranslation(const QString &id) {
-    auto found=m_translationOverlays.find(id);if(found==m_translationOverlays.end())return;
-    auto entry=found.value();entry.insert(QStringLiteral("original"),!entry.value(QStringLiteral("original")).toBool());found.value()=entry;emit translationOverlaysChanged();
+QVariantMap ReaderController::translationSelectionAction(int page,int start,int end,const QString &language,const QString &model)const {
+    QVariantMap result{{QStringLiteral("kind"),NoTranslationAction},{QStringLiteral("ids"),QStringList{}}};
+    if(!m_document || m_loading || m_snapshotMode || page<0 || page>=m_pages.size())return result;
+    const auto first=std::min(start,end),last=std::max(start,end);
+    const auto text=m_textPages.value(QString::number(page)).toMap();
+    if(first<0 || last>=text.value(QStringLiteral("chars")).toList().size())return result;
+    const auto overlaps=[&](const QVariantMap &target){return target.value(QStringLiteral("page")).toInt()==page && target.value(QStringLiteral("start")).toInt()<=last && target.value(QStringLiteral("end")).toInt()>=first;};
+    QStringList active,failed,cached;
+    for(const auto &value:m_translationState.value(QStringLiteral("rows")).toList()) {
+        const auto row=value.toMap();if(!overlaps(row.value(QStringLiteral("target")).toMap()))continue;
+        const auto state=row.value(QStringLiteral("state")).toString();
+        if(state==QStringLiteral("sending") || state==QStringLiteral("queued"))active.append(row.value(QStringLiteral("id")).toString());
+        else if(state==QStringLiteral("failed"))failed.append(row.value(QStringLiteral("id")).toString());
+    }
+    const auto resolvedLanguage=language.trimmed().isEmpty()?m_translationState.value(QStringLiteral("default_language")).toString():language.trimmed();
+    const auto promptVersion=m_translationState.value(QStringLiteral("prompt_version")).toString();
+    bool showing=false,matching=true;
+    for(auto it=m_translationOverlays.cbegin();it!=m_translationOverlays.cend();++it) {
+        const auto &entry=it.value();if(!overlaps(entry.value(QStringLiteral("target")).toMap()))continue;
+        cached.append(it.key());showing=showing || !entry.value(QStringLiteral("original")).toBool();
+        matching=matching && !promptVersion.isEmpty() && entry.value(QStringLiteral("language")).toString()==resolvedLanguage
+            && entry.value(QStringLiteral("model")).toString()==model.trimmed() && entry.value(QStringLiteral("prompt_version")).toString()==promptVersion;
+    }
+    const auto kind=!active.isEmpty()?CancelSelectionTranslation:!failed.isEmpty()?RetrySelectionTranslation:showing?ShowTranslationOriginal:!cached.isEmpty() && matching?ShowCachedTranslation:PrepareSelectionTranslation;
+    result.insert(QStringLiteral("kind"),kind);result.insert(QStringLiteral("ids"),!active.isEmpty()?active:!failed.isEmpty()?failed:cached);return result;
 }
-void ReaderController::acceptTranslationOverlay(const QVariantMap &target,const QString &id,const QString &text,const QString &language,const QString &model,const QString &viewKey,bool restoreView) {
+bool ReaderController::setTranslationOriginal(const QStringList &ids,bool original,qulonglong generation) {
+    if(!m_document || m_loading || m_snapshotMode || generation!=m_generation || ids.isEmpty())return false;
+    for(const auto &id:ids)if(!m_translationOverlays.contains(id))return false;
+    bool changed=false;
+    for(const auto &id:ids){auto &entry=m_translationOverlays[id];if(entry.value(QStringLiteral("original")).toBool()!=original){entry.insert(QStringLiteral("original"),original);changed=true;}}
+    if(changed)emit translationOverlaysChanged();return true;
+}
+void ReaderController::toggleTranslation(const QString &id) {
+    const auto found=m_translationOverlays.constFind(id);if(found==m_translationOverlays.cend())return;
+    setTranslationOriginal({id},!found->value(QStringLiteral("original")).toBool(),m_generation);
+}
+void ReaderController::acceptTranslationOverlay(const QVariantMap &target,const QString &id,const QString &text,const QString &language,const QString &model,const QString &viewKey,const QString &promptVersion,bool restoreView) {
     if(id.isEmpty() || text.trimmed().isEmpty())return;
     const auto rect=target.value(QStringLiteral("rect")).toMap();
     const auto bounds=[](const QVariantMap &r){return QRectF(r.value(QStringLiteral("x_pt")).toDouble(),r.value(QStringLiteral("y_pt")).toDouble(),r.value(QStringLiteral("width_pt")).toDouble(),r.value(QStringLiteral("height_pt")).toDouble());};
@@ -135,7 +186,7 @@ void ReaderController::acceptTranslationOverlay(const QVariantMap &target,const 
         const auto oldTarget=it->value(QStringLiteral("target")).toMap();
         if(it.key()!=id && oldTarget.value(QStringLiteral("page"))==target.value(QStringLiteral("page")) && bounds(oldTarget.value(QStringLiteral("rect")).toMap()).intersects(bounds(rect)))it=m_translationOverlays.erase(it);else ++it;
     }
-    auto entry=m_translationOverlays.value(id);entry.insert(QStringLiteral("view_key"),viewKey);entry.insert(QStringLiteral("language"),language);entry.insert(QStringLiteral("model"),model);entry.insert(QStringLiteral("id"),id);entry.insert(QStringLiteral("target"),target);entry.insert(QStringLiteral("text"),text);
+    auto entry=m_translationOverlays.value(id);entry.insert(QStringLiteral("prompt_version"),promptVersion);entry.insert(QStringLiteral("view_key"),viewKey);entry.insert(QStringLiteral("language"),language);entry.insert(QStringLiteral("model"),model);entry.insert(QStringLiteral("id"),id);entry.insert(QStringLiteral("target"),target);entry.insert(QStringLiteral("text"),text);
     if(!entry.contains(QStringLiteral("original"))){
         const auto revision=m_data.value(QStringLiteral("document_revision")).toString();
         const auto &modes=m_translationRestoreHistory && m_translationViews.contains(revision)?m_translationViews[revision]:m_translationCarryModes;
@@ -149,7 +200,7 @@ void ReaderController::applyTranslationFrame(const QVariantMap &frame) {
     QStringList outputs;QString warning,failure;qsizetype remaining=maximumAiCharacters;bool shortened=false;int ready=0,failed=0,cancelled=0;
     for(const auto &value:frame.value(QStringLiteral("rows")).toList()) {
         const auto row=value.toMap();const auto state=row.value(QStringLiteral("state")).toString();
-        if(state==QStringLiteral("ready")){++ready;acceptTranslationOverlay(row.value(QStringLiteral("target")).toMap(),row.value(QStringLiteral("id")).toString(),row.value(QStringLiteral("translated_text")).toString(),row.value(QStringLiteral("language")).toString(),row.value(QStringLiteral("model")).toString(),row.value(QStringLiteral("view_key")).toString(),false);}
+        if(state==QStringLiteral("ready")){++ready;acceptTranslationOverlay(row.value(QStringLiteral("target")).toMap(),row.value(QStringLiteral("id")).toString(),row.value(QStringLiteral("translated_text")).toString(),row.value(QStringLiteral("language")).toString(),row.value(QStringLiteral("model")).toString(),row.value(QStringLiteral("view_key")).toString(),frame.value(QStringLiteral("prompt_version")).toString(),false);}
         if(state==QStringLiteral("failed"))++failed;if(state==QStringLiteral("cancelled"))++cancelled;
         if(warning.isEmpty())warning=row.value(QStringLiteral("cache_warning")).toString();
         if(failure.isEmpty())failure=row.value(QStringLiteral("error")).toString();
@@ -186,7 +237,9 @@ void ReaderController::handleTranslationCommand(quint64 id,const QString &operat
         if(!error.isEmpty()){m_translationState.insert(QStringLiteral("cache_warning"),error);emit translationsChanged();return;}
         auto entries=frame.value(QStringLiteral("entries")).toList();
 
-        for(const auto &value:entries){const auto row=value.toMap(),entry=row.value(QStringLiteral("entry")).toMap();acceptTranslationOverlay(row.value(QStringLiteral("target")).toMap(),entry.value(QStringLiteral("key")).toString(),entry.value(QStringLiteral("translatedText")).toString(),entry.value(QStringLiteral("language")).toString(),entry.value(QStringLiteral("model")).toString(),row.value(QStringLiteral("view_key")).toString(),true);}
+        for(const auto &value:entries){const auto row=value.toMap(),entry=row.value(QStringLiteral("entry")).toMap();acceptTranslationOverlay(row.value(QStringLiteral("target")).toMap(),entry.value(QStringLiteral("key")).toString(),entry.value(QStringLiteral("translatedText")).toString(),entry.value(QStringLiteral("language")).toString(),entry.value(QStringLiteral("model")).toString(),row.value(QStringLiteral("view_key")).toString(),entry.value(QStringLiteral("promptVersion")).toString(),true);}
+        m_translationState.insert(QStringLiteral("prompt_version"),frame.value(QStringLiteral("prompt_version")));
+        m_translationState.insert(QStringLiteral("default_language"),frame.value(QStringLiteral("default_language")));
         m_translationState.insert(QStringLiteral("cache_warning"),frame.value(QStringLiteral("cache_warning")));
         if(frame.value(QStringLiteral("stale")).toInt()>0)m_translationState.insert(QStringLiteral("cache_warning"),tr("Some saved translations no longer match page %1. They are hidden; nothing was requested.").arg(page+1));
         QPointer<ReaderController> alive(this);const auto generation=m_generation;if(previousOverlays!=m_translationOverlays)emit translationOverlaysChanged();if(alive && generation==m_generation)emit translationsChanged();return;
