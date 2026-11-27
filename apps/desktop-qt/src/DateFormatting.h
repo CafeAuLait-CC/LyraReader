@@ -7,5 +7,6 @@
 namespace DateFormatting {
 inline constexpr int fontSizePt = 14;
 QVariantMap format(const QString &style, const QString &isoDay = {}, const QString &localeName = {});
+QVariantMap annotationCreated(double referenceSeconds,const QString &localeName = {});
 QVariantMap picture(const QString &text, int clockwiseDegrees);
 }

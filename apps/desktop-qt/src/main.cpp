@@ -1,6 +1,7 @@
 #include "DisplayCalibration.h"
 #include "WindowGeometryActivity.h"
 #include "ReadingTextGeometry.h"
+#include "AnnotationPassageText.h"
 #include "ReadingMarkdown.h"
 #include "ReadingScrollMemory.h"
 #include "ReadingSourceHighlight.h"
@@ -81,6 +82,7 @@ int main(int argc, char **argv) {
     qmlRegisterType<ReadingScrollMemory>("LyraReader",1,0,"ReadingScrollMemory");
     qmlRegisterType<ReadingMarkdown>("LyraReader",1,0,"ReadingMarkdown");
     qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
+    qmlRegisterType<AnnotationPassageText>("LyraReader",1,0,"AnnotationPassageText");
     qmlRegisterType<ReadingSourceHighlight>("LyraReader",1,0,"ReadingSourceHighlight");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");

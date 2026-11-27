@@ -423,6 +423,24 @@ ApplicationWindow {
     readonly property var annotationThreads: Logic.annotationThreads(annotations)
     property var noteMarkerLayouts: ({})
     property string selectedSidebarAnnotationID: ""
+    function activateAnnotationPassage(row,owner,epoch) {
+        if(!row || !row.annotation || owner!==currentReader || epoch!==owner.documentGeneration)return;
+        const reader=currentReader,generation=reader.documentGeneration;
+        if(placedTextController.deferAction(function(){if(reader===currentReader && generation===reader.documentGeneration)root.activateAnnotationPassage(row,owner,epoch);}))return;
+        const annotation=annotations.find(function(a){return a.id===row.annotation.id && !!a.foreign===!!row.annotation.foreign;});if(!annotation)return;
+        dialogs.flushAnnotation();if(reader!==currentReader || generation!==reader.documentGeneration)return;
+        annotationNotePaper.close();selectedAnnotation=annotation;selectedSidebarAnnotationID=annotation.id;
+        selection=!annotation.foreign && !annotation.fileQuads && annotation.start>=0 && annotation.end>=annotation.start ? {page:annotation.page,start:annotation.start,end:annotation.end} : null;
+        navigate(annotation.page,annotation.rect ? annotation.rect.y : 0);
+    }
+    function openSidebarPassageNote(row,owner,epoch) {
+        if(!row || !row.annotation || owner!==currentReader || epoch!==owner.documentGeneration)return;
+        const reader=currentReader,generation=reader.documentGeneration;
+        if(placedTextController.deferAction(function(){if(reader===currentReader && generation===reader.documentGeneration)root.openSidebarPassageNote(row,owner,epoch);}))return;
+        const annotation=annotations.find(function(a){return a.id===row.annotation.id && !!a.foreign===!!row.annotation.foreign;});if(!annotation)return;
+        dialogs.flushAnnotation();if(reader!==currentReader || generation!==reader.documentGeneration)return;
+        dialogs.annotationDialog.close();selectedSidebarAnnotationID=annotation.id;annotationNotePaper.openNote(annotation,false,true);
+    }
     function activateAnnotationThreadRow(row) {
         if(!row || !row.annotation)return;
         const source=currentReader,generation=source.documentGeneration;

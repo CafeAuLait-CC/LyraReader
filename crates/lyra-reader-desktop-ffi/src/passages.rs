@@ -3,7 +3,7 @@ use lyra_reader_ffi::{
     api::{AiSourceRectRecord, LyraReaderDocument},
     passages::AnnotationContextSpanRecord,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 const MAX_ENTRIES: usize = 512;
@@ -16,6 +16,16 @@ struct Entry {
     end: Option<u32>,
     #[serde(default)]
     regions: Vec<AiSourceRectRecord>,
+}
+#[derive(Serialize)]
+struct ResolvedEntry {
+    id: String,
+    page: u32,
+    quote: String,
+    context: String,
+    start: u32,
+    end: u32,
+    span: AnnotationContextSpanRecord,
 }
 pub(super) fn query(
     engine: &LyraReaderDocument,
@@ -45,7 +55,7 @@ pub(super) fn query(
         return Err("Duplicate annotation context identities are not valid.".into());
     }
     if entries.is_empty() {
-        return Ok(json!({"entries":[],"warnings":[]}));
+        return Ok(json!({"entries":[],"groups":[],"warnings":[]}));
     }
     let map = engine
         .annotation_text_map(page)
@@ -60,7 +70,7 @@ pub(super) fn query(
     let mut warnings = Vec::new();
     let mut used = 0usize;
     for entry in entries {
-        let make = || -> Result<Option<(Value, usize)>, String> {
+        let make = || -> Result<Option<(ResolvedEntry, usize)>, String> {
             let span = if !entry.regions.is_empty() {
                 map.regions_span(entry.regions.clone())
             } else {
@@ -84,7 +94,21 @@ pub(super) fn query(
                 .checked_add(text.len())
                 .ok_or("The annotation context size overflowed.")?;
             Ok(Some((
-                json!({"id":entry.id,"page":page,"quote":quote,"context":text,"start":span.start-context.start,"end":span.end-context.start,"span":context}),
+                ResolvedEntry {
+                    id: entry.id.clone(),
+                    page,
+                    quote,
+                    context: text,
+                    start: span
+                        .start
+                        .checked_sub(context.start)
+                        .ok_or("The annotation context starts after its mark.")?,
+                    end: span
+                        .end
+                        .checked_sub(context.start)
+                        .ok_or("The annotation context ends before its mark.")?,
+                    span: context,
+                },
                 bytes,
             )))
         };
@@ -101,17 +125,47 @@ pub(super) fn query(
             Err(message) => warnings.push(json!({"id":entry.id,"message":message})),
         }
     }
-    let ranges = rows
-        .iter()
-        .map(|r| {
-            serde_json::from_value::<AnnotationContextSpanRecord>(r["span"].clone())
-                .map_err(|e| e.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let ranges = rows.iter().map(|row| row.span).collect();
     let clusters = lyra_reader_ffi::passages::annotation_context_clusters(ranges)
         .map_err(|e| e.to_string())?;
+    let mut groups = Vec::new();
+    for cluster in &clusters {
+        let text = map.text_in_span(cluster.span).map_err(|e| e.to_string())?;
+        if used.checked_add(text.len()).is_none_or(|n| n > MAX_OUTPUT) {
+            for index in &cluster.indices {
+                let row = rows
+                    .get(
+                        usize::try_from(*index)
+                            .map_err(|_| "The annotation cluster index exceeds this platform.")?,
+                    )
+                    .ok_or("The annotation cluster index is invalid.")?;
+                warnings.push(json!({"id":row.id,"message":"The merged annotation context exceeds this page's display budget. Individual contexts were kept."}));
+            }
+            continue;
+        }
+        let mut members = Vec::with_capacity(cluster.indices.len());
+        for index in &cluster.indices {
+            let row = rows
+                .get(
+                    usize::try_from(*index)
+                        .map_err(|_| "The annotation cluster index exceeds this platform.")?,
+                )
+                .ok_or("The annotation cluster index is invalid.")?;
+            let relative = |offset: u32| {
+                row.span
+                    .start
+                    .checked_add(offset)
+                    .and_then(|n| n.checked_sub(cluster.span.start))
+                    .ok_or("The annotation mark is outside its context cluster.")
+            };
+            members
+                .push(json!({"id":row.id,"start":relative(row.start)?,"end":relative(row.end)?}));
+        }
+        used += text.len();
+        groups.push(json!({"id":format!("{page}:{}:{}",cluster.span.start,cluster.span.end),"page":page,"span":cluster.span,"text":text,"members":members}));
+    }
     Ok(
-        json!({"entries":rows,"clusters":clusters,"warnings":warnings,"sentence_boundary_provider":"unicode-uax29"}),
+        json!({"entries":rows,"clusters":clusters,"groups":groups,"warnings":warnings,"sentence_boundary_provider":"unicode-uax29"}),
     )
 }
 
@@ -154,6 +208,55 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(String::from_utf16(&utf16[prefix..suffix]).unwrap(), "quick");
     }
+    #[test]
+    fn grouped_passages_keep_shared_cluster_text_and_each_mark_utf16_range() {
+        let engine = engine();
+        let page = engine.text_page(0).unwrap();
+        let source = page.chars.iter().map(|c| c.unicode).collect::<Vec<_>>();
+        let find = |word: &str| {
+            let word = word.chars().map(|c| c as u32).collect::<Vec<_>>();
+            source.windows(word.len()).position(|v| v == word).unwrap()
+        };
+        let quick = find("quick");
+        let brown = find("brown");
+        let value=query(&engine,0,&json!([{"id":"highlight","start":quick,"end":quick+4,"regions":[]},{"id":"underline","start":brown,"end":brown+4,"regions":[]},{"id":"invalid","start":0,"end":u32::MAX,"regions":[]}])).unwrap();
+        let groups = value["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        let members = group["members"].as_array().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0]["id"], "highlight");
+        assert_eq!(members[1]["id"], "underline");
+        let span: AnnotationContextSpanRecord =
+            serde_json::from_value(group["span"].clone()).unwrap();
+        assert_eq!(
+            group["text"],
+            engine
+                .annotation_text_map(0)
+                .unwrap()
+                .text_in_span(span)
+                .unwrap()
+        );
+        let text = group["text"]
+            .as_str()
+            .unwrap()
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        for (member, expected) in members.iter().zip(["quick", "brown"]) {
+            assert_eq!(
+                String::from_utf16(
+                    &text[member["start"].as_u64().unwrap() as usize
+                        ..member["end"].as_u64().unwrap() as usize]
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(value["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(value["warnings"].as_array().unwrap().len(), 1);
+        assert_eq!(query(&engine, 0, &json!([])).unwrap()["groups"], json!([]));
+    }
+
     #[test]
     fn invalid_entries_are_isolated_and_request_budgets_are_checked_before_copying() {
         let engine = engine();

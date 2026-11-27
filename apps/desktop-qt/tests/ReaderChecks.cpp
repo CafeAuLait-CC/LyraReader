@@ -3,6 +3,7 @@
 #include "DisplayCalibration.h"
 #include "WindowGeometryActivity.h"
 #include "ReadingTextGeometry.h"
+#include "AnnotationPassageText.h"
 #include "ReadingMarkdown.h"
 #include "ReadingScrollMemory.h"
 #include "ReadingSourceHighlight.h"
@@ -202,6 +203,7 @@ static void registerReaderTypes() {
     qmlRegisterType<ReadingScrollMemory>("LyraReader",1,0,"ReadingScrollMemory");
     qmlRegisterType<ReadingMarkdown>("LyraReader",1,0,"ReadingMarkdown");
     qmlRegisterType<ReadingTextGeometry>("LyraReader",1,0,"ReadingTextGeometry");
+    qmlRegisterType<AnnotationPassageText>("LyraReader",1,0,"AnnotationPassageText");
     qmlRegisterType<ReadingSourceHighlight>("LyraReader",1,0,"ReadingSourceHighlight");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
@@ -7892,6 +7894,84 @@ Rectangle {
         const auto connection=connect(raw,&ReaderController::commandsChanged,this,[&]{if(armed && raw->pendingCommands()>0){armed=false;reader.reset();}});
         raw->openCachedSummary("page:1","synthetic-lifetime");QVERIFY(!armed);QVERIFY(alive.isNull());disconnect(connection);
     }
+    void annotationSidebarProjectionKeepsDocumentOrderAndReplyRoots() {
+        QQmlEngine engine;QQmlComponent component(&engine);component.setData(R"QML(import QtQml
+import "qrc:/qml/AnnotationSidebar.js" as SidebarProjection
+QtObject {
+    property string currentKey:"current"
+    property var result:SidebarProjection.rows([
+        {annotation:{id:"own",page:0,foreign:false},rootID:"own",depth:0,sectionPage:0,sectionKey:"1",orphanReason:""},
+        {annotation:{id:"own-reply",page:1,foreign:true,is_reply:true},rootID:"own",depth:1,sectionPage:0,sectionKey:"1",orphanReason:""},
+        {annotation:{id:"pdf",page:0,foreign:true},rootID:"pdf",depth:0,sectionPage:0,sectionKey:"1",orphanReason:""},
+        {annotation:{id:"pdf-reply",page:1,foreign:true,is_reply:true},rootID:"pdf",depth:2,sectionPage:0,sectionKey:"1",orphanReason:""},
+        {annotation:{id:"orphan",page:1,foreign:true,is_reply:true},rootID:"orphan",depth:0,sectionPage:1,sectionKey:"2",orphanReason:"missing"}
+    ],{"0":{input_key:"current",groups:[{id:"0:0:5",page:0,text:"public",members:[{id:"own",start:0,end:3},{id:"pdf",start:1,end:4}]}]}},{"0":currentKey})
+})QML",QUrl("qrc:/projection-fixture.qml"));QScopedPointer<QObject> fixture(component.create());QVERIFY2(fixture,qPrintable(component.errorString()));
+        const auto rows=[&]{return fixture->property("result").value<QJSValue>().toVariant().toList();};
+        const auto merged=rows();QCOMPARE(merged.size(),4);const auto group=merged.first().toMap();QCOMPARE(group.value("annotation").toMap().value("id").toString(),QString("pdf"));QCOMPARE(group.value("sourceIDs").toStringList(),QStringList({"pdf","own"}));const auto marks=group.value("passage").toMap().value("marks").toList();QCOMPARE(marks.first().toMap().value("source").toMap().value("annotation").toMap().value("id").toString(),QString("pdf"));QCOMPARE(merged[1].toMap().value("annotation").toMap().value("id").toString(),QString("pdf-reply"));QCOMPARE(merged[2].toMap().value("annotation").toMap().value("id").toString(),QString("own-reply"));QCOMPARE(merged[1].toMap().value("sectionPage").toInt(),0);QCOMPARE(merged[1].toMap().value("annotation").toMap().value("page").toInt(),1);QCOMPARE(merged.last().toMap().value("orphanReason").toString(),QString("missing"));
+        fixture->setProperty("currentKey","new-source");QCOMPARE(rows().size(),5);for(const auto &row:rows())QVERIFY(row.toMap().value("passage").isNull());
+    }
+
+    void annotationCreatedDatesUseNativeLocaleAndRejectInvalidInstants() {
+        ReaderController reader;
+        const auto english=reader.formattedAnnotationDate(43200,"en_US");QVERIFY(!english.contains("error"));QVERIFY(english.value("text").toString().contains("2001"));
+        const auto chinese=reader.formattedAnnotationDate(43200,"zh_CN");QVERIFY(!chinese.contains("error"));QVERIFY(chinese.value("text").toString()!=english.value("text").toString());
+        QVERIFY(reader.formattedAnnotationDate(std::numeric_limits<double>::quiet_NaN(),"en_US").contains("error"));
+        QVERIFY(reader.formattedAnnotationDate(1e30,"en_US").contains("error"));QVERIFY(reader.formattedAnnotationDate(43200,QString(129,'x')).contains("error"));
+    }
+
+    void nativePassageOffsetProjectionRejectsOversizedDocumentsBeforeMapping() {
+        QTextDocument document;document.setPlainText(QString((1<<20)+1,QLatin1Char('x')));
+        QVERIFY(ReadingTextGeometry::sourceBoundaries(&document,document.toPlainText()).isEmpty());
+        document.setPlainText(QString::fromUtf8("A\r\n🙂"));const auto offsets=ReadingTextGeometry::sourceBoundaries(&document,QString::fromUtf8("A\r\n🙂"));QCOMPARE(offsets.size(),6);QCOMPARE(offsets[2],-1);QCOMPARE(offsets[4],-1);QCOMPARE(offsets.last(),4);
+    }
+
+    void annotationPassageNativeTextKeepsInkAndSeparateDecorationColours() {
+        QQuickWindow window;window.setColor(Qt::white);window.resize(480,300);window.show();
+        AnnotationPassageText text(window.contentItem());text.setPosition({30,40});text.setWidth(360);text.setColor(QColor("#302B25"));QFont font=QGuiApplication::font();font.setPixelSize(18);text.setFont(font);const QString source=QString::fromUtf8("alpha beta 中文 👩‍🔬\r\nsecond line");text.setText(source);text.setHeight(100);QTRY_VERIFY(text.implicitHeight()>0);QTest::qWait(40);const auto plain=window.grabWindow();QVERIFY(!plain.isNull());
+        text.setMarks({QVariantMap{{"kind","highlight"},{"start",0},{"end",5},{"color",QColor(255,0,0,80)}}});QTest::qWait(40);const auto highlighted=window.grabWindow();QVERIFY(!highlighted.isNull());QVERIFY(highlighted!=plain);QVERIFY(text.warning().isEmpty());const auto box=QTransform::fromScale(double(plain.width())/window.width(),double(plain.height())/window.height()).mapRect(text.mapRectToScene(text.boundingRect()));int ink=0;
+        for(int y=int(box.top());y<std::min(int(box.bottom()),plain.height());++y)for(int x=int(box.left());x<std::min(int(box.right()),plain.width());++x){const auto pixel=plain.pixelColor(x,y);if(pixel==text.color()){++ink;QCOMPARE(highlighted.pixelColor(x,y),pixel);}}QVERIFY(ink>20);
+        const auto chinese=source.indexOf(QString::fromUtf8("中文"));QVERIFY(chinese>0);text.setMarks({QVariantMap{{"kind","underline"},{"start",0},{"end",10},{"color",QColor(Qt::blue)}},QVariantMap{{"kind","strikeout"},{"start",0},{"end",5},{"color",QColor(Qt::green)}},QVariantMap{{"kind","highlight"},{"start",chinese},{"end",chinese+2},{"color",QColor(255,0,0,80)}}});QTest::qWait(40);const auto decorated=window.grabWindow();int blue=0,green=0;for(int y=int(box.top());y<std::min(int(box.bottom()),decorated.height());++y)for(int x=int(box.left());x<std::min(int(box.right()),decorated.width());++x){const auto c=decorated.pixelColor(x,y);if(c.blue()>180 && c.red()<80 && c.green()<80)++blue;if(c.green()>100 && c.red()<80 && c.blue()<80)++green;}QVERIFY(blue>10);QVERIFY(green>10);QVERIFY(text.warning().isEmpty());
+        const auto emoji=source.indexOf(QString::fromUtf8("👩"));text.setMarks({QVariantMap{{"kind","highlight"},{"start",emoji+1},{"end",emoji+2},{"color",QColor(Qt::red)}}});QTRY_VERIFY(!text.warning().isEmpty());text.setMarks({});QTRY_VERIFY(text.warning().isEmpty());QVariantList tooMany;for(int i=0;i<513;++i)tooMany.append(QVariantMap{{"kind","highlight"},{"start",0},{"end",1},{"color",QColor(Qt::red)}});text.setMarks(tooMany);QTRY_VERIFY(text.warning().contains("styles"));text.setMarks({});text.setText(QString(40000,QLatin1Char('x')));QTRY_VERIFY(text.clipped());QVERIFY(text.implicitHeight()<=2048);QCOMPARE(text.text().size(),40000);
+        const auto capture=qEnvironmentVariable("LYRA_READER_PASSAGES_CAPTURE");if(!capture.isEmpty()){QVERIFY(QDir().mkpath(capture));QVERIFY(decorated.save(capture+"/passage-native-decorations.png"));}
+    }
+
+    void annotationPassageSidebarGroupsMarksAndKeepsNotesReadOnly_data() {QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");}
+    void annotationPassageSidebarGroupsMarksAndKeepsNotesReadOnly() {
+        QFETCH(QString,theme);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());const auto path=scratch.filePath("synthetic-grouped-passages.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto bytes=file.readAll();file.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(1100,820);window->setProperty("appearance",theme);window->setProperty("reduceMotion",true);MockChatServer sentinel;QVERIFY(sentinel.listen());window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-sidebar-only"}});view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));
+        const auto chars=reader->textPages().value("0").toMap().value("chars").toList();const auto find=[&](const QString &word){const auto codes=word.toUcs4();for(int i=0;i+codes.size()<=chars.size();++i){bool same=true;for(int j=0;j<codes.size();++j)if(chars[i+j].toMap().value("unicode").toUInt()!=codes[j]){same=false;break;}if(same)return i;}return -1;};QStringList ids;const QStringList words{"quick","brown","fox"},kinds{"highlight","underline","strikeout"},colours{"#E8BC5580","#2572CCFF","#3D9860FF"};
+        for(int i=0;i<3;++i) {
+            const auto start=find(words[i]);QVERIFY(start>=0);
+            const QVariantMap entry{{"kind",kinds[i]},{"page",0},{"start",start},{"end",start+words[i].size()-1},{"color",colours[i]},
+                {"note",i<2?QString("Synthetic note %1").arg(i):QString{}}};
+            reader->submit("mark_create",{{"entry",entry}});QTRY_COMPARE(reader->pendingCommands(),0);
+            ids.append(reader->data().value("marks").toMap().value("annotations").toList().last().toMap().value("id").toString());
+        }
+        const auto before=reader->data().value("marks");QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));auto *list=window->findChild<QQuickItem *>("annotationThreadList");QVERIFY(list);QTRY_VERIFY(reader->annotationPassages().value("0").toMap().value("groups").toList().size()==1);QTRY_COMPARE(list->property("count").toInt(),1);AnnotationPassageText *passage=nullptr;const auto visiblePassage=[&]{const auto groups=reader->annotationPassages().value("0").toMap().value("groups").toList();if(groups.isEmpty())return static_cast<AnnotationPassageText *>(nullptr);return qobject_cast<AnnotationPassageText *>(visualItem(window->contentItem(),"annotationPassage_"+groups.first().toMap().value("id").toString()));};QTRY_VERIFY((passage=visiblePassage()));QCOMPARE(passage->marks().size(),3);QVERIFY(passage->text().contains("quick brown fox"));QVERIFY(passage->warning().isEmpty());
+        auto *header=visualItem(window->contentItem(),"annotationPageHeader_1");QVERIFY(header);auto *name=QAccessible::queryAccessibleInterface(header);QVERIFY(name && name->text(QAccessible::Name).contains("3 annotations"));window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);header->forceActiveFocus(Qt::TabFocusReason);
+        auto *headerFocus=visualItem(header,"annotationPageHeaderFocus_1");QVERIFY(headerFocus);QTRY_VERIFY(headerFocus->isVisible());QCOMPARE(QQmlProperty::read(headerFocus,"border.width").toInt(),2);
+        QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(!passage->isVisible());QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(passage->isVisible());
+        auto *focusedRow=visualItem(window->contentItem(),"annotationThreadRow_"+ids.first());QVERIFY(focusedRow);focusedRow->forceActiveFocus(Qt::TabFocusReason);
+        auto *rowFocus=visualItem(focusedRow,"annotationThreadFocus_"+ids.first());QVERIFY(rowFocus);QTRY_VERIFY(rowFocus->isVisible());QVERIFY(!headerFocus->isVisible());
+        auto *note=visualItem(window->contentItem(),"annotationPassageNote_"+ids[1]);QVERIFY(note && note->isVisible());note->forceActiveFocus(Qt::TabFocusReason);auto *noteFocus=visualItem(note,"annotationPassageNoteFocus_"+ids[1]);QVERIFY(noteFocus);QTRY_VERIFY(noteFocus->isVisible());QVERIFY(!rowFocus->isVisible());QTest::keyClick(window,Qt::Key_Space);auto *body=window->findChild<QQuickItem *>("annotationNoteBody");QVERIFY(body);QTRY_VERIFY(body->isVisible());QVERIFY(body->property("readOnly").toBool());QCOMPARE(body->property("text").toString(),QString("Synthetic note 1"));QCOMPARE(reader->data().value("marks"),before);QCOMPARE(reader->pendingCommands(),0);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!body->isVisible());
+        const auto capture=qEnvironmentVariable("LYRA_READER_PASSAGES_CAPTURE");if(!capture.isEmpty()){QVERIFY(QDir().mkpath(capture));QVERIFY(window->grabWindow().save(capture+"/passage-grouped-"+theme+".png"));}
+        // Supply a long public view-model passage without changing the PDF or the
+        // shared query. Extraction/cluster correctness is covered by the Rust fixture.
+        auto *rowItem=visualItem(window->contentItem(),"annotationThreadRow_"+ids.first());QVERIFY(rowItem);
+        const auto rawPayload=rowItem->property("modelData");auto payload=rawPayload.metaType()==QMetaType::fromType<QJSValue>() ? rawPayload.value<QJSValue>().toVariant().toMap() : rawPayload.toMap();QVERIFY(!payload.isEmpty());
+        auto group=payload.value("passage").toMap();
+        const auto longText=group.value("text").toString()+QString::fromUtf8("\nLiteral 中文 🙂 ")+QString("<img src='%1/unexpected'> ").arg(sentinel.baseUrl())+QString("bounded passage ").repeated(3000);
+        group.insert("text",longText);payload.insert("passage",group);QVERIFY(QQmlProperty::write(rowItem,"modelData",payload));
+        QTRY_COMPARE(passage->text(),longText);QTRY_VERIFY(passage->clipped());auto *full=visualItem(rowItem,"annotationFullContext_"+ids.first());QVERIFY(full);QTRY_VERIFY(full->isVisible());QTRY_VERIFY(list->property("contentHeight").toDouble()>list->height());list->setProperty("contentY",std::max(0.,list->property("contentHeight").toDouble()-list->height()));
+        full->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);auto *dialog=window->findChild<QObject *>("annotationContextDialog");QVERIFY(dialog);QTRY_VERIFY(dialog->property("visible").toBool());auto *contextText=window->findChild<QQuickItem *>("annotationFullContextText");QVERIFY(contextText);QCOMPARE(contextText->property("text").toString(),longText);QVERIFY(contextText->property("readOnly").toBool() && contextText->property("selectByKeyboard").toBool());contextText->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QTest::keyClick(window,Qt::Key_C,Qt::ControlModifier);QCOMPARE(QGuiApplication::clipboard()->text(),longText);QCOMPARE(reader->data().value("marks"),before);QCOMPARE(sentinel.requests.size(),0);
+        const auto moved=find("Mixed");QVERIFY(moved>=0);reader->submit("mark_update",{{"id",ids[2]},{"patch",QVariantMap{{"start",moved},{"end",moved+4}}}});QTRY_COMPARE(reader->pendingCommands(),0);QTRY_COMPARE(reader->annotationPassages().value("0").toMap().value("groups").toList().size(),2);QTRY_COMPARE(list->property("count").toInt(),2);QTRY_VERIFY(!dialog->property("visible").toBool());QCOMPARE(sentinel.requests.size(),0);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),bytes);
+        const auto oldGeneration=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(!reader->loading() && reader->documentGeneration()!=oldGeneration);QTRY_COMPARE(reader->pendingCommands(),0);const auto reopened=reader->data().value("marks");
+        const auto noteRow=payload.value("passage").toMap().value("marks").toList()[1].toMap().value("source");
+        QVERIFY(QMetaObject::invokeMethod(window,"openSidebarPassageNote",Q_ARG(QVariant,noteRow),Q_ARG(QVariant,QVariant::fromValue(reader)),Q_ARG(QVariant,oldGeneration)));auto *paper=window->findChild<QObject *>("annotationNotePaperController");QVERIFY(paper && !paper->property("opened").toBool());QCOMPARE(reader->data().value("marks"),reopened);
+        const QVariantMap oldContext{{"id",ids.first()},{"page",0},{"context",longText},{"sourceIDs",ids}};auto *sidebar=window->findChild<QObject *>("readerSidebar");QVERIFY(sidebar);QVERIFY(QMetaObject::invokeMethod(sidebar,"openContext",Q_ARG(QVariant,oldContext),Q_ARG(QVariant,QVariant::fromValue(reader)),Q_ARG(QVariant,oldGeneration)));QVERIFY(!dialog->property("visible").toBool());
+    }
+
     void annotationPassageSidebarKeepsQuotesLocalReadableAndRevisionScoped_data() {
         QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
@@ -7903,8 +7983,11 @@ Rectangle {
         reader->submit("mark_create",{{"entry",QVariantMap{{"kind","highlight"},{"page",0},{"start",first},{"end",first+4},{"color","#E8BC5580"},{"note","Synthetic note"}}}});QTRY_COMPARE(reader->pendingCommands(),0);const auto mark=reader->data().value("marks").toMap().value("annotations").toList().first().toMap();const auto id=mark.value("id").toString();const auto before=reader->data().value("marks");
         QVERIFY(reader->annotationPassages().isEmpty());QVERIFY(QMetaObject::invokeMethod(window,"showSidebar",Q_ARG(QVariant,"annotations")));
         const auto row=[&]{return reader->annotationPassages().value("0").toMap().value("entries").toMap().value(id).toMap();};QTRY_COMPARE_WITH_TIMEOUT(row().value("quote").toString(),QString("quick"),10000);QVERIFY(row().value("context").toString().contains("brown fox"));QCOMPARE(reader->data().value("marks"),before);QCOMPARE(sentinel.requests.size(),0);
-        auto *label=visualItem(window->contentItem(),"annotationContext_"+id);QVERIFY(label && label->isVisible());QVERIFY(label->property("text").toString().contains("<b>quick</b>"));const auto capture=qEnvironmentVariable("LYRA_READER_PASSAGES_CAPTURE");if(!capture.isEmpty()){QVERIFY(QDir().mkpath(capture));QTest::qWait(80);QVERIFY(window->grabWindow().save(capture+"/passage-sidebar-"+theme+".png"));}auto *full=visualItem(window->contentItem(),"annotationFullContext_"+id);QVERIFY(full);QVERIFY(QMetaObject::invokeMethod(full,"clicked"));auto *dialog=window->findChild<QObject *>("annotationContextDialog");QVERIFY(dialog);QTRY_VERIFY(dialog->property("visible").toBool());auto *body=window->findChild<QObject *>("annotationFullContextText");QVERIFY(body);QCOMPARE(body->property("text").toString(),row().value("context").toString());if(!capture.isEmpty()){QTest::qWait(80);QVERIFY(window->grabWindow().save(capture+"/passage-full-"+theme+".png"));}
-        reader->submit("mark_update",{{"id",id},{"patch",QVariantMap{{"start",second},{"end",second+4}}}});QTRY_COMPARE(reader->pendingCommands(),0);QTRY_COMPARE_WITH_TIMEOUT(row().value("quote").toString(),QString("brown"),10000);QTRY_VERIFY(!dialog->property("visible").toBool());QCOMPARE(sentinel.requests.size(),0);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);file.close();
+        const auto groups=reader->annotationPassages().value("0").toMap().value("groups").toList();QCOMPARE(groups.size(),1);
+        auto *label=qobject_cast<AnnotationPassageText *>(visualItem(window->contentItem(),"annotationPassage_"+groups.first().toMap().value("id").toString()));QVERIFY(label && label->isVisible());QCOMPARE(label->text(),row().value("context").toString());QCOMPARE(label->marks().size(),1);QVERIFY(label->warning().isEmpty());
+        const auto capture=qEnvironmentVariable("LYRA_READER_PASSAGES_CAPTURE");if(!capture.isEmpty()){QVERIFY(QDir().mkpath(capture));QTest::qWait(80);QVERIFY(window->grabWindow().save(capture+"/passage-sidebar-"+theme+".png"));}
+        auto *full=visualItem(window->contentItem(),"annotationFullContext_"+id);QVERIFY(full && !full->isVisible());
+        reader->submit("mark_update",{{"id",id},{"patch",QVariantMap{{"start",second},{"end",second+4}}}});QTRY_COMPARE(reader->pendingCommands(),0);QTRY_COMPARE_WITH_TIMEOUT(row().value("quote").toString(),QString("brown"),10000);QCOMPARE(sentinel.requests.size(),0);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);file.close();
         const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_VERIFY(!reader->loading() && reader->documentGeneration()!=generation && reader->pageCount()==3);QTRY_VERIFY(reader->annotationPassages().isEmpty());QCOMPARE(sentinel.requests.size(),0);
     }
     void annotationPassageQueriesRejectLateReadersAndKeepTheDocumentModelPrivate() {

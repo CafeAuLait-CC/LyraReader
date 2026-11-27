@@ -192,6 +192,7 @@ public:
     Q_INVOKABLE void clearNoteDraft(const QString &id){if(m_noteDrafts.remove(id))emit noteDraftsChanged();}
     QVariantMap data() const { return m_data; }
     QVariantMap annotationPassages()const;
+    Q_INVOKABLE QString annotationPassageInputKey(const QVariantList &entries)const;
     Q_INVOKABLE void requestAnnotationPassages(int page,const QVariantList &entries);
     QVariantMap textPages() const { return m_textPages; }
     int pendingCommands() const { return m_pendingCommands; }
@@ -231,6 +232,7 @@ public:
     Q_INVOKABLE QVariantMap typedSignatureImage(const QString &name,const QString &family) const;
     Q_INVOKABLE QVariantMap formattedDate(const QString &style,const QString &isoDay = {},const QString &localeName = {}) const;
     Q_INVOKABLE QString trimBookmarkEditorText(const QString &text) const { return text.trimmed(); }
+    Q_INVOKABLE QVariantMap formattedAnnotationDate(double referenceSeconds,const QString &localeName={})const;
     Q_INVOKABLE QVariantMap datePicture(const QString &text,int clockwiseDegrees) const;
     Q_INVOKABLE QUrl contentPreviewUrl(int page,const QString &target,const QString &revision,
                                       double width,double height,double deviceScale);

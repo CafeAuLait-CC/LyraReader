@@ -4,9 +4,11 @@ import QtQuick.Layouts
 import QtQuick.Shapes
 import LyraReader 1.0
 import "ReaderLogic.js" as Logic
+import "AnnotationSidebar.js" as AnnotationSidebar
 
 Pane {
     id: sidebarPanel
+    objectName:"readerSidebar"
     required property var app
     padding: 0
     component BookmarkOption: LyraMenuItem {
@@ -18,7 +20,9 @@ Pane {
     }
     readonly property var passageInputs: {
         const result={},flags=app.currentReader.data.annotation_rules && app.currentReader.data.annotation_rules.kind_flags || [];
-        for(const row of app.annotationThreads.rows) {
+        const rows=app.annotationThreads.rows;
+        const ordered=rows.filter(function(row){return row.annotation.foreign;}).concat(rows.filter(function(row){return !row.annotation.foreign;}));
+        for(const row of ordered) {
             const a=row.annotation;
             if(a.is_reply || !a.visible || !flags.some(function(f){return f.kind===a.kind && f.is_markup;}))continue;
             const regions=(a.foreign ? a.quads : a.fileQuads || []).map(function(r){return {x_pt:r.x,y_pt:r.y,width_pt:r.width,height_pt:r.height};});
@@ -27,8 +31,51 @@ Pane {
         }
         return result;
     }
+    readonly property var passageInputKeys: {
+        const keys={};
+        for(const page of Object.keys(passageInputs))keys[page]=app.currentReader.annotationPassageInputKey(passageInputs[page]);
+        return keys;
+    }
+    readonly property var annotationRows: {
+        const owner=app.currentReader,generation=owner.documentGeneration;
+        return AnnotationSidebar.rows(app.annotationThreads.rows,owner.annotationPassages,passageInputKeys).map(function(row){return Object.assign({},row,{owner:owner,generation:generation});});
+    }
+    property var pendingPassages:({})
+    function requestPassage(page,owner,generation) {
+        const key=passageInputKeys[String(page)];if(!key)return;
+        const next=Object.assign({},pendingPassages);next[page]={owner:owner,generation:generation,key:key};pendingPassages=next;
+        Qt.callLater(flushPassages);
+    }
+    function flushPassages() {
+        const queued=pendingPassages;pendingPassages=({});
+        if(!visible || !app.sidebarVisible || app.sidebarTab!=="annotations")return;
+        for(const page of Object.keys(queued)) {
+            const ticket=queued[page];
+            if(ticket.owner!==app.currentReader || ticket.generation!==ticket.owner.documentGeneration || ticket.owner.loading
+                    || ticket.key!==passageInputKeys[page])continue;
+            const demanded=Array.from(annotationList.contentItem.children).some(function(item){return item.passageDemand && item.annotation && String(item.annotation.page)===page;});
+            if(demanded)ticket.owner.requestAnnotationPassages(Number(page),passageInputs[page]);
+        }
+    }
+    readonly property var annotationCounts: {
+        const result={};for(const row of app.annotationThreads.rows)result[row.sectionKey]=(result[row.sectionKey] || 0)+1;
+        return result;
+    }
+    property var collapsedAnnotationPages:({})
+    function toggleAnnotationPage(page) {const next=Object.assign({},collapsedAnnotationPages);next[page]=!next[page];collapsedAnnotationPages=next;}
+    function revealAnnotation() {
+        const owner=app.currentReader,generation=owner.documentGeneration,id=app.selectedSidebarAnnotationID;
+        if(!id)return;
+        const row=annotationRows.find(function(r){return r.sourceIDs.indexOf(id)>=0;});if(!row)return;
+        if(collapsedAnnotationPages[row.sectionKey]){const next=Object.assign({},collapsedAnnotationPages);delete next[row.sectionKey];collapsedAnnotationPages=next;}
+        Qt.callLater(function(){if(owner!==app.currentReader || generation!==owner.documentGeneration)return;const index=annotationRows.findIndex(function(r){return r.sourceIDs.indexOf(id)>=0;});if(index>=0)annotationList.positionViewAtIndex(index,ListView.Contain);});
+    }
+    function contextInputKey(row) {
+        const ids=row.sourceIDs || [row.id];
+        return JSON.stringify((passageInputs[String(row.page)] || []).filter(function(entry){return ids.indexOf(entry.id)>=0;}));
+    }
     property string fullInputKey:""
-    onPassageInputsChanged:if(fullContext && JSON.stringify((passageInputs[String(fullContext.page)] || []).find(function(e){return e.id===fullContext.id;}))!==fullInputKey)contextDialog.close()
+    onPassageInputsChanged:if(fullContext && contextInputKey(fullContext)!==fullInputKey)contextDialog.close()
     property var fullContext:null
     property var fullOwner:null
     property var fullGeneration:null
@@ -37,9 +84,9 @@ Pane {
         const escape=function(text){return text.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\"/g,"&quot;");};
         return escape(row.context.slice(0,row.start))+"<b>"+escape(row.context.slice(row.start,row.end))+"</b>"+escape(row.context.slice(row.end));
     }
-    function openContext(row) {fullInputKey=JSON.stringify((passageInputs[String(row.page)] || []).find(function(e){return e.id===row.id;}));fullContext=row;fullOwner=app.currentReader;fullGeneration=fullOwner.documentGeneration;contextDialog.open();}
-    Connections {target:sidebarPanel.app;function onCurrentReaderChanged(){contextDialog.close();}}
-    Connections {target:sidebarPanel.app.currentReader;function onDocumentChanged(){if(sidebarPanel.fullOwner && (sidebarPanel.fullOwner!==sidebarPanel.app.currentReader || sidebarPanel.fullGeneration!==sidebarPanel.fullOwner.documentGeneration))contextDialog.close();}}
+    function openContext(row,owner,generation) {if(!row || owner!==app.currentReader || generation!==owner.documentGeneration)return;fullInputKey=contextInputKey(row);fullContext=row;fullOwner=app.currentReader;fullGeneration=fullOwner.documentGeneration;contextDialog.open();}
+    Connections {target:sidebarPanel.app;function onCurrentReaderChanged(){contextDialog.close();sidebarPanel.collapsedAnnotationPages=({});sidebarPanel.pendingPassages=({});} function onSelectedSidebarAnnotationIDChanged(){sidebarPanel.revealAnnotation();}}
+    Connections {target:sidebarPanel.app.currentReader;function onDocumentChanged(){sidebarPanel.collapsedAnnotationPages=({});sidebarPanel.pendingPassages=({});if(sidebarPanel.fullOwner && (sidebarPanel.fullOwner!==sidebarPanel.app.currentReader || sidebarPanel.fullGeneration!==sidebarPanel.fullOwner.documentGeneration))contextDialog.close();}}
     background: Rectangle {
         color: app.colors.sidebarBg
     }
@@ -450,47 +497,92 @@ Pane {
                 PanelWheelHandler { viewport: annotationList }
                 clip: true
                 objectName: "annotationThreadList"
-                model: app.annotationThreads.rows
+                model: sidebarPanel.annotationRows
                 section.property: "sectionKey"
-                section.delegate: Label {
+                section.delegate: Button {
+                    id:pageHeader
                     required property string section
-                    text: qsTr("Page %1").arg(section)
-                    width: annotationList.width
-                    padding: 10
-                    color: app.colors.textSecondary
-                    font.bold: true
-                    font.pixelSize: 11
+                    objectName:"annotationPageHeader_"+section
+                    width:annotationList.width;height:34;leftPadding:12;rightPadding:12
+                    hoverEnabled:true
+                    Accessible.name:qsTr("Page %1 · %2 annotations").arg(section).arg(sidebarPanel.annotationCounts[section] || 0)
+                    Accessible.description:sidebarPanel.collapsedAnnotationPages[section] ? qsTr("Collapsed") : qsTr("Expanded")
+                    onClicked:sidebarPanel.toggleAnnotationPage(section)
+                    contentItem:RowLayout {
+                        spacing:6
+                        Label {text:sidebarPanel.collapsedAnnotationPages[section] ? "▸" : "▾";font.pixelSize:9;color:app.colors.textPrimary;Layout.preferredWidth:10}
+                        Label {text:qsTr("Page %1").arg(section);font.pixelSize:11;font.bold:true;color:app.colors.textPrimary;Layout.fillWidth:true}
+                        Label {text:String(sidebarPanel.annotationCounts[section] || 0);font.pixelSize:11;color:app.colors.textSecondary}
+                    }
+                    background:Rectangle {
+                        color:pageHeader.down ? app.colors.pressedBg : pageHeader.hovered ? app.colors.hoverBg : app.colors.panelBg
+                        Rectangle {anchors.bottom:parent.bottom;width:parent.width;height:1;color:app.colors.separator}
+                        Rectangle {
+                            objectName:"annotationPageHeaderFocus_"+pageHeader.section
+                            anchors.fill:parent;anchors.margins:2;radius:3;color:"transparent"
+                            border.width:2;border.color:app.colors.focusRing
+                            visible:pageHeader.visualFocus && app.active
+                        }
+                    }
                 }
                 ScrollBar.vertical: ScrollBar {}
                 delegate: ItemDelegate {
                     id:annotationRow
                     required property var modelData
                     readonly property var annotation: modelData.annotation
+                    readonly property var group:modelData.passage || null
+                    readonly property bool current:modelData.owner===app.currentReader && modelData.generation===app.currentReader.documentGeneration && !modelData.owner.loading
+                    readonly property bool expanded:!sidebarPanel.collapsedAnnotationPages[modelData.sectionKey]
+                    readonly property var groupNotes:group ? group.marks.filter(function(m){return String(m.source.annotation.note || m.source.annotation.contents || "").trim().length>0;}) : []
+                    readonly property string groupMetadata: {
+                        if(!group)return "";
+                        const authors=Array.from(new Set(group.marks.map(function(m){return m.source.annotation.author;}).filter(function(v){return !!v;}))).sort().join(", ");
+                        let date="";
+                        for(const mark of group.marks) {
+                            const source=mark.source.annotation;
+                            if(source.modified){date=Logic.annotationDate(source.modified);break;}
+                            if(source.createdAt!==undefined){const formatted=app.currentReader.formattedAnnotationDate(source.createdAt);date=formatted.text || formatted.error;break;}
+                        }
+                        return [authors,date].filter(function(v){return !!v;}).join(" · ");
+                    }
                     readonly property bool passageWanted:(sidebarPanel.passageInputs[String(annotation.page)] || []).some(function(e){return e.id===annotation.id;})
                     readonly property var contextFrame:app.currentReader.annotationPassages[String(annotation.page)] || ({})
-                    readonly property var passage:(contextFrame.entries || {})[annotation.id] || null
+                    readonly property var passage:contextFrame.input_key===sidebarPanel.passageInputKeys[String(annotation.page)] ? (contextFrame.entries || {})[annotation.id] || null : null
                     readonly property string passageError:passageWanted ? (contextFrame.error || ((contextFrame.warnings || []).find(function(w){return w.id===annotation.id;}) || {}).message || "") : ""
-                    readonly property bool passageDemand:sidebarPanel.visible && app.sidebarVisible && app.sidebarTab==="annotations" && !app.currentReader.loading && passageWanted && !annotation.is_reply && y+height>annotationList.contentY && y<annotationList.contentY+annotationList.height
-                    function requestPassage() {const inputs=sidebarPanel.passageInputs[String(annotation.page)];if(passageDemand && inputs)app.currentReader.requestAnnotationPassages(annotation.page,inputs);}
+                    readonly property bool passageDemand:current && expanded && sidebarPanel.visible && app.sidebarVisible && app.sidebarTab==="annotations" && !app.currentReader.loading && passageWanted && !annotation.is_reply && y+height>annotationList.contentY && y<annotationList.contentY+annotationList.height
+                    function requestPassage() {if(passageDemand)sidebarPanel.requestPassage(annotation.page,modelData.owner,modelData.generation);}
                     onPassageDemandChanged:requestPassage()
                     Component.onCompleted:requestPassage()
                     Connections {target:sidebarPanel;function onPassageInputsChanged(){annotationRow.requestPassage();}}
+                    enabled:current
                     activeFocusOnTab: true
-                    Accessible.name: qsTr("%1 · page %2").arg(annotation.is_reply ? annotation.author || qsTr("Reply") : annotation.kind).arg(annotation.page + 1)
+                    hoverEnabled:true
+                    Accessible.name: group ? group.text : qsTr("%1 · page %2").arg(annotation.is_reply ? annotation.author || qsTr("Reply") : annotation.kind).arg(annotation.page + 1)
                     Accessible.description: (annotation.note || annotation.contents || "") + (modelData.orphanReason ? " · " + modelData.orphanReason : "")
                     Accessible.onPressAction: if (enabled && visible)
                         clicked()
                     objectName: "annotationThreadRow_" + annotation.id
-                    highlighted:app.selectedSidebarAnnotationID===annotation.id
+                    highlighted:modelData.sourceIDs.indexOf(app.selectedSidebarAnnotationID)>=0
                     Accessible.selectable:true
                     Accessible.selected:highlighted
                     width: annotationList.width
                     leftPadding: 10 + Math.min(modelData.depth, 6) * 14
-                    height: Math.max(68, annotationContent.implicitHeight + 20)
+                    visible:expanded
+                    height:expanded ? Math.max(group ? 40 : 68, annotationContent.implicitHeight + 24) : 0
+                    background:Rectangle {
+                        color:annotationRow.down ? app.colors.pressedBg : annotationRow.highlighted ? app.colors.selectedBg : annotationRow.hovered ? app.colors.hoverBg : "transparent"
+                        Rectangle {
+                            objectName:"annotationThreadFocus_"+annotationRow.annotation.id
+                            anchors.fill:parent;anchors.margins:2;radius:3;color:"transparent"
+                            border.width:2;border.color:app.colors.focusRing
+                            visible:annotationRow.visualFocus && app.active
+                        }
+                    }
                     contentItem: ColumnLayout {
                         id: annotationContent
-                        spacing: 4
+                        spacing:group ? 8 : 4
                         RowLayout {
+                            visible:!annotationRow.group
                             Label {
                                 textFormat: Text.PlainText
                                 text: annotation.is_reply ? "↳ " + (annotation.author || qsTr("Reply")) : annotation.kind
@@ -507,7 +599,7 @@ Pane {
                         }
                         Label {
                             objectName:"annotationContext_"+annotation.id
-                            visible:!!passage
+                            visible:!!passage && !annotationRow.group
                             text:sidebarPanel.excerptHtml(passage)
                             textFormat:Text.RichText;wrapMode:Text.Wrap
                             maximumLineCount:5;elide:Text.ElideRight
@@ -515,11 +607,53 @@ Pane {
                             Layout.fillWidth:true
                             Accessible.name:passage ? passage.context : ""
                         }
+                        AnnotationPassageText {
+                            id:groupText
+                            objectName:"annotationPassage_"+(annotationRow.group ? annotationRow.group.id : annotation.id)
+                            visible:!!annotationRow.group
+                            Layout.fillWidth:true;Layout.preferredHeight:implicitHeight
+                            text:annotationRow.group ? annotationRow.group.text : ""
+                            marks:annotationRow.group ? annotationRow.group.marks.map(function(mark){const source=mark.source.annotation;return {start:mark.start,end:mark.end,kind:source.kind,color:Logic.displayColor(Logic.color(source),app.paperAppearance)};}) : []
+                            color:app.colors.textPrimary;font.pixelSize:12
+                            Accessible.role:Accessible.StaticText;Accessible.name:text
+                        }
+                        Repeater {
+                            model:annotationRow.groupNotes
+                            delegate:Button {
+                                id:passageNote
+                                required property var modelData
+                                objectName:"annotationPassageNote_"+modelData.source.annotation.id
+                                Layout.fillWidth:true;leftPadding:7;rightPadding:7;topPadding:7;bottomPadding:7
+                                hoverEnabled:true
+                                Accessible.name:String(modelData.source.annotation.note || modelData.source.annotation.contents || "")
+                                onClicked:app.openSidebarPassageNote(modelData.source,annotationRow.modelData.owner,annotationRow.modelData.generation)
+                                contentItem:Label {text:passageNote.Accessible.name;textFormat:Text.PlainText;wrapMode:Text.Wrap;font.pixelSize:12;color:app.colors.noteFg}
+                                background:Rectangle {
+                                    color:app.colors.noteBg;radius:3
+                                    border.width:passageNote.down || passageNote.hovered ? 1 : 0
+                                    border.color:app.colors.noteFg
+                                    Rectangle {
+                                        objectName:"annotationPassageNoteFocus_"+passageNote.modelData.source.annotation.id
+                                        anchors.fill:parent;anchors.margins:2;radius:2;color:"transparent"
+                                        border.width:2;border.color:app.colors.focusRing
+                                        visible:passageNote.visualFocus && app.active
+                                    }
+                                }
+                            }
+                        }
+                        Label {
+                            visible:!!annotationRow.groupMetadata;text:annotationRow.groupMetadata
+                            Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;font.pixelSize:10;color:app.colors.textTertiary
+                        }
+                        Label {
+                            visible:!!groupText.warning && !!annotationRow.group;text:groupText.warning
+                            Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:10;color:app.colors.warningFg
+                        }
                         ToolButton {
                             objectName:"annotationFullContext_"+annotation.id
-                            visible:!!passage;text:qsTr("Full context…")
+                            visible:!!passage && (!annotationRow.group || groupText.clipped || !!groupText.warning);text:qsTr("Full context…")
                             Accessible.name:qsTr("Full annotation context on page %1").arg(annotation.page+1)
-                            onClicked:sidebarPanel.openContext(passage)
+                            onClicked:sidebarPanel.openContext(annotationRow.group ? {id:annotation.id,page:annotation.page,context:annotationRow.group.text,quote:annotationRow.group.members.map(function(member){return annotationRow.contextFrame.entries[member.id].quote;}).join(" · "),sourceIDs:modelData.sourceIDs} : passage,modelData.owner,modelData.generation)
                         }
                         Label {
                             visible:passageError.length>0;text:passageError;textFormat:Text.PlainText
@@ -528,7 +662,7 @@ Pane {
                         Label {
                             id: annotationText
                             textFormat: Text.PlainText
-                            visible:!!(annotation.note || annotation.contents) || !passage
+                            visible:!annotationRow.group && (!!(annotation.note || annotation.contents) || !passage)
                             text: annotation.note || annotation.contents || qsTr("No text")
                             wrapMode: Text.Wrap
                             maximumLineCount: 4
@@ -538,7 +672,7 @@ Pane {
                         }
                         Label {
                             textFormat: Text.PlainText
-                            visible: !!annotation.modified
+                            visible: !annotationRow.group && !!annotation.modified
                             text: Logic.annotationDate(annotation.modified)
                             font.pixelSize: 10
                             color: app.colors.textTertiary
@@ -553,7 +687,7 @@ Pane {
                             color: app.colors.warningFg
                         }
                     }
-                    onClicked: app.activateAnnotationThreadRow(modelData)
+                    onClicked: if(group)app.activateAnnotationPassage(modelData,modelData.owner,modelData.generation);else app.activateAnnotationThreadRow(modelData)
                 }
                 Label {
                     textFormat: Text.PlainText
@@ -590,7 +724,7 @@ Pane {
             Label {objectName:"annotationFullQuote";text:sidebarPanel.fullContext ? sidebarPanel.fullContext.quote : "";textFormat:Text.PlainText;wrapMode:Text.Wrap;maximumLineCount:3;elide:Text.ElideRight;Layout.fillWidth:true;color:app.colors.textPrimary}
             ScrollView {
                 Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth
-                TextArea {objectName:"annotationFullContextText";width:parent.width;text:sidebarPanel.fullContext ? sidebarPanel.fullContext.context : "";textFormat:TextEdit.PlainText;readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap}
+                TextArea {objectName:"annotationFullContextText";width:parent.width;text:sidebarPanel.fullContext ? sidebarPanel.fullContext.context : "";textFormat:TextEdit.PlainText;readOnly:true;selectByMouse:true;selectByKeyboard:true;activeFocusOnTab:true;wrapMode:TextEdit.Wrap}
             }
         }
     }

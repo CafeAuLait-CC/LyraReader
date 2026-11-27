@@ -1,12 +1,26 @@
 #include "ReaderController.h"
 #include "NativeRaster.h"
 #include <QFutureWatcher>
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QPointer>
 #include <QtConcurrentRun>
 
-namespace {struct PassageResult {QVariantMap frame;QString error;};constexpr qint64 maximumPassageText=2*1024*1024;}
+namespace {
+struct PassageResult {QVariantMap frame;QString error;};constexpr qint64 maximumPassageText=2*1024*1024;
+struct PassageInput {QByteArray signature;QString error;};
+PassageInput passageInput(const QVariantList &entries) {
+    const auto error=[](const char *message){return PassageInput{{},QCoreApplication::translate("ReaderController",message)};};
+    if(entries.size()>512)return error("This page has too many annotation contexts.");
+    qsizetype regions=0;
+    for(const auto &value:entries){const auto entry=value.toMap();const auto count=entry.value(QStringLiteral("regions")).toList().size();if(entry.value(QStringLiteral("id")).toString().size()>256 || count>8192-regions)return error("The annotation context geometry exceeds its input limits.");regions+=count;}
+    const auto encoded=QJsonDocument::fromVariant(entries).toJson(QJsonDocument::Compact);
+    if(encoded.size()>1024*1024)return error("This page exceeds the annotation context input budget.");
+    return {QCryptographicHash::hash(encoded,QCryptographicHash::Sha256),{}};
+}
+}
+QString ReaderController::annotationPassageInputKey(const QVariantList &entries)const{return QString::fromLatin1(passageInput(entries).signature.toHex());}
 QVariantMap ReaderController::annotationPassages()const {
     QVariantMap result;for(auto i=m_passageFrames.cbegin();i!=m_passageFrames.cend();++i)result.insert(QString::number(i.key()),i.value());return result;
 }
@@ -16,12 +30,9 @@ void ReaderController::initPassages() {
 void ReaderController::requestAnnotationPassages(int page,const QVariantList &entries) {
     if(!m_source || m_loading || page<0 || page>=m_pages.size() )return;
     const auto source=m_source;const auto generation=m_generation;
-    if(entries.size()>512){m_passageInputs.remove(page);cachePassageFrame(page,{{QStringLiteral("error"),tr("This page has too many annotation contexts.")}});emit annotationPassagesChanged();return;}
-    qsizetype regions=0;
-    for(const auto &value:entries){const auto entry=value.toMap();const auto count=entry.value(QStringLiteral("regions")).toList().size();if(entry.value(QStringLiteral("id")).toString().size()>256 || count>8192-regions){m_passageInputs.remove(page);cachePassageFrame(page,{{QStringLiteral("error"),tr("The annotation context geometry exceeds its input limits.")}});emit annotationPassagesChanged();return;}regions+=count;}
-    const auto encoded=QJsonDocument::fromVariant(entries).toJson(QJsonDocument::Compact);
-    if(encoded.size()>1024*1024){m_passageInputs.remove(page);cachePassageFrame(page,{{QStringLiteral("error"),tr("This page exceeds the annotation context input budget.")}});emit annotationPassagesChanged();return;}
-    const auto signature=QCryptographicHash::hash(encoded,QCryptographicHash::Sha256);
+    const auto input=passageInput(entries);
+    if(!input.error.isEmpty()){m_passageInputs.remove(page);cachePassageFrame(page,{{QStringLiteral("error"),input.error}});emit annotationPassagesChanged();return;}
+    const auto signature=input.signature;
     if(m_passageInputs.value(page)==signature){if(m_passageFrames.contains(page)){m_passageFrameOrder.removeAll(page);m_passageFrameOrder.append(page);}return;}
     m_passageInputs.insert(page,signature);
     if(m_passageFrames.remove(page)){m_passageBytes-=m_passageFrameBytes.take(page);m_passageFrameOrder.removeAll(page);QPointer<ReaderController> alive(this);emit annotationPassagesChanged();if(!alive || source!=m_source || generation!=m_generation)return;}
@@ -38,6 +49,15 @@ void ReaderController::cachePassageFrame(int page,QVariantMap frame) {
         if(bytes>maximumPassageText){error=tr("This page exceeds the annotation context display budget.");byId.clear();order.clear();bytes=0;break;}
         byId.insert(id,row);order.append(id);
     }
+    QVariantList groups;
+    if(error.isEmpty())for(const auto &value:frame.value(QStringLiteral("groups")).toList()) {
+        const auto group=value.toMap();
+        bytes+=(group.value(QStringLiteral("text")).toString().size()+group.value(QStringLiteral("id")).toString().size())*2;
+        for(const auto &member:group.value(QStringLiteral("members")).toList())bytes+=member.toMap().value(QStringLiteral("id")).toString().size()*2;
+        if(bytes>maximumPassageText){error=tr("This page exceeds the annotation context display budget.");byId.clear();order.clear();groups.clear();bytes=0;break;}
+        groups.append(group);
+    }
+    frame.insert(QStringLiteral("groups"),groups);
     frame.insert(QStringLiteral("entries"),byId);frame.insert(QStringLiteral("order"),order);frame.insert(QStringLiteral("error"),error);
     while(!m_passageFrameOrder.isEmpty() && (m_passageFrameOrder.size()>=32 || m_passageBytes+bytes>maximumPassageText)){
         const auto oldest=m_passageFrameOrder.takeFirst();m_passageFrames.remove(oldest);m_passageBytes-=m_passageFrameBytes.take(oldest);m_passageInputs.remove(oldest);
@@ -52,7 +72,7 @@ void ReaderController::startPassageQuery(int page,const QVariantList &entries,co
         if(source!=m_source || generation!=m_generation)return;
         --m_passageRunning;
         if(m_passageInputs.value(page)==signature) {
-            result.frame.insert(QStringLiteral("error"),result.error);cachePassageFrame(page,result.frame);
+            result.frame.insert(QStringLiteral("error"),result.error);result.frame.insert(QStringLiteral("input_key"),QString::fromLatin1(signature.toHex()));cachePassageFrame(page,result.frame);
             QPointer<ReaderController> alive(this);emit annotationPassagesChanged();if(!alive || source!=m_source || generation!=m_generation)return;
         }
         while(m_passageRunning<2 && !m_passageQueueOrder.isEmpty()){

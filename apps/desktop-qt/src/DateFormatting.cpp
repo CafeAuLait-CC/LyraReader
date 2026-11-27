@@ -61,6 +61,26 @@ QVariantMap DateFormatting::format(const QString &style, const QString &isoDay, 
     return {{"text", text}, {"width", width}, {"height", height}, {"fontSize", fontSizePt}};
 }
 
+QVariantMap DateFormatting::annotationCreated(double referenceSeconds,const QString &localeName) {
+    const auto failure=[] {return QVariantMap{{"error",QCoreApplication::translate("DateFormatting","The annotation date is unavailable.")}};};
+    if(!std::isfinite(referenceSeconds) || localeName.size()>128)return failure();
+    // The shared record codec retains Foundation reference seconds. Reconstruct the
+    // instant only for native locale display, exactly as the Mac shell reconstructs Date.
+    const auto epoch=QDateTime(QDate(2001,1,1),QTime(0,0),QTimeZone(QTimeZone::UTC)).toMSecsSinceEpoch();
+    const double instant=double(epoch)+referenceSeconds*1000.;
+    if(!std::isfinite(instant) || std::abs(instant)>8640000000000000.)return failure();
+    const QLocale locale=localeName.isEmpty()?QLocale():QLocale(localeName);
+    if(!localeName.isEmpty() && locale.language()==QLocale::C && localeName!="C")return failure();
+    const auto identifier=locale.language()==QLocale::C?QByteArray("en_US_POSIX"):locale.name().toUtf8();
+    const auto zone=QTimeZone::systemTimeZoneId();const auto zoneText=QString::fromUtf8(zone);
+    UErrorCode status=U_ZERO_ERROR;
+    std::unique_ptr<UDateFormat,decltype(&udat_close)> formatter(udat_open(UDAT_SHORT,UDAT_MEDIUM,identifier.constData(),reinterpret_cast<const UChar *>(zoneText.utf16()),zoneText.size(),nullptr,0,&status),&udat_close);
+    if(U_FAILURE(status) || !formatter)return failure();
+    std::array<UChar,257> buffer{};const auto count=udat_format(formatter.get(),instant,buffer.data(),int32_t(buffer.size()),nullptr,&status);
+    if(U_FAILURE(status) || count<=0 || count>=int32_t(buffer.size()))return failure();
+    return {{"text",QString::fromUtf16(reinterpret_cast<const char16_t *>(buffer.data()),count)}};
+}
+
 QVariantMap DateFormatting::picture(const QString &text, int clockwiseDegrees) {
     const auto failure = [](const char *message) {
         return QVariantMap{{"error", QCoreApplication::translate("DateFormatting", message)}};
