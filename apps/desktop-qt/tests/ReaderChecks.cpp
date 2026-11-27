@@ -5345,6 +5345,61 @@ LyraMenu {
         reader.openFile(original);QTRY_VERIFY(replaced && reader.pageCount()>0 && !reader.loading() && !reader.pendingCommands());QObject::disconnect(connection);
         QCOMPARE(reader.fileUrl(),replacement);QCOMPARE(reader.title(),QString("metadata-info.pdf"));QVERIFY(reader.metadataDraft().isEmpty());QVERIFY(!reader.hasUnsavedChanges());
     }
+    void exportSavePanelsSuggestOriginalNamesAndResetTheirFormat_data() {
+        QTest::addColumn<QString>("kind");QTest::addColumn<QString>("filename");
+        for(const auto &row:QList<QPair<QString,QString>>{{"annotations","Synthetic paper.v2 (annotated).PDF"},{"forms","Synthetic paper.v2 (filled).PDF"},{"flattened","Synthetic paper.v2 (flattened).PDF"},{"properties","Synthetic paper.v2 (properties).PDF"},{"pages","Synthetic paper.v2 (page edits).PDF"},{"extract","Synthetic paper.v2 (pages page 1).pdf"},{"annotation-text","Synthetic paper.v2 (annotations).md"},{"bibtex","synthetic2026example.bib"}})QTest::newRow(qPrintable(row.first))<<row.first<<row.second;
+    }
+    void exportSavePanelsSuggestOriginalNamesAndResetTheirFormat() {
+        QFETCH(QString,kind);QFETCH(QString,filename);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("Synthetic paper.v2.PDF");QVERIFY(QFile::copy(root+"/tests/fixtures/metadata-info.pdf",path));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0 && !reader->loading() && !reader->pendingCommands());
+        reader->submit("document_info");QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(QMetaObject::invokeMethod(window,"editDocumentProperty",Q_ARG(QVariant,QString("title")),Q_ARG(QVariant,QString("Changed synthetic title"))));
+        reader->submit("bibtex",{{"draft",QVariantMap{{"title","Example"},{"authors",QVariantList{"Synthetic"}},{"venue",""},{"year","2026"},{"doi",""},{"arxiv_id",""}}}});QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("selectedPages",QVariantList{0});
+        auto *save=window->findChild<QObject *>("documentSaveDialog");QVERIFY(save);
+        QQmlExpression forceFallback(QQmlEngine::contextForObject(save),save,"options = FileDialog.DontUseNativeDialog");forceFallback.evaluate();QVERIFY(!forceFallback.hasError());
+        QVERIFY(QMetaObject::invokeMethod(window,"chooseExport",Q_ARG(QVariant,kind)));QTRY_VERIFY(save->property("visible").toBool());
+        const auto filenameField=[]()->QQuickItem * {for(auto *candidate:QGuiApplication::allWindows())if(auto *quick=qobject_cast<QQuickWindow *>(candidate))if(quick->isVisible())if(auto *field=visualItem(quick->contentItem(),"fileNameTextField"))if(field->isVisible())return field;return nullptr;};
+        QTRY_VERIFY(filenameField());QCOMPARE(filenameField()->property("text").toString(),filename);
+        QCOMPARE(save->property("currentFile").toUrl(),QUrl::fromLocalFile(scratch.filePath(filename)));QCOMPARE(save->property("currentFolder").toUrl().toLocalFile(),scratch.path());
+        const QMap<QString,QString> titles{{"annotations","Save Annotated Copy"},{"forms","Save Filled Form Copy"},{"flattened","Export as Flattened Copy"},{"properties","Save Document Properties Copy"},{"pages","Save Edited Copy"},{"extract","Extract Pages"},{"annotation-text","Export Annotations"},{"bibtex","Save BibTeX"}};QCOMPARE(save->property("title").toString(),titles.value(kind));
+        if(kind=="annotation-text") {
+            auto *filter=save->property("selectedNameFilter").value<QObject *>();QVERIFY(filter);
+            std::function<QQuickItem *(QQuickItem *)> findFormat=[&](QQuickItem *item)->QQuickItem * {if(item->isVisible() && item->property("count").toInt()==2 && item->property("currentText").toString().contains("(*.md)"))return item;for(auto *child:item->childItems())if(auto *found=findFormat(child))return found;return nullptr;};
+            auto *format=findFormat(filenameField()->window()->contentItem());QVERIFY(format);format->window()->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),format->window());format->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(format->hasActiveFocus());QTest::keyClick(format->window(),Qt::Key_Down);QTRY_COMPARE(filter->property("index").toInt(),1);QTRY_COMPARE(format->property("currentText").toString(),QString("CSV (*.csv)"));
+            QTRY_COMPARE(save->property("currentFile").toUrl(),QUrl::fromLocalFile(scratch.filePath("Synthetic paper.v2 (annotations).csv")));
+            QTRY_COMPARE(filenameField()->property("text").toString(),QString("Synthetic paper.v2 (annotations).csv"));auto *entry=filenameField();entry->forceActiveFocus(Qt::TabFocusReason);auto *panel=entry->window();QVERIFY(panel);panel->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),panel);QTest::keyClick(panel,Qt::Key_A,Qt::ControlModifier);for(char key:QByteArray("My chosen name.csv"))QTest::keyClick(panel,key);QCOMPARE(entry->property("text").toString(),QString("My chosen name.csv"));
+            format->forceActiveFocus();QTRY_VERIFY(format->hasActiveFocus());QTest::keyClick(format->window(),Qt::Key_Up);QTRY_COMPARE(filter->property("index").toInt(),0);QTRY_COMPARE(save->property("selectedFile").toUrl(),QUrl::fromLocalFile(scratch.filePath("My chosen name.md")));QCOMPARE(filenameField()->property("text").toString(),QString("My chosen name.md"));
+            QQuickWindow foreignOwner;FileDialogNavigation navigation;QVERIFY(!navigation.setSaveName(save,&foreignOwner,QUrl::fromLocalFile(scratch.filePath("foreign.csv"))));QCOMPARE(filenameField()->property("text").toString(),QString("My chosen name.md"));
+            entry->forceActiveFocus();QTest::keyClick(panel,Qt::Key_A,Qt::ControlModifier);QTest::keyClick(panel,Qt::Key_Backspace);format->forceActiveFocus();QTRY_VERIFY(format->hasActiveFocus());QTest::keyClick(format->window(),Qt::Key_Down);QTRY_COMPARE(filter->property("index").toInt(),1);QTRY_COMPARE(filenameField()->property("text").toString(),QString("Synthetic paper.v2 (annotations).csv"));
+            entry->forceActiveFocus();QTest::keyClick(panel,Qt::Key_A,Qt::ControlModifier);for(char key:QByteArray("exports/Nested report.csv"))QTest::keyClick(panel,key);format->forceActiveFocus();QTRY_VERIFY(format->hasActiveFocus());QTest::keyClick(format->window(),Qt::Key_Up);QTRY_COMPARE(filter->property("index").toInt(),0);QTRY_COMPARE(filenameField()->property("text").toString(),QString("exports/Nested report.md"));QCOMPARE(save->property("selectedFile").toUrl(),QUrl::fromLocalFile(scratch.filePath("exports/Nested report.md")));
+
+        }
+        QVERIFY(QMetaObject::invokeMethod(save,"reject"));QTRY_VERIFY(!save->property("visible").toBool());QVERIFY(window->property("exportContext").isNull());
+        if(kind=="annotation-text") {
+            QVERIFY(QMetaObject::invokeMethod(window,"chooseExport",Q_ARG(QVariant,kind)));QTRY_VERIFY(save->property("visible").toBool());QCOMPARE(save->property("currentFile").toUrl(),QUrl::fromLocalFile(scratch.filePath(filename)));auto *filter=save->property("selectedNameFilter").value<QObject *>();QVERIFY(filter);QCOMPARE(filter->property("index").toInt(),0);QVERIFY(QMetaObject::invokeMethod(save,"reject"));
+        }
+        QVERIFY(QFile::exists(path));QVERIFY(!reader->hasUnsavedChanges());
+    }
+    void exportSavePanelFollowsOriginalIdentityAcrossWorkingRevisionsAndReopens_data() {
+        QTest::addColumn<QString>("route");for(const auto *route:{"working-save-as","reopen-pending","reopen-open-panel","different-tab","cancelled-accept"})QTest::newRow(route)<<QString(route);
+    }
+    void exportSavePanelFollowsOriginalIdentityAcrossWorkingRevisionsAndReopens() {
+        QFETCH(QString,route);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("Original synthetic source.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *owner=view.workspace.activeReader();QTRY_VERIFY(owner->pageCount()>0 && !owner->loading() && !owner->pendingCommands());
+        auto *save=window->findChild<QObject *>("documentSaveDialog");QVERIFY(save);
+        if(route=="working-save-as") {
+            owner->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTRY_COMPARE(owner->pendingCommands(),0);QVERIFY(owner->data().value("document_revision").toString()!=path);
+            QVERIFY(QMetaObject::invokeMethod(window,"saveDocument",Q_ARG(QVariant,true)));QTRY_VERIFY(save->property("visible").toBool());QCOMPARE(save->property("currentFile").toUrl(),QUrl::fromLocalFile(scratch.filePath("Original synthetic source (page edits).pdf")));QCOMPARE(save->property("title").toString(),QString("Save Edited Copy"));QVERIFY(QMetaObject::invokeMethod(save,"reject"));
+        } else {
+            QVERIFY(QMetaObject::invokeMethod(window,"chooseExport",Q_ARG(QVariant,QString("annotations"))));
+            if(route=="reopen-pending") {owner->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(!owner->loading() && owner->pageCount()>0 && !owner->pendingCommands());QVERIFY(!save->property("visible").toBool());QVERIFY(window->property("exportContext").isNull());}
+            else {
+                QTRY_VERIFY(save->property("visible").toBool());
+                if(route=="cancelled-accept") {QVERIFY(QMetaObject::invokeMethod(save,"reject"));const auto stale=scratch.filePath("must-not-exist.pdf");QVERIFY(QMetaObject::invokeMethod(window,"exportTo",Q_ARG(QVariant,QUrl::fromLocalFile(stale))));QTRY_COMPARE(owner->pendingCommands(),0);QVERIFY(!QFileInfo::exists(stale));}
+                else if(route=="reopen-open-panel") {owner->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(!owner->loading() && owner->pageCount()>0 && !owner->pendingCommands());QVERIFY(!save->property("visible").toBool());QVERIFY(window->property("exportContext").isNull());}
+                else {view.workspace.newTab();auto *other=view.workspace.activeReader();QVERIFY(other!=owner);QCOMPARE(window->property("exportContext").toMap().value("reader").value<ReaderController *>(),owner);QCOMPARE(save->property("currentFile").toUrl(),QUrl::fromLocalFile(scratch.filePath("Original synthetic source (annotated).pdf")));QVERIFY(QMetaObject::invokeMethod(save,"reject"));QVERIFY(other->data().value("save_current_annotations").isNull());}
+            }
+        }
+    }
     void documentPropertiesDraftsKeepTheirOwnerAndUseDirtyWriteGates_data() {
         QTest::addColumn<QString>("route");QTest::addColumn<QString>("appearance");for(const auto &appearance:{QString("light"),QString("dark")})for(const auto *route:{"initial-gates","reopen","regenerate","other-tab","signed-copy","staged-revision","pending-note","copy-save","replace-save"})QTest::newRow(qPrintable(QString(route)+"-"+appearance))<<QString(route)<<appearance;
     }

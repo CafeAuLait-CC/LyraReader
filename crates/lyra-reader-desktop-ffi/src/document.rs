@@ -950,6 +950,7 @@ impl DesktopDocument {
                     .map_err(|e| e.to_string())
             }
             "document_info" => value(d.document_info()),
+            "export_suggestion" => crate::export_dialog::suggestion(&self.original_path, &r),
             "forms" => value(d.form_info()),
             "annotations" => {
                 crate::artwork::annotations(d.annotations().map_err(|e| e.to_string())?)

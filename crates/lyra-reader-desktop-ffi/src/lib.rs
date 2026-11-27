@@ -11,6 +11,7 @@ mod document;
 mod document_cache;
 mod draft_store;
 mod drag_preview;
+mod export_dialog;
 mod exports;
 mod knowledge;
 mod marks;

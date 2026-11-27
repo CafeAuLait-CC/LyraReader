@@ -76,6 +76,7 @@ public:
     Q_INVOKABLE QVariant preference(const QString &key, const QVariant &fallback = {}) const;
     Q_INVOKABLE void setPreference(const QString &key, const QVariant &value);
     Q_INVOKABLE QString localPath(const QUrl &url) const { return url.toLocalFile(); }
+    Q_INVOKABLE QUrl urlForLocalPath(const QString &path) const { return QUrl::fromLocalFile(path); }
     Q_INVOKABLE QString writeTextFile(const QUrl &url, const QString &text);
 signals:
     void readingPresetChanged();

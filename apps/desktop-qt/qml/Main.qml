@@ -763,7 +763,7 @@ ApplicationWindow {
             exportKind="document";
             exportContext={reader:owner,revision:owner.data.document_revision,kind:"document",forms:[],closeTicket:ticket};
             ticket.phase="panel";
-            dialogs.saveDialog.open();
+            prepareExportDialog();
         } else closeCommand(ticket,"document_save",{expected_revision:owner.data.document_revision});
     }
     function discardAndClose(index) { beginCloseOperation("discard",closeTarget(index),index<0); }
@@ -860,6 +860,15 @@ ApplicationWindow {
             target: modelData.reader
             function onCommandFinished(id, operation, result, error) {
                 root.closeCommandFinished(modelData.reader,id,operation,result,error);
+                if(operation==="export_suggestion")root.exportDialogPrepared(modelData.reader,id,result,error);
+            }
+            function onDocumentReset() {
+                const context=root.exportContext;
+                if(context && context.reader===modelData.reader && context.generation!==modelData.reader.documentGeneration) {
+                    dialogs.saveDialog.close();
+                    root.exportContext=null;
+                    if(context.closeTicket===root.closeOperation)root.cancelCloseOperation("");
+                }
             }
             function onCommandsChanged() {
                 // Defer until the command's data/error notifications finish.
@@ -1817,7 +1826,7 @@ ApplicationWindow {
         if (context.copy) {
             exportKind="document";
             exportContext={reader:context.reader,revision:context.revision,kind:"document",forms:context.forms};
-            dialogs.saveDialog.open();
+            prepareExportDialog();
         } else {
             pendingSavePosition={reader:context.reader,position:context.position};
             if (context.reader===currentReader) {pendingPage=context.page;pendingPageSelection=context.selection;}
@@ -1860,6 +1869,29 @@ ApplicationWindow {
         else if(action==="annotations")chooseExport("annotation-text");
         else if(action==="print")printDocument();
     }
+    function prepareExportDialog() {
+        const previous=exportContext;
+        if(!previous || !previous.reader)return;
+        const context=Object.assign({},previous,{
+            generation:previous.reader.documentGeneration,
+            pageEdits:!!(previous.reader.data.marks || {}).page_pending
+        });
+        exportContext=context;
+        context.suggestionRequest=context.reader.submit("export_suggestion",{
+            kind:context.kind,page_edits:context.pageEdits,
+            bibtex:context.kind==="bibtex" ? context.text : "",pages:context.pages || []
+        });
+    }
+    function exportDialogPrepared(owner,id,result,error) {
+        const context=exportContext;
+        if(!context || context.reader!==owner || context.suggestionRequest!==id)return;
+        if(error.length || context.generation!==owner.documentGeneration) {
+            exportContext=null;
+            if(context.closeTicket===closeOperation)cancelCloseOperation("");
+            operationStatus=error || qsTr("The document changed. Choose the export again.");return;
+        }
+        dialogs.openSaveDialog(result);
+    }
     function setAnnotationExportFormat(index) {
         if(!exportContext || exportContext.kind!=="annotation-text")return;
         if(index!==0 && index!==1)return;
@@ -1885,7 +1917,7 @@ ApplicationWindow {
             properties: kind === "properties" ? dialogs.informationDialog.draft() : null,
             text: kind === "bibtex" ? bibtex : (kind === "markdown" || kind === "csv" ? annotationExport(kind) : "")
         };
-        dialogs.saveDialog.open();
+        prepareExportDialog();
     }
     function chooseRedactionExport(owner, areas) {
         exportKind = "redactions";
@@ -1894,7 +1926,7 @@ ApplicationWindow {
             kind: "redactions",
             redactions: areas
         };
-        dialogs.saveDialog.open();
+        prepareExportDialog();
     }
     function updateFormValue(id, value) {
         if (blockXfaWrite()) return;
@@ -1947,12 +1979,8 @@ ApplicationWindow {
     function exportTo(url) {
         if (!session)
             return;
-        const context = exportContext || {
-            reader: currentReader,
-            kind: exportKind,
-            forms: formPayload(),
-            redactions: pendingRedactions.slice()
-        };
+        const context = exportContext;
+        if (!context) return;
         const owner = context.reader;
         if (!owner)
             return;

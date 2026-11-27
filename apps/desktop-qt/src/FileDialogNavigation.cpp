@@ -3,6 +3,8 @@
 #include <QMetaProperty>
 #include <QTimer>
 #include <QUrl>
+#include <QDir>
+#include <QFileInfo>
 
 namespace {
 QQuickItem *fileList(QQuickItem *item) {
@@ -14,10 +16,55 @@ bool belongsTo(QWindow *window,QWindow *owner) {
     for(auto *candidate=window;candidate;candidate=candidate->transientParent())if(candidate==owner)return true;
     return false;
 }
+QQuickItem *namedVisibleItem(QQuickItem *item,const QString &name) {
+    if(item->isVisible() && item->objectName()==name)return item;
+    for(auto *child:item->childItems())if(auto *found=namedVisibleItem(child,name))return found;
+    return nullptr;
+}
+QQuickItem *saveNameField(QObject *dialog,QQuickWindow *owner) {
+    if(!dialog || !owner || !dialog->property("visible").toBool())return nullptr;
+    const auto folder=dialog->property("currentFolder").toUrl();
+    for(auto *window:QGuiApplication::allWindows()) {
+        auto *quick=qobject_cast<QQuickWindow *>(window);
+        if(!quick || !quick->isVisible() || !belongsTo(quick,owner))continue;
+        auto *list=fileList(quick->contentItem());
+        auto *model=list ? list->property("model").value<QObject *>() : nullptr;
+        if(!model || model->property("folder").toUrl()!=folder)continue;
+        if(auto *field=namedVisibleItem(quick->contentItem(),QStringLiteral("fileNameTextField")))return field;
+    }
+    return nullptr;
+}
 }
 FileDialogNavigation::FileDialogNavigation(QObject *parent):QObject(parent) {
     if(auto *application=qobject_cast<QGuiApplication *>(QCoreApplication::instance()))
         connect(application,&QGuiApplication::focusWindowChanged,this,&FileDialogNavigation::refresh,Qt::QueuedConnection);
+}
+bool FileDialogNavigation::setSaveName(QObject *dialog,QQuickWindow *owner,const QUrl &file,bool focus) {
+    if(!file.isLocalFile())return false;
+    QPointer<QQuickItem> field=saveNameField(dialog,owner);
+    if(!field)return false;
+    // Qt 6.10's optional Quick fallback leaves a nonexistent suggested file's editor empty.
+    // Repair that presentation after open, without creating a placeholder file or changing
+    // native platform panels. This guarded adapter uses the same fallback seam as navigation.
+    const auto folder=dialog->property("currentFolder").toUrl();
+    const auto name=folder.isLocalFile() ? QDir(folder.toLocalFile()).relativeFilePath(file.toLocalFile()) : QFileInfo(file.toLocalFile()).fileName();
+    field->setProperty("text",name);
+    if(!field)return false;
+    QMetaObject::invokeMethod(field,"editingFinished",Qt::DirectConnection);
+    if(focus && field && field->isVisible()) {
+        field->forceActiveFocus(Qt::OtherFocusReason);
+        QMetaObject::invokeMethod(field,"selectAll",Qt::DirectConnection);
+    }
+    return true;
+}
+QUrl FileDialogNavigation::currentSaveFile(QObject *dialog,QQuickWindow *owner)const {
+    if(auto *field=saveNameField(dialog,owner)) {
+        const auto folder=dialog->property("currentFolder").toUrl();
+        const auto name=field->property("text").toString();
+        if(name.isEmpty())return {};
+        if(folder.isLocalFile())return QUrl::fromLocalFile(QDir(folder.toLocalFile()).filePath(name));
+    }
+    return dialog ? dialog->property("selectedFile").toUrl() : QUrl{};
 }
 void FileDialogNavigation::track(QObject *dialog,QQuickWindow *owner) {
     if(m_list)disconnect(m_list,nullptr,this,nullptr);

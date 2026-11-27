@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import LyraReader 1.0
 import "ReaderLogic.js" as Logic
 
 Item {
@@ -350,11 +351,50 @@ Item {
     }
     QuitDialog { app: dialogs.app }
 
+    FileDialogNavigation {id:saveNavigation}
+    function openSaveDialog(suggestion) {
+        save.suggestion=suggestion;
+        save.adjustingFormat=true;
+        save.selectedNameFilter.index=0;
+        save.currentFolder=app.session.urlForLocalPath(suggestion.folder);
+        const initialFile=app.session.urlForLocalPath(suggestion.path);
+        save.selectedFile=initialFile;
+        save.open();
+        saveNavigation.setSaveName(save,app,initialFile,true);
+        save.adjustingFormat=false;
+    }
     FileDialog {
         id: save
         objectName: "documentSaveDialog"
+        property var suggestion:null
+        property bool adjustingFormat:false
+        function updateFormat() {
+            if(adjustingFormat || app.exportKind!=="annotation-text" || !suggestion)return;
+            const suffix=selectedNameFilter.index===1 ? "csv" : "md";
+            const current=app.session.localPath(saveNavigation.currentSaveFile(save,app));
+            const previous=current===suggestion.markdown || current===suggestion.csv;
+            const separator=Math.max(current.lastIndexOf("/"),current.lastIndexOf("\\"));
+            const dot=current.lastIndexOf(".");
+            const stem=dot>separator+1 ? current.slice(0,dot) : current;
+            selectedFile=app.session.urlForLocalPath(!current.length || previous ? suggestion[suffix==="md" ? "markdown" : "csv"] : stem+"."+suffix);
+            saveNavigation.setSaveName(save,app,selectedFile,false);
+        }
+        Connections {
+            target:save.selectedNameFilter
+            function onIndexChanged() {save.updateFormat();}
+        }
         fileMode: FileDialog.SaveFile
-        title: app.exportKind==="flattened" ? qsTr("Export as Flattened Copy") : app.exportKind==="annotation-text" ? qsTr("Export Annotations") : qsTr("Save a copy")
+        title: {
+            if(app.exportKind==="flattened")return qsTr("Export as Flattened Copy");
+            if(app.exportKind==="properties")return qsTr("Save Document Properties Copy");
+            if(app.exportKind==="forms")return qsTr("Save Filled Form Copy");
+            if(app.exportKind==="bibtex")return qsTr("Save BibTeX");
+            if(["annotation-text","markdown","csv"].indexOf(app.exportKind)>=0)return qsTr("Export Annotations");
+            if(app.exportKind==="extract")return qsTr("Extract Pages");
+            if(app.exportKind==="pages" || (app.exportKind==="document" && app.exportContext && app.exportContext.pageEdits))return qsTr("Save Edited Copy");
+            if(app.exportKind==="annotations" || app.exportKind==="document")return qsTr("Save Annotated Copy");
+            return qsTr("Save a copy");
+        }
         nameFilters: app.exportKind==="annotation-text" ? [qsTr("Markdown (*.md)"),qsTr("CSV (*.csv)")] : app.exportKind === "bibtex" ? [qsTr("BibTeX (*.bib)")] : app.exportKind === "markdown" ? [qsTr("Markdown (*.md)")] : app.exportKind === "csv" ? [qsTr("CSV (*.csv)")] : [qsTr("PDF documents (*.pdf)")]
         defaultSuffix: app.exportKind==="annotation-text" ? (selectedNameFilter.index===1 ? "csv" : "md") : app.exportKind==="markdown" ? "md" : app.exportKind==="csv" ? "csv" : app.exportKind==="bibtex" ? "bib" : "pdf"
         onAccepted: {
