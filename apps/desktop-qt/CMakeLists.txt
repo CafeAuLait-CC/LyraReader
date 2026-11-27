@@ -39,6 +39,7 @@ target_sources(lyrareader_shell PRIVATE src/ContentDragItem.cpp src/ContentDragI
     src/ReaderWindowFactory.cpp src/ReaderWindowFactory.h src/LocalFileIdentity.cpp src/LocalFileIdentity.h)
 target_sources(lyrareader_shell PRIVATE src/RenderTrace.cpp src/RenderTrace.h)
 target_sources(lyrareader_shell PRIVATE src/RecentCoverCache.cpp src/RecentCoverCache.h)
+target_sources(lyrareader_shell PRIVATE src/WindowGeometryActivity.cpp src/WindowGeometryActivity.h)
 target_include_directories(lyrareader_shell PUBLIC src)
 target_sources(lyrareader_shell PRIVATE src/ReaderDocumentReading.cpp src/ReaderRegionPersistence.cpp)
 target_sources(lyrareader_shell PRIVATE src/FileDialogNavigation.cpp src/FileDialogNavigation.h)

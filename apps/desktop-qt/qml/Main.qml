@@ -56,6 +56,8 @@ ApplicationWindow {
     property string appearance: session ? session.preference("appearance", "light") : "light"
     property bool reduceMotion:session ? !!session.preference("reduceMotion",false) : false
     onReduceMotionChanged:if(session)session.setPreference("reduceMotion",reduceMotion)
+    WindowGeometryActivity { id: geometryActivity; window: root }
+    readonly property bool windowGeometryChanging: geometryActivity.active
     property string sidebarTab: "thumbnails"
     property string aiPanelMode:"assistant"
     property bool aiPanelVisible: false
@@ -156,7 +158,7 @@ ApplicationWindow {
     onAiPanelVisibleChanged: if (!aiPanelVisible) returnFocusFromAiPanel()
     // Restore and the first fit use settled chrome geometry, independently of
     // animation frames. User-initiated panel toggles animate after restoration.
-    readonly property bool immediatePanelLayout: reduceMotion || positionRestoring
+    readonly property bool immediatePanelLayout: reduceMotion || positionRestoring || windowGeometryChanging
     readonly property bool sidePanelMotionActive: leftDrawer.moving || editDrawer.moving || fillDrawer.moving || searchDrawer.moving || aiDrawer.moving
     function toggleAiWorkspace(value) {
         const notes = value === "notes";

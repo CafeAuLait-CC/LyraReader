@@ -1,6 +1,7 @@
 #include <QEventLoop>
 #include <QEasingCurve>
 #include "DisplayCalibration.h"
+#include "WindowGeometryActivity.h"
 #include "ReadingTextGeometry.h"
 #include "ReadingMarkdown.h"
 #include "ReadingScrollMemory.h"
@@ -74,6 +75,7 @@
 #include <QTextTable>
 #include <QRegularExpression>
 #include <QQmlProperty>
+#include <QMetaProperty>
 #include <QSGRendererInterface>
 #include <QSettings>
 #include <QTemporaryDir>
@@ -205,6 +207,7 @@ static void registerReaderTypes() {
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
+    qmlRegisterType<WindowGeometryActivity>("LyraReader",1,0,"WindowGeometryActivity");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<AuxiliaryWindowOwner>("LyraReader",1,0,"AuxiliaryWindowOwner");
     qmlRegisterType<PageItem>("LyraReader",1,0,"PdfPage");
@@ -3740,6 +3743,95 @@ private slots:
         if(QTest::currentTestFailed())return;
         auto *paper=view.window->property("regionPaper").value<QObject *>();QVERIFY(paper);
         check(paper->property("revealAnimation").value<QObject *>(),220,true);
+    }
+
+    void nativeGeometryActivitySettlesHiddenWindowsAndRejectsOldTargets() {
+        QWindow first,second;
+        WindowGeometryActivity activity,independent;
+        activity.setWindow(&first);independent.setWindow(&second);
+        QVERIFY(!first.isVisible() && !second.isVisible());
+        first.resize(640,480);QVERIFY(activity.active());QVERIFY(!independent.active());
+        // There is no Qt Quick surface or animation frame for these windows.
+        QTRY_VERIFY(!activity.active());
+        first.resize(641,480);QVERIFY(activity.active());
+        activity.setWindow(&second);QVERIFY(!activity.active());
+        first.resize(642,480);QVERIFY(!activity.active());
+        activity.setWindow(&first);first.resize(643,480);QVERIFY(activity.active());
+        bool resizeWhenRebound=true;
+        const auto reentrant=connect(&activity,&WindowGeometryActivity::activeChanged,&activity,[&] {
+            if(resizeWhenRebound && !activity.active() && activity.window()==&second) {
+                resizeWhenRebound=false;second.resize(700,500);
+            }
+        });
+        activity.setWindow(&second);QVERIFY(!resizeWhenRebound);
+        QVERIFY(activity.active());QVERIFY(independent.active());disconnect(reentrant);
+        activity.setWindow(nullptr);QVERIFY(!activity.active());
+        QTRY_VERIFY(!independent.active());
+        auto *temporary=new QWindow;activity.setWindow(temporary);
+        temporary->resize(500,400);QVERIFY(activity.active());
+        delete temporary;QVERIFY(!activity.window());QVERIFY(!activity.active());
+        second.resize(701,500);QVERIFY(independent.active());
+        QTRY_VERIFY(!independent.active());QVERIFY(!activity.active());
+        auto *parent=new QWindow;QPointer<WindowGeometryActivity> child=new WindowGeometryActivity(parent);
+        child->setWindow(parent);parent->resize(600,400);QVERIFY(child->active());
+        delete parent;QVERIFY(!child);
+        QWindow target;QPointer<WindowGeometryActivity> destroyed=new WindowGeometryActivity;
+        destroyed->setWindow(&target);
+        connect(destroyed.data(),&WindowGeometryActivity::activeChanged,&target,[&] {
+            if(destroyed && !destroyed->active())delete destroyed.data();
+        });
+        target.resize(610,410);QVERIFY(destroyed && destroyed->active());
+        destroyed->setWindow(nullptr);QVERIFY(!destroyed);
+    }
+
+    void windowSizeChangesFinishChromeMotionBeforeTheNextFrame_data() {
+        QTest::addColumn<QString>("target");
+        for(const auto &name:{"left","right-ai","secondary"})QTest::newRow(name)<<QString(name);
+    }
+    void windowSizeChangesFinishChromeMotionBeforeTheNextFrame() {
+        QFETCH(QString,target);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        window->resize(1600,900);window->setProperty("reduceMotion",true);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(settleReaderViewport(window));QTRY_VERIFY(!window->property("windowGeometryChanging").toBool());
+        const auto show=[&](bool visible) {
+            if(target=="left")return window->setProperty("sidebarVisible",visible);
+            if(target=="secondary")return window->setProperty("secondaryRow",visible?"annotate":"");
+            return QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,visible));
+        };
+        auto *item=visualItem(window->contentItem(),target=="left"?"leftSidebarDrawer":target=="right-ai"?"aiSidebarDrawer":"secondaryTools");QVERIFY(item);
+        auto *animation=item->property(target=="secondary"?"revealAnimation":"animation").value<QObject *>();QVERIFY(animation);
+        const auto moving=[&]{return target=="secondary"?animation->property("running").toBool():item->property("moving").toBool();};
+        QVERIFY(show(false));QTRY_VERIFY(!moving());window->setProperty("reduceMotion",false);
+        QVERIFY(show(true));QTRY_VERIFY(moving());
+        if(target=="secondary") {
+            const auto running=animation->metaObject()->property(animation->metaObject()->indexOfProperty("running"));
+            QVERIFY(running.hasNotifySignal());QSignalSpy continuity(animation,running.notifySignal());QVERIFY(continuity.isValid());
+            QVERIFY(window->setProperty("secondaryRow","edit"));
+            QCOMPARE(continuity.size(),0);QVERIFY(moving());
+        }
+        // X11 confirms a client resize asynchronously. Hold the actual animation
+        // so natural completion cannot hide a missed resize notification.
+        QVERIFY(QMetaObject::invokeMethod(animation,"pause"));QVERIFY(moving());
+        const auto before=window->size();bool observed=false,snapped=false,activeAtResize=false;
+        const auto sample=[&] {
+            if(observed || window->size()==before)return;
+            observed=true;activeAtResize=window->property("windowGeometryChanging").toBool();snapped=!moving();
+        };
+        const auto width=connect(window,&QWindow::widthChanged,window,sample,Qt::DirectConnection);
+        const auto height=connect(window,&QWindow::heightChanged,window,sample,Qt::DirectConnection);
+        const auto stopObserving=qScopeGuard([&]{disconnect(width);disconnect(height);});
+        window->resize(window->width()-73,window->height()-27);
+        QTRY_VERIFY2(observed,"The window manager must report a real logical size change");
+        QVERIFY2(snapped,"A confirmed window size change must finish the active transition before the next scene frame");
+        QVERIFY(activeAtResize);animation->setProperty("paused",false);
+        if(target=="secondary")QCOMPARE(item->height(),46.);
+        else QCOMPARE(item->width(),item->property("panelWidth").toDouble());
+        QTRY_VERIFY(!window->property("windowGeometryChanging").toBool());
+        QVERIFY(show(false));QTRY_VERIFY(moving());
+        window->setProperty("reduceMotion",true);QVERIFY(!moving());
     }
 
     void sidePanelDrawersKeepFixedContentAndPauseRasterDemand_data() {

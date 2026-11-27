@@ -1,4 +1,5 @@
 #include "DisplayCalibration.h"
+#include "WindowGeometryActivity.h"
 #include "ReadingTextGeometry.h"
 #include "ReadingMarkdown.h"
 #include "ReadingScrollMemory.h"
@@ -85,6 +86,7 @@ int main(int argc, char **argv) {
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");
+    qmlRegisterType<WindowGeometryActivity>("LyraReader",1,0,"WindowGeometryActivity");
     qmlRegisterType<AuxiliaryWindowPolicy>("LyraReader",1,0,"AuxiliaryWindowPolicy");
     qmlRegisterType<AuxiliaryWindowOwner>("LyraReader",1,0,"AuxiliaryWindowOwner");
     qmlRegisterType<PageItem>("LyraReader", 1, 0, "PdfPage");

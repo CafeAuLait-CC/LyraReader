@@ -8,23 +8,37 @@ Item {
     readonly property NumberAnimation revealAnimation: heightReveal
     readonly property string requestedRow: app.currentReader.pageCount > 0 && !app.overviewVisible && !app.textViewVisible ? app.secondaryRow : ""
     property string presentedRow: ""
-    onRequestedRowChanged: if (requestedRow.length) presentedRow = requestedRow
-    Component.onCompleted: presentedRow = requestedRow
+    property bool initialized: false
+    function move() {
+        if (!initialized) return;
+        const target = requestedRow.length ? rowHeight : 0;
+        // Swapping one open tool row for another preserves the reveal already
+        // in flight, like the Mac animation keyed by row visibility.
+        if (!app.immediatePanelLayout && heightReveal.running && heightReveal.to === target) return;
+        heightReveal.stop();
+        if (app.immediatePanelLayout || Math.abs(height - target) < .000001) height = target;
+        else { heightReveal.to = target; heightReveal.start(); }
+    }
+    onRequestedRowChanged: { if (requestedRow.length) presentedRow = requestedRow; move(); }
+    Component.onCompleted: {
+        presentedRow = requestedRow;
+        height = requestedRow.length ? rowHeight : 0;
+        initialized = true;
+    }
+    Connections { target: rows.app; function onImmediatePanelLayoutChanged() { rows.move(); } }
     readonly property int rowHeight: 46
-    height: requestedRow.length ? rowHeight : 0
     visible: requestedRow.length > 0 || height > 0
     enabled: requestedRow.length > 0
     Accessible.ignored: !enabled
     clip: true
-    Behavior on height {
-        enabled: !rows.app.reduceMotion
-        NumberAnimation {
-            id: heightReveal
-            objectName: "secondaryRowRevealMotion"
-            duration: 180
-            easing.type: Easing.BezierSpline
-            easing.bezierCurve: [0, 0, .58, 1, 1, 1]
-        }
+    NumberAnimation {
+        id: heightReveal
+        objectName: "secondaryRowRevealMotion"
+        target: rows
+        property: "height"
+        duration: 180
+        easing.type: Easing.BezierSpline
+        easing.bezierCurve: [0, 0, .58, 1, 1, 1]
     }
     // Reveal above the reader without changing its viewport or the adjoining panels.
     Item {
