@@ -39,7 +39,7 @@ qulonglong &readingPresetRevision() {static qulonglong revision=0;return revisio
 qulonglong &regionStyleRevision() {static qulonglong revision=0;return revision;}
 // UI-owned retry state: a failed settings flush must not turn a later same-value
 // Save into a no-op before the native readers have received the durable value.
-bool &outputLanguagePublicationPending() {static bool pending=false;return pending;}
+QSet<QString> &readingWorkflowPublicationPending() {static QSet<QString> pending;return pending;}
 QVariantList normalizedRecents(const QVariantList &entries) {
     QVariantList result;QSet<QString> seen;
     for(const auto &value:entries) {
@@ -608,41 +608,76 @@ QVariant WorkspaceController::aiOutputLanguage() const {
     // a normal empty-language preference. The settings UI diagnoses them.
     return settings.contains(key) ? settings.value(key) : QVariant(QString{});
 }
-bool WorkspaceController::setAiOutputLanguage(const QString &language) {
-    const auto previous=aiOutputLanguage();
-    // An undecodable stored value cannot be restored faithfully through QVariant
-    // after a failed flush. Keep its original representation until recovery.
-    if(!previous.isValid())return false;
-    if(previous.metaType()==QMetaType::fromType<QString>() && previous.toString()==language
-        && !outputLanguagePublicationPending())return true;
+QVariant WorkspaceController::aiReviewBeforeSending() const {
     QSettings settings;
-    const QString key=QStringLiteral("reader/preferences/aiOutputLanguage");
-    const bool existed=settings.contains(key);
-    settings.setValue(key,language);
+    const QString key=QStringLiteral("reader/preferences/aiReviewBeforeSending");
+    // Keep the existing Linux preview-first workflow until the user opts out.
+    return settings.contains(key) ? settings.value(key) : QVariant(true);
+}
+bool WorkspaceController::setAiOutputLanguage(const QString &language) {
+    return setAiReadingWorkflow({{QStringLiteral("outputLanguage"),language}});
+}
+bool WorkspaceController::setAiReviewBeforeSending(bool enabled) {
+    return setAiReadingWorkflow({{QStringLiteral("reviewBeforeSending"),enabled}});
+}
+bool WorkspaceController::setAiReadingWorkflow(const QVariantMap &changes) {
+    struct Change {QString field,key;QVariant previous,value;bool existed;};
+    QList<Change> writes;
+    QSettings settings;
+    auto &pending=readingWorkflowPublicationPending();
+    for(auto it=changes.cbegin();it!=changes.cend();++it) {
+        QString name;QVariant fallback;
+        if(it.key()==QStringLiteral("outputLanguage")){name=QStringLiteral("aiOutputLanguage");fallback=QString{};}
+        else if(it.key()==QStringLiteral("reviewBeforeSending")){name=QStringLiteral("aiReviewBeforeSending");fallback=true;}
+        else return false;
+        if(it.value().metaType()!=fallback.metaType())return false;
+        const auto key=QStringLiteral("reader/preferences/")+name;
+        const bool existed=settings.contains(key);
+        const auto previous=existed ? settings.value(key) : fallback;
+        // Undecodable representations cannot be restored through QVariant after
+        // a failed flush. Protect them before changing any key in this Save.
+        if(!previous.isValid())return false;
+        if(previous.metaType()==it.value().metaType() && previous==it.value() && !pending.contains(key))continue;
+        writes.append({it.key(),key,previous,it.value(),existed});
+    }
+    if(writes.isEmpty())return true;
+    for(const auto &write:writes)settings.setValue(write.key,write.value);
     settings.sync();
     if(settings.status()!=QSettings::NoError) {
-        outputLanguagePublicationPending()=true;
-        // QSettings keeps pending writes in its shared process cache even when
-        // the atomic disk flush fails. Restore decodable values or absence so
-        // another settings window cannot mistake an unsaved draft for a save.
-        if(existed && previous.isValid())settings.setValue(key,previous);
-        else if(!existed)settings.remove(key);
+        // Restore the shared QSettings cache as well as leaving the failed atomic
+        // disk replacement untouched. A later retry must still flush and publish.
+        for(const auto &write:writes) {
+            pending.insert(write.key);
+            if(write.existed)settings.setValue(write.key,write.previous);
+            else settings.remove(write.key);
+        }
         return false;
     }
-    outputLanguagePublicationPending()=false;
+    bool language=false,review=false;
+    for(const auto &write:writes) {
+        pending.remove(write.key);
+        language|=write.field==QStringLiteral("outputLanguage");
+        review|=write.field==QStringLiteral("reviewBeforeSending");
+    }
     QList<QPointer<WorkspaceController>> recipients;
     for(auto *workspace:workspaces())recipients.append(workspace);
     for(const auto &workspace:recipients)if(workspace) {
-        QList<QPointer<ReaderController>> readers;
-        for(auto *reader:workspace->m_tabs)readers.append(reader);
-        for(const auto &reader:readers) {
-            if(!workspace)break;
-            if(reader)reader->setDefaultAiOutputLanguage(language);
+        if(language) {
+            QList<QPointer<ReaderController>> readers;
+            for(auto *reader:workspace->m_tabs)readers.append(reader);
+            for(const auto &reader:readers) {
+                if(!workspace)break;
+                // A signal listener may have saved a newer value reentrantly.
+                const auto current=workspace->aiOutputLanguage();
+                if(reader && current.metaType()==QMetaType::fromType<QString>())reader->setDefaultAiOutputLanguage(current.toString());
+            }
+            if(workspace)emit workspace->aiOutputLanguageChanged();
         }
-        if(workspace)emit workspace->aiOutputLanguageChanged();
+        if(workspace && review)emit workspace->aiReviewBeforeSendingChanged();
     }
     return true;
 }
+
 QVariant WorkspaceController::preference(const QString &key,const QVariant &fallback) const {
     QSettings settings;
     const auto plainFallback=fallback.metaType()==QMetaType::fromType<QJSValue>() ? fallback.value<QJSValue>().toVariant() : fallback;

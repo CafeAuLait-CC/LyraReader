@@ -25,6 +25,9 @@ ApplicationWindow {
     property var initialOutputLanguage:""
     property bool outputLanguageEdited:false
     property string outputLanguageSaveError:""
+    property var initialReviewBeforeSending:true
+    property bool reviewBeforeSendingEdited:false
+    readonly property bool unknownReviewBeforeSending:typeof initialReviewBeforeSending!=="boolean" && !reviewBeforeSendingEdited
     readonly property bool unknownOutputLanguage:typeof initialOutputLanguage!=="string" && !outputLanguageEdited
     readonly property var generationSeeds:app.session ? app.session.generationDefaults() : ({valid:false})
     readonly property bool generationSeedsReady:!!generationSeeds.valid && validTemperature(generationSeeds.temperature) && validMaxTokens(generationSeeds.max_tokens)
@@ -94,6 +97,10 @@ ApplicationWindow {
         initialOutputLanguage=app.session ? app.session.aiOutputLanguage : "";
         outputLanguage.text=typeof initialOutputLanguage==="string" ? initialOutputLanguage : "";
         outputLanguageEdited=false;outputLanguageSaveError="";
+        initialReviewBeforeSending=app.session ? app.session.aiReviewBeforeSending : true;
+        reviewBeforeSending.checkState=typeof initialReviewBeforeSending==="boolean"
+            ? (initialReviewBeforeSending ? Qt.Checked : Qt.Unchecked) : Qt.PartiallyChecked;
+        reviewBeforeSendingEdited=false;
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
         if(!policy.prepare(settings,app,saved,560,650)){auditOnOpen=false;app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
@@ -160,10 +167,17 @@ ApplicationWindow {
         if(reasoningBlocksSave)return;
         const languageChanged=outputLanguageEdited
             && (typeof initialOutputLanguage!=="string" || outputLanguage.text!==initialOutputLanguage);
-        if(languageChanged && (!app.session || !app.session.setAiOutputLanguage(outputLanguage.text))) {
-            outputLanguageSaveError=initialOutputLanguage===undefined || initialOutputLanguage===null
+        const reviewChanged=reviewBeforeSendingEdited
+            && (typeof initialReviewBeforeSending!=="boolean" || reviewBeforeSending.checked!==initialReviewBeforeSending);
+        const workflow={};
+        if(languageChanged)workflow.outputLanguage=outputLanguage.text;
+        if(reviewChanged)workflow.reviewBeforeSending=reviewBeforeSending.checked;
+        if(Object.keys(workflow).length && (!app.session || !app.session.setAiReadingWorkflow(workflow))) {
+            outputLanguageSaveError=languageChanged && (initialOutputLanguage===undefined || initialOutputLanguage===null)
                 ? qsTr("The saved output language could not be read and was kept. Recover the saved preference before replacing it.")
-                : qsTr("The output language could not be saved. The stored value was kept; try again when saving is available.");
+                : reviewChanged && (initialReviewBeforeSending===undefined || initialReviewBeforeSending===null)
+                    ? qsTr("The saved review preference could not be read and was kept. Recover it before replacing it.")
+                    : qsTr("The reading workflow could not be saved. The stored values were kept; try again when saving is available.");
             return;
         }
         const selectedPaper=app.readingPresets[paper.currentIndex];
@@ -206,6 +220,12 @@ ApplicationWindow {
     Connections {target:settings.app;function onAiSettingsChanged(){if(settings.connectionTest)settings.connectionTest.cancel();}}
     Connections {
         target:settings.app.session
+        function onAiReviewBeforeSendingChanged() {
+            if(settings.reviewBeforeSendingEdited)return;
+            settings.initialReviewBeforeSending=settings.app.session.aiReviewBeforeSending;
+            reviewBeforeSending.checkState=typeof settings.initialReviewBeforeSending==="boolean"
+                ? (settings.initialReviewBeforeSending ? Qt.Checked : Qt.Unchecked) : Qt.PartiallyChecked;
+        }
         function onAiOutputLanguageChanged() {
             // A Wayland open intent can still be waiting for its parent's first frame.
             if(settings.outputLanguageEdited)return;
@@ -338,6 +358,25 @@ ApplicationWindow {
                 }
                 Button {objectName:"openAuditTrail";text:qsTr("Local audit trail…");onClicked:auditDialog.open()}
                 Label {text:qsTr("Reading workflow");font.weight:Font.DemiBold;textFormat:Text.PlainText;Layout.topMargin:8}
+                LyraCheckBox {
+                    id:reviewBeforeSending
+                    objectName:"settingsAiReviewBeforeSending"
+                    colors:settings.colors
+                    text:qsTr("Review before sending")
+                    tristate:settings.unknownReviewBeforeSending
+                    Accessible.description:settings.unknownReviewBeforeSending
+                        ? qsTr("Unrecognized saved review preference. Choose a value to replace it.")
+                        : checked ? qsTr("Review tasks in a separate window before sending.")
+                            : qsTr("Generate and Ask send their prepared task directly.")
+                    onClicked:{settings.reviewBeforeSendingEdited=true;settings.outputLanguageSaveError="";}
+                }
+                Label {
+                    Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText
+                    text:settings.unknownReviewBeforeSending
+                        ? qsTr("The saved review preference is unrecognized and is kept until you choose a value. Tasks require review in the meantime.")
+                        : qsTr("Review sidebar tasks and Interleaf questions in a separate window. When off, Generate or Ask sends directly. Applies when you save.")
+                    font.pixelSize:11;color:settings.unknownReviewBeforeSending ? settings.colors.warningFg : settings.colors.textSecondary
+                }
                 Label {text:qsTr("Output language (blank uses document language)");textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true}
                 ReadingTextField {
                     id:outputLanguage
@@ -357,9 +396,9 @@ ApplicationWindow {
                 Label {
                     objectName:"settingsOutputLanguageIssue"
                     Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;font.pixelSize:11
-                    visible:settings.unknownOutputLanguage || settings.outputLanguageSaveError.length>0
+                    visible:settings.unknownOutputLanguage
                     color:settings.colors.errorFg
-                    text:settings.outputLanguageSaveError || qsTr("The saved output language is unrecognized. Enter a language, or clear the field, to replace it. Other settings keep the saved value.")
+                    text:qsTr("The saved output language is unrecognized. Enter a language, or clear the field, to replace it. Other settings keep the saved value.")
                 }
                 Label {text:qsTr("Use AI with");textFormat:Text.PlainText}
                 LyraReadingSegmentedPicker {
@@ -672,6 +711,14 @@ ApplicationWindow {
             }
         }
 
+        Label {
+            objectName:"settingsWorkflowSaveIssue"
+            Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText
+            visible:settings.outputLanguageSaveError.length>0
+            text:settings.outputLanguageSaveError
+            color:settings.colors.errorFg
+            Accessible.role:Accessible.AlertMessage
+        }
         DialogButtonBox {
             id:settingsButtons
             Layout.fillWidth:true

@@ -9,33 +9,35 @@ Popup {
     required property var task
     property var ticket: null
     property var closingTicket: null
-    property var reviewTicket: null
+    property var sendIntent: null
     property string workerId: ""
     property var frozenState: null
     readonly property var reader: ticket ? ticket.reader : null
     readonly property var controller: reader ? reader.readingTerm : null
     readonly property var state: frozenState || (controller ? controller.state : ({}))
     readonly property bool current: !!ticket && !!reader && reader === app.currentReader && ticket.generation === reader.documentGeneration
-    readonly property bool ownsWorker: current && !!workerId && controller.state.request_id === workerId
+    readonly property bool ownsWorker: current && !!workerId && !!controller && controller.state.request_id === workerId
     readonly property bool busy: ["preparing", "starting", "running"].indexOf(state.phase) >= 0
-    readonly property bool anyVisible: visible || review.visible
+    readonly property bool reviewing: !!app.aiTaskReviewTicket && app.aiTaskReviewTicket.reader===reader
+        && app.aiTaskReviewTicket.purpose==="term"
+    readonly property bool anyVisible: visible || reviewing
     parent: Overlay.overlay
     width: Math.max(120, Math.min(340, parent ? parent.width - 16 : 340))
     height: Math.max(160, Math.min(300, parent ? parent.height - 16 : 300))
     padding: 16; focus: true; modal: false
-    closePolicy: Popup.CloseOnEscape | (review.visible ? Popup.NoAutoClose : Popup.CloseOnPressOutside)
+    closePolicy: Popup.CloseOnEscape | (reviewing ? Popup.NoAutoClose : Popup.CloseOnPressOutside)
     background: Rectangle {radius: 8; color: app.colors.panelBg; border.color: app.colors.separator}
     enter: Transition {NumberAnimation {property: "opacity"; from: 0; to: 1; duration: app.reduceMotion ? 0 : 100}}
     exit: Transition {NumberAnimation {property: "opacity"; from: 1; to: 0; duration: app.reduceMotion ? 0 : 80}}
     function openFor(owner, generation, request, anchor, sourceRow) {
         if (!owner || owner !== app.currentReader || owner.documentGeneration !== generation || !parent) return false;
-        review.close();
+        app.cancelAiTaskReview(reader,"term");
         if (ownsWorker) controller.dismiss();
         frozenState = null; workerId = "";
         ticket = {reader: owner, generation: generation, request: request, anchor: anchor, sourceRow: sourceRow,
             record: sourceRow ? sourceRow.recordId : ""};
         const active = ticket;
-        closingTicket = null; reviewTicket = null;
+        closingTicket = null; sendIntent = {owner:active,workflowRevision:app.aiReviewRevision};
         const point = anchor ? anchor.mapToItem(parent, 0, anchor.height) : Qt.point(parent.width / 2, parent.height / 2);
         x = Math.max(8, Math.min(parent.width - width - 8, point.x));
         y = Math.max(8, Math.min(parent.height - height - 8, point.y));
@@ -43,19 +45,23 @@ Popup {
         if (!controller.prepare(request)) { close(); return false; }
         if (ticket !== active) return false;
         ticket.worker = controller.state.request_id; workerId = ticket.worker;
+        Qt.callLater(finishUiRequest);
         return true;
+    }
+    onOpened: if(sendIntent)Qt.callLater(finishUiRequest)
+    function finishUiRequest() {
+        const intent=sendIntent;
+        if(!intent)return;
+        if(intent.owner!==ticket || !current || intent.workflowRevision!==app.aiReviewRevision) {
+            sendIntent=null;return;
+        }
+        if(!opened || busy)return;
+        sendIntent=null;
+        showReview();
     }
     function showReview() {
         if (!ownsWorker || !opened || state.phase !== "preview" || !state.plan) return;
-        reviewTicket = {owner: ticket, plan: state.plan};
-        review.open();
-    }
-    function sendReviewed() {
-        const approved = reviewTicket;
-        if (!opened || !review.opened || !ownsWorker || !approved || approved.owner !== ticket || state.phase !== "preview"
-                || !state.plan || state.plan.term_token !== approved.plan.term_token) return;
-        app.sendAi(reader, approved.plan, "term");
-        review.close();
+        app.dispatchAiTaskFromUi(reader,state.plan,"term");
     }
     function followCitation(link) {
         if (current) task.panel.followVerifiedPage(link, state.sent_pages || [], ticket.generation);
@@ -63,7 +69,7 @@ Popup {
     onAboutToHide: {
         closingTicket = ticket;
         frozenState = controller ? controller.state : ({});
-        review.close();
+        sendIntent=null;app.cancelAiTaskReview(reader,"term");
         if (ownsWorker) {
             app.abandonTermCredential(reader, state.plan);
             // Retire admission immediately; keep the displayed answer during the short fade.
@@ -74,7 +80,7 @@ Popup {
         if (closingTicket !== ticket) return;
         const previous = ticket;
         if (controller && previous && previous.worker && controller.state.request_id === previous.worker) controller.cancel();
-        ticket = null; reviewTicket = null; workerId = ""; frozenState = null;
+        ticket = null; sendIntent = null; workerId = ""; frozenState = null;
         if (previous && previous.reader && previous.anchor && previous.reader === app.currentReader
                 && previous.generation === previous.reader.documentGeneration && previous.anchor.visible
                 && (!previous.sourceRow || previous.sourceRow.recordId === previous.record))
@@ -99,6 +105,7 @@ Popup {
         target: popup.controller
         function onChanged() {
             if (popup.ticket && popup.workerId && !popup.frozenState && popup.controller.state.request_id !== popup.workerId) popup.close();
+            if(popup.sendIntent)Qt.callLater(popup.finishUiRequest);
         }
     }
     contentItem: ColumnLayout {
@@ -144,50 +151,10 @@ Popup {
         }
         ReadingPrimaryButton {
             objectName: "reviewAiTermRequest"
-            app: popup.app; text: qsTr("Review request…"); Layout.fillWidth: true
+            app: popup.app; text: popup.app.requiresAiTaskReview ? qsTr("Review request…") : qsTr("Send request"); Layout.fillWidth: true
             visible: popup.state.phase === "preview"
             enabled: popup.ownsWorker && popup.opened && !!popup.state.plan
             onClicked: popup.showReview()
-        }
-    }
-    Dialog {
-        id: review
-        objectName: "aiTermReview"
-        parent: Overlay.overlay
-        title: qsTr("Review term explanation")
-        modal: true; focus: true; padding: 16
-        closePolicy: Popup.CloseOnEscape
-        width: Math.min(620, parent.width - 24); height: Math.min(560, parent.height - 24)
-        x: (parent.width - width) / 2; y: (parent.height - height) / 2
-        background: Rectangle {radius: 8; color: app.colors.panelBg; border.color: app.colors.separator}
-        contentItem: ColumnLayout {
-            spacing: 12
-            Label {
-                text: qsTr("Nothing has been sent. These are the exact request bodies.")
-                textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary
-            }
-            AiReadingScrollView {
-                id: reviewScroll
-                Layout.fillWidth: true; Layout.fillHeight: true
-                TextArea {
-                    objectName: "aiTermRequestBodies"
-                    text: popup.reviewTicket ? (popup.reviewTicket.plan.parts || []).map(part => part.wire_body).join("\n\n") : ""
-                    width: reviewScroll.availableWidth; readOnly: true; selectByMouse: true; selectByKeyboard: true
-                    wrapMode: TextEdit.Wrap; textFormat: TextEdit.PlainText; font.family: "monospace"; font.pixelSize: 11
-                    color: app.colors.textPrimary; background: null
-                    Accessible.name: qsTr("Exact term request bodies")
-                }
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Button {text: qsTr("Cancel"); onClicked: review.close()}
-                ReadingPrimaryButton {
-                    objectName: "sendAiTermRequest"
-                    app: popup.app; text: qsTr("Send"); Layout.fillWidth: true
-                    enabled: popup.ownsWorker && !!popup.reviewTicket && popup.reviewTicket.owner === popup.ticket && popup.state.phase === "preview"
-                    onClicked: popup.sendReviewed()
-                }
-            }
         }
     }
 }

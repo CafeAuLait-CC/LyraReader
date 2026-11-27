@@ -97,6 +97,7 @@ ApplicationWindow {
     }
     AiRegionCard {id:aiRegionCard;app:root}
     DocumentReading {id:documentReadingPopup;app:root}
+    AiTaskReviewWindow {id:aiTaskReview;app:root}
     function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
     function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"regions");}}
     function openReadingNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
@@ -498,6 +499,10 @@ ApplicationWindow {
     readonly property var aiOutputLanguageValue:session ? session.aiOutputLanguage : ""
     readonly property bool aiOutputLanguageValid:typeof aiOutputLanguageValue==="string"
     readonly property string defaultAiOutputLanguage:aiOutputLanguageValid ? aiOutputLanguageValue : ""
+    readonly property var aiReviewBeforeSendingValue:session ? session.aiReviewBeforeSending : true
+    readonly property bool aiReviewPreferenceKnown:typeof aiReviewBeforeSendingValue==="boolean"
+    readonly property bool requiresAiTaskReview:!aiReviewPreferenceKnown || aiReviewBeforeSendingValue
+    property int aiReviewRevision:0
     property var previousReader: null
     property var pendingPosition: null
     property var pendingLayoutPosition: null
@@ -617,7 +622,7 @@ ApplicationWindow {
         }
         if (closeApproved || closeOperation || closingTab!==-2 || pendingDocumentSave || printRequested || pendingAiReader || pendingAiPlan)
             return qsTr("Finish or cancel the pending window operation before moving this tab.");
-        if (fileDialog.visible || passwordDialog.visible || dialogs.tabTransferDialogVisible || aiContent.tabTransferDialogVisible || contentController.tabTransferDialogVisible || fillTools.tabTransferDialogVisible || pageExports.visible || pageExports.tabTransferDialogVisible || regionNotes.tabTransferDialogVisible || redactionReview.visible || documentReadingPopup.visible || aiRegionCard.visible || regionNotes.visible)
+        if (fileDialog.visible || passwordDialog.visible || aiTaskReview.ticket || dialogs.tabTransferDialogVisible || aiContent.tabTransferDialogVisible || contentController.tabTransferDialogVisible || fillTools.tabTransferDialogVisible || pageExports.visible || pageExports.tabTransferDialogVisible || regionNotes.tabTransferDialogVisible || redactionReview.visible || documentReadingPopup.visible || aiRegionCard.visible || regionNotes.visible)
             return qsTr("Close the open dialog or panel before moving this tab. Its input stays here.");
         if (placedTextController.active || placedTextController.waitingForCreation || contentController.inlineEditing || contentController.gesture || contentController.pending || contentController.transition || contentController.imageRequest || contentController.imageExportRequest || contentController.rasterRequest || annotationDraft || redactionDraft || eraseDraft.length || eraserToken.length || regionSelecting || readerChrome.tabDragActive || fillTool.length || annotationTool!=="select" || (activeFocusItem && activeFocusItem.inputMethodComposing))
             return qsTr("Finish or cancel the active edit or tool before moving this tab.");
@@ -808,6 +813,7 @@ ApplicationWindow {
         if (wholeWindow) Qt.callLater(function () { root.close(); });
     }
     onClosing: function (event) {
+        aiTaskReview.cancel();++aiReviewRevision;
         if (closeApproved) return;
         if (session && (session.tabTransferInProgress || readerChrome.nativeTabToken.length)) {event.accepted=false;return;}
         if (session && session.quitCoordinator.busy) {event.accepted=false;return;}
@@ -2139,6 +2145,41 @@ ApplicationWindow {
         }
         return true;
     }
+    function sameAiReviewPlan(first, second) {
+        // This only retires stale UI intent. Native start remains the authority
+        // for source, connection and exact request-plan validation.
+        return !!first && !!second && JSON.stringify(first)===JSON.stringify(second);
+    }
+    function aiTaskReviewIsCurrent(ticket) {
+        if(!ticket || !ticket.reader || ticket.reader!==currentReader
+                || ticket.generation!==ticket.reader.documentGeneration
+                || ticket.workflowRevision!==aiReviewRevision
+                || closeApproved || closeOperation || closingTab!==-2 || dialogs.closePromptVisible)return false;
+        if(ticket.purpose==="document-reading") {
+            const state=ticket.reader.documentReading;
+            return state.phase==="preview" && state.token===ticket.token && sameAiReviewPlan(state.plan,ticket.plan);
+        }
+        if(ticket.purpose==="term") {
+            const state=ticket.reader.readingTerm.state;
+            return state.phase==="preview" && sameAiReviewPlan(state.plan,ticket.plan);
+        }
+        const state=ticket.reader.aiState;
+        return !state.running && !state.planSent && sameAiReviewPlan(state.plan,ticket.plan);
+    }
+    function dispatchAiTaskFromUi(owner, plan, purpose, token) {
+        const ticket={reader:owner,plan:plan,generation:owner ? owner.documentGeneration : 0,
+            purpose:purpose || "assistant",token:token || "",workflowRevision:aiReviewRevision};
+        if(!aiTaskReviewIsCurrent(ticket)) {
+            operationStatus=qsTr("The task changed. Prepare it again before sending.");return;
+        }
+        if(requiresAiTaskReview)aiTaskReview.open(ticket);
+        else sendAi(owner,plan,ticket.purpose,ticket.token);
+    }
+    readonly property var aiTaskReviewTicket:aiTaskReview ? aiTaskReview.ticket : null
+    function cancelAiTaskReview(owner,purpose) {
+        const ticket=aiTaskReview ? aiTaskReview.ticket : null;
+        if(ticket && ticket.reader===owner && ticket.purpose===purpose)aiTaskReview.cancel();
+    }
     function startPreparedAi(owner,key,plan,purpose,token) {
         if(!owner || !refreshAiConnection() || !owner || !aiConnectionMatches(plan))return false;
         if(purpose==="term")return owner.startAiTerm(key,plan);
@@ -2995,12 +3036,18 @@ ApplicationWindow {
     }
     Connections {
         target: root.session
+        function onAiReviewBeforeSendingChanged() {
+            ++root.aiReviewRevision;
+            root.credentialReadId=-1;
+            if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
+            root.pendingAiReader=null;root.pendingAiPlan=null;root.pendingAiToken="";
+        }
         function onAiOutputLanguageChanged() {
             const owner=root.pendingAiReader;
             if(!owner)return;
             const view=owner.aiState.previewView;
             const affected=root.pendingAiPurpose==="document-reading"
-                || (root.pendingAiPurpose==="assistant" && ["summary","note","region_note"].indexOf(view)>=0);
+                || (["assistant","region"].indexOf(root.pendingAiPurpose)>=0 && ["summary","note","region_note"].indexOf(view)>=0);
             if(!affected)return;
             const currentPlan=root.pendingAiPurpose==="document-reading" ? owner.documentReading.plan : owner.aiState.plan;
             if(currentPlan && Object.keys(currentPlan).length>0)return;

@@ -24,7 +24,8 @@ Pane {
     readonly property bool referenceSummary: workspace === "summary" && !unitMode && !batchMode && (action === 1 || action === 5)
     readonly property bool referenceTranslation: workspace === "translation" && !input.inplace
     readonly property bool taskMenuOpen: (!!summaryTaskLoader.item && summaryTaskLoader.item.popupVisible) || (!!translationTaskLoader.item && translationTaskLoader.item.popupVisible) || (!!translationLanguagePicker && translationLanguagePicker.popupVisible)
-    readonly property bool payloadOpen: payload.visible
+    readonly property bool payloadOpen: payload.visible || (!!app.aiTaskReviewTicket
+        && app.aiTaskReviewTicket.reader===owner && app.aiTaskReviewTicket.purpose==="assistant")
     readonly property bool translateDocument: workspace === "translation" && (input.translationScope === "document" || (input.translationScope === undefined && !input.inplace))
     readonly property bool translateInPlace: workspace === "translation" && !translateDocument && !!input.inplace
     readonly property string summaryDetail: input.summaryDetail || "Standard"
@@ -57,6 +58,7 @@ Pane {
         if (reviewTicket) Qt.callLater(finishUiReview);
     }
     onVisibleChanged: if (!visible) {
+        reviewTicket=null;app.cancelAiTaskReview(owner,"assistant");
         if (summaryCatalog) summaryCatalog.close();
         if (selectionSource) selectionSource.close();
         if (translationHistory) translationHistory.close();
@@ -106,20 +108,23 @@ Pane {
         if (workspace !== "chat" && !referenceSummary && !referenceTranslation) { prepare(); return; }
         if (running) { owner.cancelAi(); return; }
         const selectedTask = selectedSummary || (referenceTranslation && !translateDocument);
-        if (previewReady && (!selectedTask || sameRange(preparedRange, liveRange))) { payload.open(); return; }
-        reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || ""};
+        if (previewReady && (!selectedTask || sameRange(preparedRange, liveRange))) { app.dispatchAiTaskFromUi(owner,plan); return; }
+        reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || "",
+            selectionBound:selectedTask, range:liveRange, workflowRevision:app.aiReviewRevision};
         prepare();
         Qt.callLater(finishUiReview);
     }
     function finishUiReview() {
         const ticket = reviewTicket;
         if (!ticket) return;
-        if (ticket.reader !== owner || ticket.generation !== ownerGeneration || ticket.view !== workspace || ticket.question !== (input.question || "")) {
+        if (ticket.reader !== owner || ticket.generation !== ownerGeneration || ticket.view !== workspace || ticket.question !== (input.question || "")
+                || ticket.workflowRevision !== app.aiReviewRevision
+                || (ticket.selectionBound && !sameRange(ticket.range,liveRange))) {
             reviewTicket = null; return;
         }
         if (owner.pendingCommands) return;
         reviewTicket = null;
-        if (previewReady) payload.open();
+        if (previewReady) app.dispatchAiTaskFromUi(owner,plan);
     }
     function keepInNotes(source) {
         if (!source || keepTicket || owner.pendingCommands || owner.readingNoteDraft.id) return;
@@ -168,7 +173,7 @@ Pane {
         if (!entry.selection) { request.action = "SummarizeDocument"; request.selection = null; }
         const accounts = app.session ? app.session.chatGptAccounts : null;
         if (accounts && !connectChatGpt(request, accounts, entry.selection ? accounts.useForSelection : accounts.useForWholeDocument)) return;
-        if (review) reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || ""};
+        if (review) reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || "", workflowRevision:app.aiReviewRevision};
         owner.prepareAi(request, {}, {kind: "translation", detail: "Standard", saved_translation: entry.id});
         if (review) Qt.callLater(finishUiReview);
     }
@@ -184,6 +189,7 @@ Pane {
         owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
     }
     onWorkspaceChanged: {
+        app.cancelAiTaskReview(owner,"assistant");
         taskHistoryShown = false; reviewTicket = null;
         if (chatHistory && workspace !== "chat") chatHistory.close();
         if (summaryCatalog && workspace !== "summary") summaryCatalog.close();

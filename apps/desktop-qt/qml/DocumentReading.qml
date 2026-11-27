@@ -16,6 +16,7 @@ Popup {
     padding:14;modal:false;focus:true;closePolicy:Popup.CloseOnEscape
     background:Rectangle {color:reading.app.colors.panelBg;border.color:reading.app.colors.separator;radius:8}
     onAboutToShow:{owner=app.currentReader;owner.dismissDocumentReadingChoice();}
+    onAboutToHide:app.cancelAiTaskReview(owner,"document-reading")
     onClosed:{payload.close();if(owner===app.currentReader)app.focusReadingView();}
     Connections {target:reading.app;function onCurrentReaderChanged(){if(reading.visible)reading.close();}}
     readonly property var accounts: app.session ? app.session.chatGptAccounts : null
@@ -89,7 +90,7 @@ Popup {
             onClicked:reading.prepareForConnection(true)
         }
         Button {objectName:"inspectDocumentReading";text:qsTr("Inspect Payload");Layout.fillWidth:true;visible:!!reading.plan;onClicked:payload.open()}
-        Button {objectName:"startDocumentReading";text:qsTr("Read in Background");Layout.fillWidth:true;visible:reading.state.phase==="preview";enabled:!!reading.owner && !reading.owner.pendingCommands;onClicked:reading.app.sendAi(reading.owner,reading.plan,"document-reading",reading.state.token)}
+        Button {objectName:"startDocumentReading";text:qsTr("Read in Background");Layout.fillWidth:true;visible:reading.state.phase==="preview";enabled:!!reading.owner && !reading.owner.pendingCommands;onClicked:reading.app.dispatchAiTaskFromUi(reading.owner,reading.plan,"document-reading",reading.state.token)}
         Button {objectName:"skipDocumentReading";text:qsTr("Continue Without Reading");Layout.fillWidth:true;visible:!reading.state.ready && reading.state.phase!=="reading" && reading.state.phase!=="starting";onClicked:{if(reading.owner)reading.owner.stopDocumentReading();reading.close();}}
         Button {objectName:"stopDocumentReading";text:qsTr("Stop Reading");Layout.fillWidth:true;visible:reading.busy;enabled:reading.state.phase!=="stopping";onClicked:reading.owner.stopDocumentReading()}
     }

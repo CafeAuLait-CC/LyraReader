@@ -23,6 +23,7 @@ class WorkspaceController : public QObject {
     Q_PROPERTY(CredentialStore *credentials READ credentials CONSTANT)
     Q_PROPERTY(ConnectionTestController *connectionTest READ connectionTest CONSTANT)
     Q_PROPERTY(QVariant aiOutputLanguage READ aiOutputLanguage NOTIFY aiOutputLanguageChanged)
+    Q_PROPERTY(QVariant aiReviewBeforeSending READ aiReviewBeforeSending NOTIFY aiReviewBeforeSendingChanged)
     Q_PROPERTY(ChatGptAccounts *chatGptAccounts READ chatGptAccounts CONSTANT)
     Q_PROPERTY(QuitCoordinator *quitCoordinator READ quitCoordinator CONSTANT)
     Q_PROPERTY(bool tabTransferInProgress READ tabTransferInProgress NOTIFY tabTransferStateChanged)
@@ -80,6 +81,9 @@ public:
     Q_INVOKABLE QVariantMap inspectReasoning(const QString &mode, const QString &encoding) const;
     Q_INVOKABLE QVariantMap generationDefaults() const;
     QVariant aiOutputLanguage() const;
+    QVariant aiReviewBeforeSending() const;
+    Q_INVOKABLE bool setAiReviewBeforeSending(bool enabled);
+    Q_INVOKABLE bool setAiReadingWorkflow(const QVariantMap &changes);
     Q_INVOKABLE bool setAiOutputLanguage(const QString &language);
     Q_INVOKABLE QVariant preference(const QString &key, const QVariant &fallback = {}) const;
     Q_INVOKABLE void setPreference(const QString &key, const QVariant &value);
@@ -88,6 +92,7 @@ public:
     Q_INVOKABLE QString writeTextFile(const QUrl &url, const QString &text);
 signals:
     void aiOutputLanguageChanged();
+    void aiReviewBeforeSendingChanged();
     void readingPresetChanged();
     void regionConversationStyleChanged();
     void tabsChanged();

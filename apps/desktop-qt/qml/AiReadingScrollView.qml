@@ -12,10 +12,14 @@ ScrollView {
     function rememberPosition() { scrollMemory.capturePosition(); }
     function applyReadingWheel(dx, dy) { panelWheel.scrollRequested(dx, dy); }
     function revealItem(item) {
+        if (item) revealRect(item, Qt.rect(0, 0, item.width, item.height));
+    }
+    function revealRect(item, rect) {
         const f = contentItem;
         if (!visible || !f || !item) return;
-        const y = item.mapToItem(f, 0, 0).y;
-        const delta = y < 0 ? -y : y + item.height > f.height ? f.height - y - item.height : 0;
+        const y = item.mapToItem(f, rect.x, rect.y).y;
+        if (!Number.isFinite(y) || !Number.isFinite(rect.height)) return;
+        const delta = y < 0 ? -y : y + rect.height > f.height ? f.height - y - rect.height : 0;
         // Focus is an explicit navigation intent even when the item already fits.
         // Keep a queued memory restore from moving the focused control away.
         applyReadingWheel(0, delta);

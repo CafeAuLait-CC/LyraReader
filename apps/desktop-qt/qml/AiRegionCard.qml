@@ -10,6 +10,7 @@ Item {
     readonly property bool parchment:app.regionConversationStyle!=="window"
     readonly property color dividerColor:parchment ? Qt.rgba(app.colors.accentBorder.r,app.colors.accentBorder.g,app.colors.accentBorder.b,.18) : app.colors.separator
     property bool showingNote: false
+    property var sendIntent:null
     property var owner:null
     readonly property var attachment:owner ? owner.aiRegion : ({})
     readonly property var state:owner ? owner.aiState : ({})
@@ -32,6 +33,7 @@ Item {
     })
     readonly property var plan:state.previewView==="region" || notePreview ? state.plan || null : null
     readonly property bool previewReady:!!plan && !state.planSent
+    onStateChanged:if(sendIntent)Qt.callLater(finishUiRequest)
     onPreviewReadyChanged:if(!previewReady && payload && payload.visible)payload.close()
     readonly property bool activeTurn: running && state.responseView==="region"
     readonly property var result:activeTurn ? ({
@@ -112,6 +114,7 @@ Item {
     }
     function closeAnimated() {
         if(!opened || closing)return;
+        sendIntent=null;app.cancelAiTaskReview(owner,"region");
         if(owner)owner.flushAiRegionNote();
         if(!canAnimate || !located){close();return;}
         reveal.stop();closing=true;needsReveal=false;
@@ -153,6 +156,7 @@ Item {
     function close(){closeCard(true);}
     function closeCard(preserve) {
         if(!opened)return;
+        sendIntent=null;app.cancelAiTaskReview(owner,"region");
         const current=owner===app.currentReader && ownerGeneration===owner.documentGeneration;
         const anchor=preserve && current ? app.documentCanvas.viewportAnchor(0) : null;
         opened=false;needsReveal=false;closing=false;reveal.stop();layoutSettle.stop();layoutApply.stop();payload.close();discardChanges.close();capturePreview.close();actions.close();
@@ -220,7 +224,7 @@ Item {
     Connections {
         target:card.owner
         function onAiRegionPaperChanged(){layoutApply.restart();}
-        function onCommandsChanged(){card.requestPaper();}
+        function onCommandsChanged(){card.requestPaper();if(card.sendIntent)Qt.callLater(card.finishUiRequest);}
     }
     Connections {
         target:card.app
@@ -251,37 +255,58 @@ Item {
     Keys.onShortcutOverride:function(event){if(event.key===Qt.Key_Escape)event.accepted=true;}
     Keys.onEscapePressed:function(event){closeAnimated();event.accepted=true;}
     function prepare(){
-        if(owner!==app.currentReader)return;
-        if(chatGptAccounts && chatGptAccounts.connectionMode==="chatGPT") {prepareWithChatGpt();return;}
-        if(!app.beginAiPreparation())return;
+        if(owner!==app.currentReader)return false;
+        if(chatGptAccounts && chatGptAccounts.connectionMode==="chatGPT")return prepareWithChatGpt();
+        if(!app.beginAiPreparation())return false;
         showingNote=false;owner.prepareAiRegion(app.aiSettings);
+        return true;
     }
     function submitQuestion() {
         if (previewReady && !running && owner && !owner.pendingCommands)
-            app.sendAi(owner,plan);
-        else if (canPrepare)
-            prepare();
+            app.dispatchAiTaskFromUi(owner,plan,"region");
+        else if (canPrepare) prepareFromUi(false);
+    }
+    function prepareFromUi(note) {
+        if(!opened || closing || owner!==app.currentReader || !owner || owner.pendingCommands || running)return;
+        sendIntent={reader:owner,generation:ownerGeneration,id:attachment.history_id,
+            question:attachment.question || "",note:!!note,workflowRevision:app.aiReviewRevision};
+        if(!(note ? prepareKnowledge() : prepare())) {sendIntent=null;return;}
+        Qt.callLater(finishUiRequest);
+    }
+    function finishUiRequest() {
+        const intent=sendIntent;
+        if(!intent)return;
+        if(!opened || closing || intent.reader!==owner || owner!==app.currentReader
+                || intent.generation!==owner.documentGeneration || intent.id!==attachment.history_id
+                || intent.question!==(attachment.question || "") || intent.workflowRevision!==app.aiReviewRevision) {
+            sendIntent=null;return;
+        }
+        if(owner.pendingCommands)return;
+        sendIntent=null;
+        if(previewReady && notePreview===intent.note)app.dispatchAiTaskFromUi(owner,plan,"region");
     }
     function prepareWithChatGpt() {
         if(!app.beginAiPreparation() || !chatGptAccounts
-                || ["legacy","chatGPT"].indexOf(chatGptAccounts.connectionMode)<0)return;
-        if(owner!==app.currentReader)return;
-        if(!chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return;}
-        if(chatGptAccounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
+                || ["legacy","chatGPT"].indexOf(chatGptAccounts.connectionMode)<0)return false;
+        if(owner!==app.currentReader)return false;
+        if(!chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return false;}
+        if(chatGptAccounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return false;}
         showingNote=false;
         owner.prepareAiRegion({baseUrl:"https://api.openai.com/v1", model:chatGptAccounts.model,
             imageInput:true, chatgptAccount:chatGptAccounts.accountId});
+        return true;
     }
     function prepareKnowledge() {
-        if(owner!==app.currentReader || !app.beginAiPreparation())return;
+        if(owner!==app.currentReader || !app.beginAiPreparation())return false;
         const settings=Object.assign({},app.aiSettings);
         if(chatGptAccounts && chatGptAccounts.connectionMode==="chatGPT") {
-            if(!chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return;}
-            if(chatGptAccounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
+            if(!chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return false;}
+            if(chatGptAccounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return false;}
             settings.baseUrl="https://api.openai.com/v1";settings.model=chatGptAccounts.model;
             settings.chatgptAccount=chatGptAccounts.accountId;settings.reasoningMode="default";settings.reasoningEncoding="none";
         }
         showingNote=true;owner.prepareAiRegion(settings,true);
+        return true;
     }
     function follow(link,plan) {
         if(owner!==app.currentReader || plan.generation!==owner.documentGeneration)return;
@@ -388,7 +413,7 @@ Item {
                         objectName:"prepareAiRegionKnowledge"
                         text:qsTr("Finish & Make Note…")
                         enabled:!!card.attachment.completed_turn_count && !card.candidate && !!card.owner && !!card.attachment.saved && !card.running && !card.owner.pendingCommands && !card.owner.hasUnsavedReadingNotes
-                        onTriggered:card.prepareKnowledge()
+                        onTriggered:card.prepareFromUi(true)
                     }
                     LyraMenuItem {objectName:"saveAiRegionNote";text:qsTr("Save to Reading Notes");enabled:!!card.attachment.image_png && !card.running && card.owner && !card.owner.pendingCommands;onTriggered:card.owner.saveAiRegionNote()}
                     LyraMenuItem {text:qsTr("Request Details");enabled:card.previewReady;onTriggered:payload.open()}
@@ -518,7 +543,7 @@ Item {
             }
         }
             LyraToolButton {
-                objectName:"prepareAiRegion";symbol:"arrow";text:qsTr("Preview Question")
+                objectName:"prepareAiRegion";symbol:"arrow";text:qsTr("Send question")
                 visible:!card.previewReady && !card.regionRunning;enabled:card.canPrepare
                 contentItem.rotation:-45
                 background:Rectangle {
@@ -526,7 +551,7 @@ Item {
                     border.width:parent.visualFocus ? 2 : 1
                     border.color:parent.visualFocus ? card.app.colors.focusRing : card.app.colors.controlBorder
                 }
-                onClicked:card.prepare()
+                onClicked:card.prepareFromUi(false)
             }
             LyraToolButton {
                 objectName:"inspectAiRegion";symbol:"info";text:qsTr("Inspect payload")

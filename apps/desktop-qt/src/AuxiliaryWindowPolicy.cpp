@@ -1,5 +1,7 @@
 #include "AuxiliaryWindowPolicy.h"
 #include <QGuiApplication>
+#include <QQuickItem>
+#include <QResizeEvent>
 #include <QScreen>
 #include <QTimer>
 #include <cmath>
@@ -78,6 +80,17 @@ bool AuxiliaryWindowPolicy::prepare(QWindow *window,QWindow *owner,const QVarian
     window->setModality(Qt::NonModal);
     window->setMinimumSize({qMin(360,size.width()),qMin(280,size.height())});
     window->resize(size);
+    // A hidden window can retain its previous Quick content size until a platform
+    // resize event arrives. Notify the entire window hierarchy before first map,
+    // including ApplicationWindow's padded content, headers and footers. A later
+    // platform configure event remains authoritative for the actual window size.
+    if(auto *quick=qobject_cast<QQuickWindow *>(window);quick && quick->contentItem()->size()!=size) {
+        const QPointer<AuxiliaryWindowPolicy> alive(this);
+        const QPointer<QWindow> expectedWindow(window),expectedOwner(owner);
+        QResizeEvent event(size,quick->contentItem()->size().toSize());
+        QGuiApplication::sendEvent(window,&event);
+        if(!alive || !expectedWindow || !expectedOwner || m_window!=expectedWindow || m_owner!=expectedOwner)return false;
+    }
     if(!isWayland()) {
         const auto available=screen->availableGeometry();
         const auto centered=owner->geometry().center()-QPoint(size.width()/2,size.height()/2);
