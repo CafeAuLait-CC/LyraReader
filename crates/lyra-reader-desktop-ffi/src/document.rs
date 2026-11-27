@@ -3557,6 +3557,100 @@ mod tests {
         assert_eq!(fs::read(&fixture.path).unwrap(), original);
     }
     #[test]
+    fn properties_replacement_preserves_application_drafts_and_verified_backup() {
+        let fixture = Fixture::new("metadata-info.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let foreign = r#"{ "kind":"future-tool", "opaque":[3, 1, 4] }"#;
+        fs::write(cache_path(&fixture.path), format!("[{foreign}]\n")).unwrap();
+        let doc = fixture.open();
+        let note = doc.command(json!({"op":"mark_create","entry":{"kind":"square","version":1,"page":0,"rect":{"x":20,"y":50,"width":80,"height":40},"strokeWidth":2,"color":"#E8BC5580","note":"Keep this local draft"}})).unwrap();
+        let note_id = note["selected_id"].as_str().unwrap().to_owned();
+        let bookmark = doc.command(json!({"op":"bookmark_create","page":0,"title":"Keep the reading bookmark","yPt":20})).unwrap();
+        let bookmark_id = bookmark["bookmarks"][0]["id"].as_str().unwrap().to_owned();
+        let report = doc.command(json!({"op":"replace_properties","title":"Changed PDF information","author":"Synthetic author","subject":"Properties check","keywords":"native"})).unwrap();
+        let backup = report["backup_path"].as_str().unwrap();
+        assert_eq!(fs::read(backup).unwrap(), original);
+        assert_ne!(fs::read(&fixture.path).unwrap(), original);
+        let reopened = fixture.open();
+        assert_eq!(
+            reopened.command(json!({"op":"document_info"})).unwrap()["title"],
+            "Changed PDF information"
+        );
+        let marks = reopened.command(json!({"op":"marks"})).unwrap();
+        assert!(
+            marks["annotations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == note_id)
+        );
+        assert!(
+            marks["bookmarks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["id"] == bookmark_id)
+        );
+        assert!(
+            fs::read_to_string(cache_path(&fixture.path))
+                .unwrap()
+                .contains(foreign)
+        );
+    }
+
+    #[test]
+    fn properties_writes_keep_the_staged_revision_immutable_and_refuse_original_replacement() {
+        let fixture = Fixture::new("multipage.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        doc.command(
+            json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}}}),
+        )
+        .unwrap();
+        let lease = doc.active().unwrap();
+        let revision = fs::read(lease.path()).unwrap();
+        let error = doc.command(json!({"op":"replace_properties","title":"Refused title","author":"Synthetic author","subject":"","keywords":""})).unwrap_err();
+        assert!(error.contains("staged page changes"));
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(fs::read(lease.path()).unwrap(), revision);
+        let copy = fixture.directory.join("properties-from-revision.pdf");
+        doc.command(json!({"op":"save_properties","destination":copy,"title":"Working revision copy","author":"Synthetic author","subject":"","keywords":""})).unwrap();
+        let copied = open_fixture_document(&copy, None).unwrap();
+        assert_eq!(
+            copied.command(json!({"op":"document_info"})).unwrap()["title"],
+            "Working revision copy"
+        );
+        assert_eq!(
+            copied.info().unwrap()["pages"][0]["width"],
+            doc.info().unwrap()["pages"][0]["width"]
+        );
+        assert_eq!(
+            copied.info().unwrap()["pages"][0]["height"],
+            doc.info().unwrap()["pages"][0]["height"]
+        );
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+        assert_eq!(fs::read(lease.path()).unwrap(), revision);
+    }
+
+    #[test]
+    fn properties_copy_strips_signatures_and_protects_the_original() {
+        let fixture = Fixture::new("signed-signature.pdf");
+        let original = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let copy = fixture.directory.join("unsigned-properties-copy.pdf");
+        doc.command(json!({"op":"save_properties","destination":copy,"title":"Unsigned properties copy","author":"Synthetic author","subject":"","keywords":""})).unwrap();
+        let copied = open_fixture_document(&copy, None).unwrap();
+        assert_eq!(copied.info().unwrap()["signature_status"]["signed"], false);
+        assert_eq!(
+            copied.command(json!({"op":"document_info"})).unwrap()["title"],
+            "Unsigned properties copy"
+        );
+        assert!(doc.command(json!({"op":"replace_properties","title":"Refused title","author":"Synthetic author","subject":"","keywords":""})).is_err());
+        assert_eq!(doc.info().unwrap()["signature_status"]["signed"], true);
+        assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    }
+
+    #[test]
     fn page_corner_bookmarks_default_only_an_omitted_name_and_keep_manual_order() {
         let fixture = Fixture::new("multipage.pdf");
         let sidecar = cache_path(&fixture.path);

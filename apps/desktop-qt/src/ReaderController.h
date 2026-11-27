@@ -69,6 +69,7 @@ class ReaderController : public QObject {
     Q_PROPERTY(QVariantMap summaryBatchState READ summaryBatchState NOTIFY aiStateChanged)
     Q_PROPERTY(QVariantMap data READ data NOTIFY dataChanged)
     Q_PROPERTY(QVariantMap metadataDraft READ metadataDraft WRITE setMetadataDraft NOTIFY metadataDraftChanged)
+    Q_PROPERTY(QVariantMap documentPropertiesDraft READ documentPropertiesDraft WRITE setDocumentPropertiesDraft NOTIFY documentPropertiesDraftChanged)
     Q_PROPERTY(QVariantMap annotationPassages READ annotationPassages NOTIFY annotationPassagesChanged)
     Q_PROPERTY(QVariantMap textPages READ textPages NOTIFY textPagesChanged)
     Q_PROPERTY(int pendingCommands READ pendingCommands NOTIFY commandsChanged)
@@ -195,6 +196,8 @@ public:
     // Panel corrections stay with the reader without becoming PDF edits.
     QVariantMap metadataDraft() const { return m_metadataDraft; }
     void setMetadataDraft(const QVariantMap &draft) {if(m_metadataDraft!=draft){m_metadataDraft=draft;emit metadataDraftChanged();}}
+    QVariantMap documentPropertiesDraft() const { return m_documentPropertiesDraft; }
+    void setDocumentPropertiesDraft(const QVariantMap &draft) {if(m_documentPropertiesDraft!=draft){m_documentPropertiesDraft=draft;emit documentPropertiesDraftChanged();}}
     QVariantMap annotationPassages()const;
     Q_INVOKABLE QString annotationPassageInputKey(const QVariantList &entries)const;
     Q_INVOKABLE void requestAnnotationPassages(int page,const QVariantList &entries);
@@ -272,6 +275,7 @@ signals:
     void commandFinished(quint64 id, const QString &operation, const QVariant &result, const QString &error);
     void dataChanged();
     void metadataDraftChanged();
+    void documentPropertiesDraftChanged();
     void noteDraftsChanged();
     void unsavedChangesChanged();
     void editDraftsChanged();
@@ -462,7 +466,7 @@ private:
     QVariantList m_layoutRows;
     double m_documentWidth = 0;
     double m_documentHeight = 0;
-    QVariantMap m_data, m_textPages, m_noteDrafts, m_editDrafts, m_metadataDraft;
+    QVariantMap m_data, m_textPages, m_noteDrafts, m_editDrafts, m_metadataDraft, m_documentPropertiesDraft;
     QSet<int> m_textPending;
     int m_pendingCommands = 0;
     quint64 m_commandSequence = 0;

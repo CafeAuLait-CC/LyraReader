@@ -161,6 +161,8 @@ void ReaderController::openFile(const QUrl &url, const QString &password) {
     QPointer<ReaderController> metadataOwner(this);
     setMetadataDraft({});
     if(!metadataOwner || m_generation!=generation)return;
+    setDocumentPropertiesDraft({});
+    if(!metadataOwner || m_generation!=generation)return;
     m_textPages.clear(); m_textPending.clear();m_noteDrafts.clear();emit noteDraftsChanged();m_editDrafts.clear();emit editDraftsChanged();
     emit dataChanged(); emit textPagesChanged();
     m_title = QFileInfo(url.toLocalFile()).fileName();

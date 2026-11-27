@@ -554,6 +554,7 @@ ApplicationWindow {
     }
     readonly property string bibtex: currentReader.data.bibtex || (currentReader.data.metadata ? currentReader.data.metadata.bibtex : "")
     readonly property var metadataDraft: currentReader ? currentReader.metadataDraft : ({})
+    readonly property var propertiesDraft: currentReader ? currentReader.documentPropertiesDraft : ({})
     property string operationStatus: ""
     property string previewStatus: ""
     onOperationStatusChanged: previewStatus = ""
@@ -1869,6 +1870,9 @@ ApplicationWindow {
         if(placedTextController.deferAction(function(){root.chooseExport(kind);}))return;
         if (secondaryRow==="edit" && contentController.deferAction({kind:"export",value:kind})) return;
         if (["bibtex","markdown","csv","annotation-text"].indexOf(kind)<0 && blockXfaWrite()) return;
+        if (kind === "properties" && !dialogs.informationDialog.canSaveProperties) {
+            operationStatus = qsTr("Review the changed document properties before saving.");return;
+        }
         exportKind = kind;
         exportContext = {
             reader: currentReader,
@@ -1913,6 +1917,13 @@ ApplicationWindow {
         return Object.keys(formValues).map(function (key) {
             return formValues[key];
         });
+    }
+    function editDocumentProperty(key, text) {
+        if (!currentReader.data.document_info || xfaReadOnly || infoData.is_encrypted
+                || ["title", "author", "subject", "keywords"].indexOf(key) < 0) return;
+        const draft = Object.assign({}, currentReader.documentPropertiesDraft);
+        draft[key] = text;
+        currentReader.documentPropertiesDraft = draft;
     }
     function editMetadata(key, text) {
         const m = currentReader.data.metadata;
@@ -2022,6 +2033,9 @@ ApplicationWindow {
             operationStatus = readOnlyReason;
             return;
         }
+        if(kind==="properties" && !dialogs.informationDialog.canReplaceProperties) {
+            operationStatus=dialogs.informationDialog.propertiesReplaceReason || qsTr("Review the changed document properties before saving.");return;
+        }
         if(kind==="forms") {
             const reason=exportActionReason("formValues");
             if(reason.length){operationStatus=reason;return;}
@@ -2044,8 +2058,13 @@ ApplicationWindow {
         dialogs.annotationDialog.close();
         if (kind === "pages")
             currentReader.submit("page_apply");
-        else if (kind === "properties")
+        else if (kind === "properties") {
+            const draft=dialogs.informationDialog.draft();
+            if(!dialogs.informationDialog.canReplaceProperties || ["title","author","subject","keywords"].some(function(key){return draft[key]!==context.properties[key];})) {
+                operationStatus=dialogs.informationDialog.propertiesReplaceReason || qsTr("The properties changed. Review the replacement again.");return;
+            }
             currentReader.submit("replace_properties", context.properties);
+        }
         else if (kind === "forms") {
             const reason=exportActionReason("formValues");
             if(reason.length){operationStatus=reason;return;}
@@ -2980,9 +2999,12 @@ ApplicationWindow {
             root.selectedSidebarAnnotationID = "";
             root.annotationDraft = null;
             root.redactionDraft = null;
+            if(dialogs.informationDialog.visible && !currentReader.loading && currentReader.pageCount>0)
+                currentReader.submit("document_info");
         }
         function onOpenFinished(success) {
             if (success) {
+                if(dialogs.informationDialog.visible)currentReader.submit("document_info");
                 root.restorePosition();
                 if (root.formToolActive)
                     currentReader.submit("forms");

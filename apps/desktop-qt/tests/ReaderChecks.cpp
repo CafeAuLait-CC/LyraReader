@@ -5345,6 +5345,47 @@ LyraMenu {
         reader.openFile(original);QTRY_VERIFY(replaced && reader.pageCount()>0 && !reader.loading() && !reader.pendingCommands());QObject::disconnect(connection);
         QCOMPARE(reader.fileUrl(),replacement);QCOMPARE(reader.title(),QString("metadata-info.pdf"));QVERIFY(reader.metadataDraft().isEmpty());QVERIFY(!reader.hasUnsavedChanges());
     }
+    void documentPropertiesDraftsKeepTheirOwnerAndUseDirtyWriteGates_data() {
+        QTest::addColumn<QString>("route");QTest::addColumn<QString>("appearance");for(const auto &appearance:{QString("light"),QString("dark")})for(const auto *route:{"initial-gates","reopen","regenerate","other-tab","signed-copy","staged-revision","pending-note","copy-save","replace-save"})QTest::newRow(qPrintable(QString(route)+"-"+appearance))<<QString(route)<<appearance;
+    }
+    void documentPropertiesDraftsKeepTheirOwnerAndUseDirtyWriteGates() {
+        QFETCH(QString,route);QFETCH(QString,appearance);QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-properties-draft.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/"+(route=="signed-copy"?QString("signed-signature.pdf"):QString("metadata-info.pdf")),path));
+        QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto bytes=file.readAll();file.close();NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->setProperty("appearance",appearance);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()>0 && !reader->loading() && !reader->pendingCommands());
+        const auto show=[&]{return QMetaObject::invokeMethod(window,"showDocumentInformation");};QVERIFY(show());QTRY_COMPARE(reader->pendingCommands(),0);auto *dialog=window->findChild<QObject *>("documentInformationDialog");QVERIFY(dialog);QTRY_VERIFY(dialog->property("opened").toBool());
+        std::function<QQuickItem *(QQuickItem *,const QString &,bool)> find=[&](QQuickItem *item,const QString &name,bool input)->QQuickItem * {
+            if(item->isVisible() && item->metaObject()->indexOfSignal(input?"textEdited()":"clicked()")>=0) {
+                auto *accessible=QAccessible::queryAccessibleInterface(item);
+                if((input && accessible && accessible->text(QAccessible::Name)==name) || (!input && item->property("text").toString()==name))return item;
+            }
+            for(auto *child:item->childItems())if(auto *found=find(child,name,input))return found;return nullptr;
+        };
+        auto *title=find(window->contentItem(),"Title",true),*copy=find(window->contentItem(),"Save Copy…",false),*replace=find(window->contentItem(),"Write to This File…",false);QVERIFY(title && copy && replace);
+        if(route=="initial-gates") {QVERIFY(!copy->isEnabled());QVERIFY(!replace->isEnabled());auto *colors=window->property("colors").value<QObject *>();QVERIFY(colors);QCOMPARE(QQmlProperty(copy,"palette.buttonText").read().value<QColor>(),colors->property("textDisabled").value<QColor>());QCOMPARE(QQmlProperty(replace,"palette.buttonText").read().value<QColor>(),colors->property("textDisabled").value<QColor>());}
+        else {
+            title->forceActiveFocus(Qt::TabFocusReason);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTRY_VERIFY(title->hasActiveFocus());QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);for(char key:QByteArray("New raw PDF title"))QTest::keyClick(window,key);QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));
+            if(route=="signed-copy") {QVERIFY(window->property("originalReadOnly").toBool());QVERIFY(copy->isEnabled());QVERIFY(!replace->isEnabled());}
+            else if(route=="staged-revision") {
+                reader->submit("page_stage",{{"operation",QVariantMap{{"Rotate",QVariantMap{{"pages",QVariantList{0}},{"quarter_turns",1}}}}}});QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!window->property("infoData").toMap().isEmpty());QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));QVERIFY(copy->isEnabled());QVERIFY(!replace->isEnabled());
+                reader->submit("document_save");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QTRY_VERIFY(!window->property("infoData").toMap().isEmpty());QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));QVERIFY(copy->isEnabled() && replace->isEnabled());
+            } else if(route=="pending-note") {
+                const auto created=reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"version",1},{"page",0},{"rect",QVariantMap{{"x",20},{"y",50},{"width",80},{"height",40}}},{"strokeWidth",2},{"color","#E8BC5580"},{"note","Cached note"}}}});QVERIFY(created);QTRY_COMPARE(reader->pendingCommands(),0);const auto id=reader->data().value("marks").toMap().value("selected_id").toString();QVERIFY(!id.isEmpty());reader->setNoteDraft(id,"Unflushed local text");QVERIFY(copy->isEnabled());QVERIFY(!replace->isEnabled());QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));QCOMPARE(reader->noteDrafts().value(id).toString(),QString("Unflushed local text"));
+            } else if(route=="copy-save" || route=="replace-save") {
+                QQmlExpression payload(QQmlEngine::contextForObject(dialog),dialog,"draft()");auto arguments=payload.evaluate().toMap();QVERIFY(!payload.hasError());QCOMPARE(arguments.value("title").toString(),QString("New raw PDF title"));
+                if(route=="copy-save") {
+                    const auto copyPath=scratch.filePath("properties-copy.pdf");arguments.insert("destination",copyPath);reader->submit("save_properties",arguments);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(QFile::exists(copyPath));ReaderController copied;copied.openFile(QUrl::fromLocalFile(copyPath));QTRY_VERIFY(copied.pageCount()>0 && !copied.loading() && !copied.pendingCommands());copied.submit("document_info");QTRY_COMPARE(copied.pendingCommands(),0);QCOMPARE(copied.data().value("document_info").toMap().value("title").toString(),QString("New raw PDF title"));QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));QVERIFY(copy->isEnabled());
+                } else {
+                    QSignalSpy completed(reader,&ReaderController::commandFinished);reader->submit("replace_properties",arguments);QTRY_VERIFY_WITH_TIMEOUT(!reader->loading() && !reader->pendingCommands() && window->property("infoData").toMap().value("title").toString()=="New raw PDF title",10000);QVERIFY(reader->documentPropertiesDraft().isEmpty());QVERIFY(!copy->isEnabled() && !replace->isEnabled());QString backup;for(const auto &event:completed)if(event[1].toString()=="replace_properties")backup=event[2].toMap().value("backup_path").toString();QVERIFY(!backup.isEmpty());QFile saved(backup);QVERIFY(saved.open(QIODevice::ReadOnly));QCOMPARE(saved.readAll(),bytes);
+                }
+            }
+            else if(route=="regenerate") {QVERIFY(QMetaObject::invokeMethod(window,"editMetadata",Q_ARG(QVariant,QString("year")),Q_ARG(QVariant,QString("2099"))));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));QVERIFY(copy->isEnabled() && replace->isEnabled());}
+            else {
+                QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!dialog->property("visible").toBool());
+                if(route=="other-tab") {view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *other=view.workspace.activeReader();QTRY_VERIFY(other!=reader && other->pageCount()>0 && !other->loading() && !other->pendingCommands());QVERIFY(show());QTRY_COMPARE(other->pendingCommands(),0);auto *otherTitle=find(window->contentItem(),"Title",true);QVERIFY(otherTitle);QVERIFY(otherTitle->property("text").toString()!="New raw PDF title");QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!dialog->property("visible").toBool());view.workspace.selectTab(0);}
+                QVERIFY(show());QTRY_COMPARE(reader->pendingCommands(),0);title=find(window->contentItem(),"Title",true);QVERIFY(title);QCOMPARE(title->property("text").toString(),QString("New raw PDF title"));QVERIFY(copy->isEnabled() && replace->isEnabled());
+            }
+        }
+        if(route!="pending-note")QVERIFY(!reader->hasUnsavedChanges());QTest::keyClick(window,Qt::Key_Escape);QVERIFY(file.open(QIODevice::ReadOnly));if(route=="staged-revision" || route=="replace-save")QVERIFY(file.readAll()!=bytes);else QCOMPARE(file.readAll(),bytes);
+    }
     void documentQuestionUsesRetrievedSourcesAndRejectsUnsentCitations() {
         MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Document answer [p.1], invented [p.99], invalid [p.0]."}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},20,200});
         QTemporaryDir scratch;const auto path=scratch.path()+"/question.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));

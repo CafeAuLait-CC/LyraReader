@@ -496,6 +496,11 @@ Item {
         }
         footer: null
         onOpened: informationDone.forceActiveFocus(Qt.TabFocusReason)
+        readonly property bool propertiesReady: !!app.currentReader.data.document_info
+        readonly property bool propertiesDirty: propertiesReady && (titleField.text !== (app.infoData.title || "") || authorField.text !== (app.infoData.author || "") || subjectField.text !== (app.infoData.subject || "") || keywordsField.text !== (app.infoData.keywords || ""))
+        readonly property bool canSaveProperties: propertiesReady && propertiesDirty && app.canModifyPdf && !app.infoData.is_encrypted && app.currentReader.pendingCommands===0 && !app.pendingDocumentSave && !app.closeOperation
+        readonly property string propertiesReplaceReason: app.originalReadOnly ? app.readOnlyReason : app.pageEditsPending ? qsTr("Save or discard the pending page changes before replacing the original's properties.") : Object.keys(app.currentReader.noteDrafts).length || app.currentReader.hasEditDrafts ? qsTr("Save the other document edits before replacing its properties. Save Copy keeps those drafts here.") : ""
+        readonly property bool canReplaceProperties: canSaveProperties && !propertiesReplaceReason.length
         function draft() {
             return {
                 title: titleField.text,
@@ -567,10 +572,11 @@ Item {
                     Label {text: qsTr("Title"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
                     TextField {
                         id: titleField; Accessible.name: qsTr("Title")
-                        readOnly: app.xfaReadOnly
-                        enabled: !!app.currentReader.data.document_info
+                        readOnly: app.xfaReadOnly || !!app.infoData.is_encrypted
+                        enabled: information.propertiesReady
                         Layout.fillWidth: true
-                        text: app.infoData.title || ""
+                        text: typeof app.propertiesDraft.title !== "undefined" ? app.propertiesDraft.title : app.infoData.title || ""
+                        onTextEdited: app.editDocumentProperty("title", text)
                         placeholderText: qsTr("Title")
                     }
                 }
@@ -579,10 +585,11 @@ Item {
                     Label {text: qsTr("Author"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
                     TextField {
                         id: authorField; Accessible.name: qsTr("Author")
-                        readOnly: app.xfaReadOnly
-                        enabled: !!app.currentReader.data.document_info
+                        readOnly: app.xfaReadOnly || !!app.infoData.is_encrypted
+                        enabled: information.propertiesReady
                         Layout.fillWidth: true
-                        text: app.infoData.author || ""
+                        text: typeof app.propertiesDraft.author !== "undefined" ? app.propertiesDraft.author : app.infoData.author || ""
+                        onTextEdited: app.editDocumentProperty("author", text)
                         placeholderText: qsTr("Author")
                     }
                 }
@@ -591,10 +598,11 @@ Item {
                     Label {text: qsTr("Subject"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
                     TextField {
                         id: subjectField; Accessible.name: qsTr("Subject")
-                        readOnly: app.xfaReadOnly
-                        enabled: !!app.currentReader.data.document_info
+                        readOnly: app.xfaReadOnly || !!app.infoData.is_encrypted
+                        enabled: information.propertiesReady
                         Layout.fillWidth: true
-                        text: app.infoData.subject || ""
+                        text: typeof app.propertiesDraft.subject !== "undefined" ? app.propertiesDraft.subject : app.infoData.subject || ""
+                        onTextEdited: app.editDocumentProperty("subject", text)
                         placeholderText: qsTr("Subject")
                     }
                 }
@@ -603,30 +611,34 @@ Item {
                     Label {text: qsTr("Keywords"); font.pixelSize: 11; font.weight: Font.DemiBold; color: app.colors.textPrimary}
                     TextField {
                         id: keywordsField; Accessible.name: qsTr("Keywords")
-                        readOnly: app.xfaReadOnly
-                        enabled: !!app.currentReader.data.document_info
+                        readOnly: app.xfaReadOnly || !!app.infoData.is_encrypted
+                        enabled: information.propertiesReady
                         Layout.fillWidth: true
-                        text: app.infoData.keywords || ""
+                        text: typeof app.propertiesDraft.keywords !== "undefined" ? app.propertiesDraft.keywords : app.infoData.keywords || ""
+                        onTextEdited: app.editDocumentProperty("keywords", text)
                         placeholderText: qsTr("Keywords")
                     }
                 }
                 RowLayout {
-                    Button {
-                        text: qsTr("Save Copy…")
-                        enabled: app.canModifyPdf && !!app.currentReader.data.document_info && !app.infoData.is_encrypted && !app.originalReadOnly
+                    LyraToolButton {
+                        text: qsTr("Save Copy…"); symbol: "export"; fitLabel: true; display: AbstractButton.TextBesideIcon
+                        enabled: information.canSaveProperties
                         onClicked: app.chooseExport("properties")
                     }
-                    Button {
-                        text: qsTr("Write to This File…")
-                        enabled: app.canModifyPdf && !!app.currentReader.data.document_info && !app.infoData.is_encrypted && !app.originalReadOnly
+                    LyraToolButton {
+                        text: qsTr("Write to This File…"); symbol: "document"; fitLabel: true; display: AbstractButton.TextBesideIcon
+                        enabled: information.canReplaceProperties
                         onClicked: app.confirmReplace("properties")
                     }
+                    Item {Layout.fillWidth: true}
+                    Label {text: qsTr("Unsaved"); visible: information.propertiesDirty; font.pixelSize: 11; color: app.colors.warningFg}
                 }
                 Label {
                     Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText
-                    text: app.xfaReadOnly ? app.readOnlyReason : qsTr("Save Copy writes these properties to a new PDF. Write to This File backs up the original before replacing it.")
+                    text: app.xfaReadOnly ? app.readOnlyReason : app.infoData.is_encrypted ? qsTr("This PDF is encrypted. Its document properties cannot be written safely.") : app.originalReadOnly ? qsTr("Signed PDF: properties can be saved to an unsigned copy. The original stays read-only.") : qsTr("Save Copy writes these properties to a new PDF. Other unsaved drafts stay here. Write to This File backs up the original before replacing it.")
                     font.pixelSize: 11; color: app.colors.textSecondary
                 }
+                Label {Layout.fillWidth: true; wrapMode: Text.Wrap; textFormat: Text.PlainText; text: information.propertiesReplaceReason; visible: !app.originalReadOnly && text.length>0; font.pixelSize: 11; color: app.colors.warningFg}
                 Rectangle {Layout.fillWidth: true; height: 1; color: app.colors.separator; Layout.topMargin: 6}
                 Label {
                     textFormat: Text.PlainText
