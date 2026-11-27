@@ -114,7 +114,7 @@ class ReadingPreferenceGuard final {
 public:
     ReadingPreferenceGuard() {
         QSettings settings;
-        for(const auto &key:{"appearance","paper","ai","reduceMotion","auxiliarySettingsGeometry","lyra.regionConversationStyle"}) {
+        for(const auto &key:{"appearance","paper","ai","aiOutputLanguage","reduceMotion","auxiliarySettingsGeometry","lyra.regionConversationStyle"}) {
             const auto full=QStringLiteral("reader/preferences/")+QLatin1String(key);
             m_values.insert(full,{settings.contains(full),settings.value(full)});
         }
@@ -2018,6 +2018,434 @@ private slots:
         const auto capture=qEnvironmentVariable("LYRA_READER_CONNECTION_TEST_EVIDENCE");if(!capture.isEmpty() && route=="cancel-test"){status->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(status->hasActiveFocus());QSignalSpy frame(settings,&QQuickWindow::frameSwapped);settings->update();QTRY_VERIFY(!frame.isEmpty());QVERIFY(settings->grabWindow().save(capture+(dark?"-pending-dark.png":"-pending-light.png")));}
         if(route=="close")QVERIFY(settings->close());else if(route=="cancel-test"){cancel->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(cancel->hasActiveFocus());QTest::keyClick(settings,Qt::Key_Space);}else if(route=="mode"){QVERIFY(workspace.chatGptAccounts()->selectConnectionMode("chatGPT"));}else if(route=="external-config"){auto changed=original;changed.insert("model","newer-window-model");window->setProperty("aiSettings",changed);}else {const auto name=route=="base-url"?"settingsBaseUrl":route=="model"?"settingsAiModel":"settingsApiKey";auto *field=visualItem(settings->contentItem(),name);QVERIFY(field);field->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(field->hasActiveFocus());QTest::keyClick(settings,Qt::Key_A,Qt::ControlModifier);for(const auto ch:QStringLiteral("synthetic-edited-draft"))QTest::keyClick(settings,ch.toLatin1());}
         QTRY_VERIFY(!test->busy());vault->reply(0,"SYNTHETIC_LATE_KEY");QCoreApplication::sendPostedEvents(test,QEvent::MetaCall);QTest::qWait(60);QTRY_VERIFY(test->findChildren<QFutureWatcherBase *>().isEmpty());QCOMPARE(server.requests.size(),0);QCOMPARE(test->state().value("phase").toString(),QString("idle"));QCOMPARE(workspace.preference("ai",{}).toMap(),original);if(settings->isVisible())QVERIFY(settings->close());QSignalSpy ownerFrames(window,&QQuickWindow::frameSwapped);window->update();QTRY_VERIFY(window->isExposed() && !ownerFrames.isEmpty());
+    }
+    void globalOutputLanguageDoesNotCancelOrAlterTheFixedConnectionProbe() {
+        ReadingPreferenceGuard preferences;
+        QSettings saved;saved.setValue("reader/preferences/aiOutputLanguage","French");saved.sync();
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto oldCache=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restoreCache=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",oldCache);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        MockChatServer server;QVERIFY(server.listen());
+        server.responses.append({{MockChatServer::delta({{"content","OK"}}),QByteArray("data: [DONE]\n\n")},5,200,true});
+        WorkspaceController workspace(nullptr,new FakeCredentialStore);
+        auto *probe=workspace.connectionTest();
+        probe->start(server.baseUrl(),"synthetic-language-probe","SYNTHETIC_LANGUAGE_PROBE_KEY");
+        QTRY_COMPARE(server.requests.size(),1);QTRY_VERIFY(probe->busy());
+        QVERIFY(workspace.setAiOutputLanguage("Esperanto"));QTest::qWait(100);
+        QVERIFY(probe->busy());QCOMPARE(server.activeConnections(),1);QCOMPARE(server.requests.size(),1);
+        const auto request=server.requests.first();const auto body=request.mid(request.indexOf("\r\n\r\n")+4);
+        QVERIFY(!body.contains("French") && !body.contains("Esperanto"));
+        const auto wire=QJsonDocument::fromJson(body).object();QCOMPARE(wire.value("max_tokens").toInt(),16);
+        QCOMPARE(wire.value("messages").toArray().at(1).toObject().value("content").toString(),QString("ping"));
+        probe->cancel();QTRY_COMPARE(server.activeConnections(),0);
+    }
+      void unreadableGlobalOutputLanguageIsKeptUntilRecovery() {
+        QVERIFY(WorkspaceController::allWorkspaces().isEmpty());
+        QSettings stored;const QString key=QStringLiteral("reader/preferences/aiOutputLanguage");
+        const bool existed=stored.contains(key);const auto previous=stored.value(key);
+        const auto restore=qScopeGuard([&]{if(existed)stored.setValue(key,previous);else stored.remove(key);stored.sync();});
+        stored.setValue(key,QVariant{});stored.sync();QCOMPARE(stored.status(),QSettings::NoError);
+        QVERIFY(stored.contains(key));QVERIFY(!stored.value(key).isValid());
+        QFile file(stored.fileName());QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
+        WorkspaceController workspace;QSignalSpy published(&workspace,&WorkspaceController::aiOutputLanguageChanged);
+        QVERIFY(!workspace.aiOutputLanguage().isValid());
+        QVERIFY(!workspace.setAiOutputLanguage("French"));
+        QVERIFY(!workspace.aiOutputLanguage().isValid());QCOMPARE(published.size(),0);
+        QVERIFY(workspace.activeReader()->aiState().isEmpty());
+        stored.sync();QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);
+    }
+    void globalOutputLanguageCanRetryAfterASettingsWriteFailure() {
+#ifndef Q_OS_LINUX
+        QSKIP("The read-only file fixture applies to Linux settings storage");
+#else
+        QVERIFY(WorkspaceController::allWorkspaces().isEmpty());
+        QSettings current;
+        const auto format=current.format();
+        QDir previousRoot(QFileInfo(current.fileName()).absolutePath());
+        QCOMPARE(previousRoot.dirName(),QCoreApplication::organizationName());
+        QVERIFY(previousRoot.cdUp());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        QSettings::setPath(format,QSettings::UserScope,scratch.path());
+        const auto restorePath=qScopeGuard([&]{QSettings::setPath(format,QSettings::UserScope,previousRoot.absolutePath());});
+        WorkspaceController workspace;
+        QVERIFY(workspace.setAiOutputLanguage("French"));
+        QSettings fixture;
+        const auto file=fixture.fileName(),directory=QFileInfo(file).absolutePath();
+        QVERIFY(file.startsWith(scratch.path()+"/"));
+        QFile original(file);QVERIFY(original.open(QIODevice::ReadOnly));const auto before=original.readAll();original.close();
+        const auto filePermissions=QFile::permissions(file),directoryPermissions=QFile::permissions(directory);
+        const auto restorePermissions=qScopeGuard([&]{QFile::setPermissions(directory,directoryPermissions);QFile::setPermissions(file,filePermissions);});
+        QVERIFY(QFile::setPermissions(file,QFileDevice::ReadOwner));
+        QVERIFY(QFile::setPermissions(directory,QFileDevice::ReadOwner|QFileDevice::ExeOwner));
+        QFile probe(directory+"/write-probe");
+        if(probe.open(QIODevice::WriteOnly)){probe.close();QVERIFY(probe.remove());QSKIP("This runtime bypasses read-only fixture permissions");}
+        QVERIFY(!workspace.setAiOutputLanguage("German"));
+        QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),before);original.close();
+        QCOMPARE(workspace.aiOutputLanguage(),QVariant("French"));
+        QCOMPARE(workspace.activeReader()->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("French"));
+        QVERIFY(QFile::setPermissions(directory,directoryPermissions));
+        QVERIFY(QFile::setPermissions(file,filePermissions));
+        QVERIFY(workspace.setAiOutputLanguage("German"));
+        QCOMPARE(workspace.aiOutputLanguage(),QVariant("German"));
+        QCOMPARE(workspace.activeReader()->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("German"));
+#endif
+    }
+    void globalOutputLanguagePreservesAnUnappliedSummaryDraft() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;
+        QSettings saved;saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");
+        saved.setValue("reader/preferences/aiOutputLanguage","French");saved.sync();
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto path=scratch.filePath("synthetic-language-unit-draft.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        WorkspaceController workspace;workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();
+        QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());
+        reader->loadSummaryCatalog("Page");
+        QTRY_VERIFY(!reader->pendingCommands() && !reader->summaryCatalog().value("rows").toList().isEmpty());
+        const auto id=reader->summaryCatalog().value("rows").toList().first().toMap().value("id").toString();
+        reader->openCachedSummary(id,"synthetic-language-draft");QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(reader->summaryUnitContext().value("id").toString(),id);
+        QVERIFY(reader->setSummaryLanguageDraft("Unfinished language draft",reader->documentGeneration()));
+        QVERIFY(workspace.setAiOutputLanguage("German"));
+        const auto input=reader->aiState().value("input").toMap();
+        QCOMPARE(input.value("summaryLanguage").toString(),QString("German"));
+        QCOMPARE(input.value("summaryLanguageDraft").toString(),QString("Unfinished language draft"));
+        QVERIFY(reader->applySummaryLanguage(reader->documentGeneration()));
+        QCOMPARE(reader->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("Unfinished language draft"));
+    }
+    void unknownGlobalOutputLanguageBlocksOnlyNewAiPreparation() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;
+        QSettings saved;saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");
+        const QVariantMap raw{{"future",true}};saved.setValue("reader/preferences/aiOutputLanguage",raw);saved.sync();
+        MockChatServer server;QVERIFY(server.listen());
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());
+        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-unknown-language"}});
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));
+        auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);reader->setAiInput("action",1);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+        QVERIFY(view.window->property("operationStatus").toString().contains("output language"));
+        QCOMPARE(view.workspace.aiOutputLanguage().toMap(),raw);
+        QCOMPARE(server.requests.size(),0);QVERIFY(!reader->hasUnsavedChanges());
+    }
+    void globalOutputLanguageKeepsNewerWindowsAndUndoneDrafts() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;
+        QSettings saved;saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");
+        saved.setValue("reader/preferences/aiOutputLanguage","French");saved.sync();
+        NativeCorpus::Viewer first,second;QVERIFY(first.window && second.window);
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));
+        auto *settings=first.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(settings);
+        auto *field=visualItem(settings->contentItem(),"settingsOutputLanguage");QVERIFY(field);
+        QVERIFY(second.workspace.setAiOutputLanguage("German"));
+        QCOMPARE(field->property("text").toString(),QString("German"));
+        const auto edit=[&](const QString &text) {
+            settings->requestActivate();
+            if(!QTest::qWaitFor([&]{return QGuiApplication::focusWindow()==settings;},3000))return false;
+            field->forceActiveFocus(Qt::TabFocusReason);
+            QTest::keyClick(settings,Qt::Key_A,Qt::ControlModifier);
+            for(const auto ch:text)QTest::keyClick(settings,ch.toLatin1());
+            return field->property("text").toString()==text;
+        };
+        QVERIFY(edit("Italian"));
+        QVERIFY(second.workspace.setAiOutputLanguage("Japanese"));
+        QCOMPARE(field->property("text").toString(),QString("Italian"));
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));
+        QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(first.workspace.aiOutputLanguage(),QVariant("Italian"));
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));
+        QVERIFY(edit("German"));
+        QTest::keyClick(settings,Qt::Key_Z,Qt::ControlModifier);
+        QCOMPARE(field->property("text").toString(),QString("Italian"));
+        QVERIFY(second.workspace.setAiOutputLanguage("Spanish"));
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));
+        QCOMPARE(first.workspace.aiOutputLanguage(),QVariant("Spanish"));
+    }
+    void globalOutputLanguageRetiresAnObsoleteCredentialIntent() {
+        ReadingPreferenceGuard preferences;
+        ChatGptPreferenceGuard profiles;
+        QSettings saved;
+        saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");
+        saved.setValue("reader/preferences/aiOutputLanguage","French");saved.sync();
+        MockChatServer server;QVERIFY(server.listen());
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto oldCache=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restoreCache=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",oldCache);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-language-credential.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());
+        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-language-credential"}});
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));
+        auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        reader->setAiInput("action",1);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+        QTRY_VERIFY2(!reader->pendingCommands() && !reader->aiState().value("plan").toMap().isEmpty(),
+            qPrintable(reader->aiState().value("status").toString()+" | "+view.window->property("operationStatus").toString()));
+        const auto reviewed=reader->aiState().value("plan").toMap();
+        // Stage only the asynchronous intent, without requesting the real vault.
+        view.window->setProperty("credentialReadId",123);
+        view.window->setProperty("pendingAiReader",QVariant::fromValue(reader));
+        view.window->setProperty("pendingAiPlan",reviewed);
+        view.window->setProperty("pendingAiPurpose","assistant");
+        QVERIFY(view.workspace.setAiOutputLanguage("German"));
+        QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+        QCOMPARE(view.window->property("credentialReadId").toDouble(),-1.);
+        QVERIFY(!view.window->property("pendingAiReader").value<QObject *>());
+        emit view.workspace.credentials()->finished(123,"read",{},{});
+        QCoreApplication::processEvents();
+        auto *dialog=view.window->findChild<QObject *>("aiCredentialDialog");QVERIFY(dialog);
+        QVERIFY(!dialog->property("visible").toBool());
+        QVERIFY(!reader->startAi("local",reviewed));
+        QCOMPARE(server.requests.size(),0);
+    }
+    void globalOutputLanguagePreservesRunningAndExplicitTranslationRequests_data() {
+        QTest::addColumn<QString>("route");
+        for(const char *route:{"prepared-summary","prepared-translation","running-summary","running-translation"})
+            QTest::newRow(route)<<QString(route);
+    }
+    void globalOutputLanguagePreservesRunningAndExplicitTranslationRequests() {
+        QFETCH(QString,route);
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;
+        QSettings saved;saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");
+        saved.setValue("reader/preferences/aiOutputLanguage","French");saved.sync();
+        MockChatServer server;QVERIFY(server.listen());
+        server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_LANGUAGE_PARTIAL"}}),QByteArray("data: [DONE]\n\n")},5,200,true});
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());
+        const auto oldCache=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restoreCache=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",oldCache);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-language-lifetime.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();QTRY_VERIFY(!reader->loading() && reader->pageCount()==1 && !reader->pendingCommands());
+        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-language-lifetime"}});
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
+        QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));
+        auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const bool translating=route.endsWith("translation"),running=route.startsWith("running");
+        reader->setAiInput("view",translating?"translation":"summary");
+        if(translating)reader->setAiInput("translationScope","document");else reader->setAiInput("action",1);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+        QTRY_VERIFY2(!reader->pendingCommands() && !reader->aiState().value("plan").toMap().isEmpty(),
+            qPrintable(reader->aiState().value("status").toString()+" | "+view.window->property("operationStatus").toString()));
+        const auto reviewed=reader->aiState().value("plan").toMap();
+        const auto exact=reviewed.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        QVERIFY(exact.contains("French"));
+        if(running) {
+            QVERIFY(reader->startAi("local",reviewed));QTRY_COMPARE(server.requests.size(),1);
+            QTRY_VERIFY(reader->aiState().value("output").toString().contains("SYNTHETIC_LANGUAGE_PARTIAL"));
+        }
+        QVERIFY(view.workspace.setAiOutputLanguage("German"));
+        QCOMPARE(reader->aiState().value("input").toMap().value("language").toString(),QString("French"));
+        QCOMPARE(reader->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("German"));
+        if(!running && !translating) {
+            QVERIFY(reader->aiState().value("plan").toMap().isEmpty());QVERIFY(!reader->startAi("local",reviewed));
+            QCOMPARE(server.requests.size(),0);return;
+        }
+        QCOMPARE(reader->aiState().value("plan").toMap(),reviewed);
+        if(!running)QVERIFY(reader->startAi("local",reviewed));
+        QTRY_COMPARE(server.requests.size(),1);QTest::qWait(100);
+        QVERIFY(reader->aiState().value("running").toBool());QCOMPARE(server.activeConnections(),1);
+        const auto actual=server.requests.first();QCOMPARE(actual.mid(actual.indexOf("\r\n\r\n")+4),exact);
+        reader->cancelAi();QTRY_COMPARE(server.activeConnections(),0);
+    }
+    void globalOutputLanguageMatchesTheActualReadingRequest_data() {
+        QTest::addColumn<QString>("route");
+        for(const char *route:{"summary","selection","unit","translation","custom-translation","document-reading","region-note","region-control","document-language","unicode-language"})
+            QTest::newRow(route)<<QString(route);
+    }
+    void globalOutputLanguageMatchesTheActualReadingRequest() {
+        QFETCH(QString,route);
+        ReadingPreferenceGuard preferences;
+        ChatGptPreferenceGuard profiles;
+        QSettings saved;
+        saved.setValue("chatGptPlan/connectionMode","apiKey");
+        saved.remove("chatGptPlan/accounts");
+        saved.setValue("reader/preferences/aiOutputLanguage","Esperanto");
+        if(route=="document-language")saved.remove("reader/preferences/aiOutputLanguage");
+        if(route=="unicode-language")saved.setValue("reader/preferences/aiOutputLanguage",QString::fromUtf8("简体中文"));
+        saved.sync();
+        MockChatServer server;
+        QVERIFY(server.listen());
+        const auto respond=[&] {
+            server.responses.append({{MockChatServer::delta({{"content","Synthetic completed reading answer [p.1]."}}),QByteArray("data: [DONE]\n\n")},5,200});
+        };
+        respond();respond();
+        QTemporaryDir scratch;
+        QVERIFY(scratch.isValid());
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-default-language.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;
+        QVERIFY(view.window);
+        QVERIFY(view.window->property("aiOutputLanguageValid").toBool());
+        view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        const QVariantMap settings{{"baseUrl",server.baseUrl()},{"model","synthetic-default-language"}};
+        view.window->setProperty("aiSettings",settings);
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
+        auto *panel=view.window->findChild<QObject *>("aiPanel");
+        QVERIFY(panel);
+        QString expected=route=="unicode-language"?QString::fromUtf8("简体中文"):QString("Esperanto"),token;
+        QVariantMap plan;
+        if(route=="document-reading") {
+            QVERIFY(QMetaObject::invokeMethod(view.window,"openDocumentReading"));
+            auto *reading=view.window->findChild<QObject *>("documentReadingPopup");
+            QVERIFY(reading);
+            QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));
+            QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));
+            plan=reader->documentReading().value("plan").toMap();
+            token=reader->documentReading().value("token").toString();
+        } else if(route.startsWith("region-")) {
+            QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+            QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
+            QVERIFY(reader->saveAiRegionNote());
+            QTRY_COMPARE(reader->pendingCommands(),0);
+            reader->setAiRegionQuestion("Explain this synthetic discussion.");
+            QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands());
+            reader->prepareAiRegion(settings);
+            QTRY_VERIFY(!reader->pendingCommands() && !reader->aiState().value("plan").toMap().isEmpty());
+            plan=reader->aiState().value("plan").toMap();
+            QVERIFY(!plan.value("parts").toList().first().toMap().value("wire_body").toString().contains("Esperanto"));
+            if(route=="region-note") {
+                QVERIFY(reader->startAi("local",plan));
+                QTRY_VERIFY(!reader->aiState().value("running").toBool());
+                reader->flushAiRegionNote(false);
+                QTRY_VERIFY(!reader->regionPersistencePending() && !reader->pendingCommands());
+                reader->prepareAiRegion(settings,true);
+                QTRY_VERIFY(!reader->pendingCommands() && reader->aiState().value("plan").toMap().value("kind").toString()=="region_knowledge_note");
+                plan=reader->aiState().value("plan").toMap();
+            }
+        } else {
+            QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));
+            if(route=="unit") {
+                reader->loadSummaryCatalog("Page");
+                QTRY_VERIFY(!reader->pendingCommands() && !reader->summaryCatalog().value("rows").toList().isEmpty());
+                const auto id=reader->summaryCatalog().value("rows").toList().first().toMap().value("id");
+                QVERIFY(QMetaObject::invokeMethod(panel,"prepareUnit",Q_ARG(QVariant,id)));
+            } else {
+                const bool translating=route.endsWith("translation");
+                reader->setAiInput("view",translating?"translation":"summary");
+                if(translating) {
+                    reader->setAiInput("translationScope","document");
+                    if(route=="custom-translation") {
+                        reader->setAiInput("language","French");
+                        QVERIFY(view.workspace.setAiOutputLanguage("German"));
+                        expected="French";
+                    }
+                } else {
+                    reader->setAiInput("action",route=="selection"?5:1);
+                    if(route=="selection")view.window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",17}});
+                }
+                QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));
+            }
+            QTRY_VERIFY2(!reader->pendingCommands() && !reader->aiState().value("plan").toMap().isEmpty(),qPrintable(reader->aiState().value("status").toString()));
+            plan=reader->aiState().value("plan").toMap();
+        }
+        const auto parts=plan.value("parts").toList();
+        QCOMPARE(parts.size(),1);
+        const auto exact=parts.first().toMap().value("wire_body").toString().toUtf8();
+        QVERIFY(!exact.isEmpty());
+        QCOMPARE(exact.contains(expected.toUtf8()),route!="region-control" && route!="document-language");
+        if(route=="custom-translation")QVERIFY(!exact.contains("German"));
+        const int previousRequests=server.requests.size();
+        QCOMPARE(previousRequests,route=="region-note"?1:0);
+        if(route=="document-reading") {
+            QVERIFY(reader->startDocumentReading("local",plan,token));
+            QTRY_COMPARE_WITH_TIMEOUT(reader->documentReading().value("phase").toString(),QString("ready"),10000);
+        } else {
+            QVERIFY(reader->startAi("local",plan));
+            QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);
+        }
+        QTRY_COMPARE(server.requests.size(),previousRequests+1);
+        const auto actual=server.requests.last();
+        QCOMPARE(actual.mid(actual.indexOf("\r\n\r\n")+4),exact);
+    }
+    void globalOutputLanguageSavesOutsideTheProviderAndReachesEveryReader_data() {
+        QTest::addColumn<bool>("chatGpt");
+        QTest::addColumn<bool>("unknown");
+        for(bool account:{false,true})for(bool unknown:{false,true})
+            QTest::newRow(qPrintable(QString(account?"chatgpt":"api")+(unknown?"-unknown":"-known")))<<account<<unknown;
+    }
+    void globalOutputLanguageSavesOutsideTheProviderAndReachesEveryReader() {
+        QFETCH(bool,chatGpt);
+        QFETCH(bool,unknown);
+        ReadingPreferenceGuard preferences;
+        ChatGptPreferenceGuard profiles;
+        QSettings saved;
+        saved.setValue("chatGptPlan/connectionMode",chatGpt?"chatGPT":"apiKey");
+        saved.remove("chatGptPlan/accounts");
+        const QVariant original=unknown?QVariant(QVariantMap{{"future",true}}):QVariant("French");
+        saved.setValue("reader/preferences/aiOutputLanguage",original);
+        MockChatServer server;
+        QVERIFY(server.listen());
+        const QVariantMap provider{{"baseUrl",server.baseUrl()},{"model","synthetic-global-language"},{"opaque",true}};
+        saved.setValue("reader/preferences/ai",provider);
+        saved.sync();
+        NativeCorpus::Viewer first,second;
+        QVERIFY(first.window && second.window);
+        first.window->setProperty("appearance",chatGpt?"dark":"light");
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));
+        auto *settings=first.window->findChild<QQuickWindow *>("settingsWindow");
+        QVERIFY(settings);
+        auto *field=visualItem(settings->contentItem(),"settingsOutputLanguage");
+        QVERIFY2(field,"The global output language must be available in both connection modes");
+        auto *issue=visualItem(settings->contentItem(),"settingsOutputLanguageIssue");
+        QVERIFY(issue);
+        QCOMPARE(issue->isVisible(),unknown);
+        QCOMPARE(field->property("text").toString(),unknown?QString{}:QString("French"));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_OUTPUT_LANGUAGE_EVIDENCE");
+        if(!evidence.isEmpty()) {
+            QSignalSpy frames(settings,&QQuickWindow::frameSwapped);settings->update();
+            QTRY_VERIFY(settings->isExposed() && !frames.isEmpty());
+            settings->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),settings);
+            field->forceActiveFocus(Qt::TabFocusReason);
+            if(unknown) {
+                auto *scroll=visualItem(settings->contentItem(),"settingsScroll");QVERIFY(scroll);
+                QVERIFY(QMetaObject::invokeMethod(scroll,"revealItem",Q_ARG(QVariant,QVariant::fromValue(issue))));
+            }
+            QSignalSpy rendered(settings,&QQuickWindow::frameSwapped);settings->update();QTRY_VERIFY(!rendered.isEmpty());
+            QVERIFY(settings->grabWindow().save(evidence+"-"+QTest::currentDataTag()+".png"));
+        }
+        // Saving unrelated settings must retain an unknown future representation.
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));
+        QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(first.workspace.preference("aiOutputLanguage",{}),original);
+        const auto edit=[&] {
+            settings->requestActivate();
+            if(!QTest::qWaitFor([&]{return QGuiApplication::focusWindow()==settings;},3000))return false;
+            field->forceActiveFocus(Qt::TabFocusReason);
+            QTest::keyClick(settings,Qt::Key_A,Qt::ControlModifier);
+            for(const auto ch:QString("German"))QTest::keyClick(settings,ch.toLatin1());
+            return field->property("text").toString()=="German";
+        };
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));
+        QVERIFY(edit());
+        QTest::keyClick(settings,Qt::Key_Escape);
+        QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(first.workspace.preference("aiOutputLanguage",{}),original);
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));
+        QVERIFY(edit());
+        QVERIFY(QMetaObject::invokeMethod(settings,"save"));
+        QTRY_VERIFY(!settings->isVisible());
+        QCOMPARE(first.workspace.preference("aiOutputLanguage",{}),QVariant("German"));
+        for(auto *workspace:{&first.workspace,&second.workspace}) {
+            QCOMPARE(workspace->activeReader()->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("German"));
+            QCOMPARE(workspace->preference("ai",{}).toMap(),provider);
+        }
+        first.workspace.newTab();
+        QCOMPARE(first.workspace.activeReader()->aiState().value("input").toMap().value("language").toString(),QString("German"));
+        first.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));
+        QTRY_VERIFY(!first.workspace.activeReader()->loading() && first.workspace.activeReader()->pageCount()==1);
+        QCOMPARE(first.workspace.activeReader()->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("German"));
+        QCOMPARE(server.requests.size(),0);
     }
     void settingsProviderFieldsHaveVisibleBoundariesAndKeepDraftsPrivate_data() {
         QTest::addColumn<bool>("dark");
@@ -8408,9 +8836,9 @@ Rectangle {
     }
 
     void summaryLanguageEditorRejectsQueuedEditsAfterTabAndDocumentChanges() {
-        MockChatServer sentinel;QVERIFY(sentinel.listen());QTemporaryDir scratch;const auto firstPath=scratch.filePath("language-first.pdf"),secondPath=scratch.filePath("language-second.pdf");for(const auto &path:{firstPath,secondPath})QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;QSignalSpy warnings(&view.engine,&QQmlEngine::warnings);view.workspace.openFile(QUrl::fromLocalFile(firstPath));auto *first=view.workspace.activeReader();QTRY_COMPARE(first->pageCount(),1);QTRY_COMPARE(first->pendingCommands(),0);window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-language-ownership"}});QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);first->loadSummaryCatalog("Page");QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(QMetaObject::invokeMethod(panel,"prepareUnit",Q_ARG(QVariant,"page:1")));QTRY_COMPARE(first->pendingCommands(),0);auto *field=visualItem(window->contentItem(),"aiSummaryLanguage");QVERIFY(field);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);field->forceActiveFocus();for(const auto ch:QStringLiteral("French"))QTest::keyClick(window,ch.toLatin1());QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft").toString(),QString("French"));QInputMethodEvent ime;ime.setCommitString(QString::fromUtf8(" 日本語"));QCoreApplication::sendEvent(field,&ime);QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft").toString(),QString::fromUtf8("French 日本語"));const auto draft=first->aiState().value("input").toMap().value("summaryLanguageDraft");QPointer<QObject> oldEditor=window->findChild<QObject *>("summaryLanguageEditor");QVERIFY(oldEditor);QVERIFY(QMetaObject::invokeMethod(oldEditor,"commitDraft",Qt::QueuedConnection,Q_ARG(QVariant,"STALE_TAB")));const auto oldGeneration=first->documentGeneration();
-        view.workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=view.workspace.activeReader();QVERIFY(second!=first);QTRY_COMPARE(second->pageCount(),1);QTRY_COMPARE(second->pendingCommands(),0);QCoreApplication::processEvents();QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft"),draft);QVERIFY(!second->aiState().value("input").toMap().contains("summaryLanguageDraft"));QTRY_VERIFY(oldEditor.isNull());view.workspace.selectTab(0);QCOMPARE(view.workspace.activeReader(),first);QTRY_VERIFY((field=visualItem(window->contentItem(),"aiSummaryLanguage")));QCOMPARE(field->property("text").toString(),draft.toString());
-        oldEditor=window->findChild<QObject *>("summaryLanguageEditor");QVERIFY(oldEditor);QVERIFY(QMetaObject::invokeMethod(oldEditor,"commitDraft",Qt::QueuedConnection,Q_ARG(QVariant,"STALE_REOPEN")));first->openFile(QUrl::fromLocalFile(firstPath));QTRY_COMPARE(first->pageCount(),1);QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(first->documentGeneration()!=oldGeneration);first->loadSummaryCatalog("Page");QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(QMetaObject::invokeMethod(panel,"prepareUnit",Q_ARG(QVariant,"page:1")));QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(!first->summaryUnitContext().isEmpty());QVERIFY(!first->aiState().value("input").toMap().contains("summaryLanguageDraft"));bool accepted=true;QVERIFY(QMetaObject::invokeMethod(first,"setSummaryLanguageDraft",Q_RETURN_ARG(bool,accepted),Q_ARG(QString,"STALE_GENERATION"),Q_ARG(qulonglong,oldGeneration)));QVERIFY(!accepted);QVERIFY(QMetaObject::invokeMethod(first,"applySummaryLanguage",Q_RETURN_ARG(bool,accepted),Q_ARG(qulonglong,oldGeneration)));QVERIFY(!accepted);QTRY_VERIFY(oldEditor.isNull());QTRY_VERIFY((field=visualItem(window->contentItem(),"aiSummaryLanguage")));QCOMPARE(field->property("text").toString(),QString{});QCOMPARE(sentinel.requests.size(),0);QCOMPARE(warnings.size(),0);QVERIFY(!first->hasUnsavedChanges());QVERIFY(!second->hasUnsavedChanges());
+        MockChatServer sentinel;QVERIFY(sentinel.listen());QTemporaryDir scratch;const auto firstPath=scratch.filePath("language-first.pdf"),secondPath=scratch.filePath("language-second.pdf");for(const auto &path:{firstPath,secondPath})QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;QSignalSpy warnings(&view.engine,&QQmlEngine::warnings);view.workspace.openFile(QUrl::fromLocalFile(firstPath));auto *first=view.workspace.activeReader();QTRY_COMPARE(first->pageCount(),1);QTRY_COMPARE(first->pendingCommands(),0);const auto seededInput=first->aiState().value("input").toMap();window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-language-ownership"}});QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);first->loadSummaryCatalog("Page");QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(QMetaObject::invokeMethod(panel,"prepareUnit",Q_ARG(QVariant,"page:1")));QTRY_COMPARE(first->pendingCommands(),0);auto *field=visualItem(window->contentItem(),"aiSummaryLanguage");QVERIFY(field);window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);field->forceActiveFocus();for(const auto ch:QStringLiteral("French"))QTest::keyClick(window,ch.toLatin1());QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft").toString(),QString("French"));QInputMethodEvent ime;ime.setCommitString(QString::fromUtf8(" 日本語"));QCoreApplication::sendEvent(field,&ime);QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft").toString(),QString::fromUtf8("French 日本語"));const auto draft=first->aiState().value("input").toMap().value("summaryLanguageDraft");QPointer<QObject> oldEditor=window->findChild<QObject *>("summaryLanguageEditor");QVERIFY(oldEditor);QVERIFY(QMetaObject::invokeMethod(oldEditor,"commitDraft",Qt::QueuedConnection,Q_ARG(QVariant,"STALE_TAB")));const auto oldGeneration=first->documentGeneration();
+        view.workspace.openFile(QUrl::fromLocalFile(secondPath));auto *second=view.workspace.activeReader();QVERIFY(second!=first);QTRY_COMPARE(second->pageCount(),1);QTRY_COMPARE(second->pendingCommands(),0);QCoreApplication::processEvents();QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft"),draft);QCOMPARE(second->aiState().value("input").toMap().value("summaryLanguageDraft"),seededInput.value("summaryLanguageDraft"));QTRY_VERIFY(oldEditor.isNull());view.workspace.selectTab(0);QCOMPARE(view.workspace.activeReader(),first);QTRY_VERIFY((field=visualItem(window->contentItem(),"aiSummaryLanguage")));QCOMPARE(field->property("text").toString(),draft.toString());
+        oldEditor=window->findChild<QObject *>("summaryLanguageEditor");QVERIFY(oldEditor);QVERIFY(QMetaObject::invokeMethod(oldEditor,"commitDraft",Qt::QueuedConnection,Q_ARG(QVariant,"STALE_REOPEN")));first->openFile(QUrl::fromLocalFile(firstPath));QTRY_COMPARE(first->pageCount(),1);QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(first->documentGeneration()!=oldGeneration);first->loadSummaryCatalog("Page");QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(QMetaObject::invokeMethod(panel,"prepareUnit",Q_ARG(QVariant,"page:1")));QTRY_COMPARE(first->pendingCommands(),0);QVERIFY(!first->summaryUnitContext().isEmpty());QCOMPARE(first->aiState().value("input").toMap().value("summaryLanguageDraft"),seededInput.value("summaryLanguageDraft"));bool accepted=true;QVERIFY(QMetaObject::invokeMethod(first,"setSummaryLanguageDraft",Q_RETURN_ARG(bool,accepted),Q_ARG(QString,"STALE_GENERATION"),Q_ARG(qulonglong,oldGeneration)));QVERIFY(!accepted);QVERIFY(QMetaObject::invokeMethod(first,"applySummaryLanguage",Q_RETURN_ARG(bool,accepted),Q_ARG(qulonglong,oldGeneration)));QVERIFY(!accepted);QTRY_VERIFY(oldEditor.isNull());QTRY_VERIFY((field=visualItem(window->contentItem(),"aiSummaryLanguage")));QCOMPARE(field->property("text").toString(),QString{});QCOMPARE(sentinel.requests.size(),0);QCOMPARE(warnings.size(),0);QVERIFY(!first->hasUnsavedChanges());QVERIFY(!second->hasUnsavedChanges());
     }
 
     void summaryLanguageApplyRetiresReentrantPreparationWithoutLabellingOrdinaryAnswers() {
@@ -8972,7 +9400,7 @@ QtObject {
         for(const auto &answer:{"Synthetic summary", "Synthetic translation [p.2]", "Synthetic selected text [p.1] [p.2]", "Synthetic chat [p.1]"})server.responses.append({{MockChatServer::delta({{"content",answer}}),QByteArray("data: [DONE]\n\n")},30,200});
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.path()+"/workspaces.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
         NativeCorpus::Viewer view;QVERIFY(view.window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),3,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
-        view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        const auto seededInput=reader->aiState().value("input").toMap();view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","fixture"}});QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);
         QCOMPARE(panel->property("action").toInt(),1); // Document summary is the normal summary target.
         reader->setAiInput("action",0);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
         auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("action").toString(),QString("SummarizePage"));QVERIFY(reader->startAi("local",plan));
@@ -8993,7 +9421,7 @@ QtObject {
         auto *conversation=visualItem(view.window->contentItem(),"aiConversationHistory");QVERIFY(conversation);auto *flick=conversation->property("contentItem").value<QObject *>();QVERIFY(flick);QTRY_VERIFY(flick->property("atYEnd").toBool());
         const auto capture=qEnvironmentVariable("LYRA_READER_AI_VIEWS_SNAPSHOT");if(!capture.isEmpty())QVERIFY(view.window->grabWindow().save(capture));
         reader->clearAiChat();QTRY_VERIFY(reader->aiState().value("chatTurns").toList().isEmpty());QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(panel->property("result").toMap().value("output").toString().isEmpty());QCOMPARE(reader->aiState().value("results").toMap().value("summary").toMap(),saved);QVERIFY(reader->aiState().value("results").toMap().contains("translation"));QCOMPARE(server.requests.size(),4);
-        view.workspace.newTab();QVERIFY(view.workspace.activeReader()->aiState().isEmpty());view.workspace.selectTab(0);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString());
+        view.workspace.newTab();QCOMPARE(view.workspace.activeReader()->aiState(),QVariantMap({{"input",seededInput}}));QVERIFY(!view.workspace.activeReader()->hasAiUserState());view.workspace.selectTab(0);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString());
     }
     void documentChatStopsFollowingWhenTheReaderScrollsUp() {
         MockChatServer server;QVERIFY(server.listen());MockChatServer::Response stream;stream.holdLast=true;stream.delay=1800;QString longAnswer;for(int i=0;i<100;++i)longAnswer+=QString("Synthetic paragraph %1 with enough text to scroll.\n\n").arg(i);stream.chunks={MockChatServer::delta({{"content",longAnswer}}),MockChatServer::delta({{"content","Later streaming chunk"}}),QByteArray("data: [DONE]\n\n")};server.responses.append(stream);
@@ -9053,7 +9481,7 @@ QtObject {
     }
     void closingAiWithAComposerFocusedReturnsKeyboardUndoToTheDocument() {
         QTemporaryDir scratch;const auto path=scratch.path()+"/ai-focus.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);QSignalSpy qmlWarnings(&view.engine,&QQmlEngine::warnings);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_COMPARE_WITH_TIMEOUT(reader->pageCount(),1,10000);QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);
-        reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",60},{"y",120},{"width",60},{"height",40}}},{"color","#90B79AFF"},{"note","Synthetic document undo"},{"strokeWidth",2}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().size(),1);
+        const auto seededInput=reader->aiState().value("input").toMap();reader->submit("mark_create",{{"entry",QVariantMap{{"kind","square"},{"page",0},{"version",1},{"rect",QVariantMap{{"x",60},{"y",120},{"width",60},{"height",40}}},{"color","#90B79AFF"},{"note","Synthetic document undo"},{"strokeWidth",2}}}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().size(),1);
         QVERIFY(QMetaObject::invokeMethod(view.window,"openAiWorkspace",Q_ARG(QVariant,"chat")));auto *composer=visualItem(view.window->contentItem(),"aiQuestion");QVERIFY(composer);composer->forceActiveFocus();QTRY_VERIFY(composer->hasActiveFocus());for(const auto ch:QByteArray("Draft retained"))QTest::keyClick(view.window,ch);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,false)));QVERIFY(!composer->hasActiveFocus());auto *canvas=visualItem(view.window->contentItem(),"pageList");QVERIFY(canvas && canvas->hasActiveFocus());QTest::keyClick(view.window,Qt::Key_Z,Qt::ControlModifier);QTRY_COMPARE_WITH_TIMEOUT(reader->data().value("marks").toMap().value("annotations").toList().size(),0,10000);QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QVERIFY(!composer->hasActiveFocus());QVERIFY(canvas->hasActiveFocus());
@@ -9061,7 +9489,7 @@ QtObject {
         view.window->setProperty("textViewVisible",false);QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));QVERIFY(QMetaObject::invokeMethod(view.window,"showOverview",Q_ARG(QVariant,false)));auto *grid=visualItem(view.window->contentItem(),"pageOverview");QVERIFY(grid && grid->isVisible());composer->forceActiveFocus();view.window->setProperty("aiPanelVisible",false);QTRY_VERIFY(grid->hasActiveFocus());QVERIFY(!canvas->hasActiveFocus());
         QVERIFY(QMetaObject::invokeMethod(view.window,"showAiPanel",Q_ARG(QVariant,true)));composer->forceActiveFocus();view.workspace.newTab();QTRY_VERIFY(!composer->hasActiveFocus());QVERIFY(view.workspace.activeReader()->aiState().value("input").toMap().value("chatQuestion").toString().isEmpty());QCOMPARE(reader->aiState().value("input").toMap().value("chatQuestion").toString(),QString("Draft retained"));
         const auto loops=qmlBindingLoops(qmlWarnings);QVERIFY2(loops.isEmpty(),qPrintable(loops.join("\n")));
-        QCOMPARE(view.workspace.activeReader()->aiState().value("input").toMap(),QVariantMap());
+        QCOMPARE(view.workspace.activeReader()->aiState().value("input").toMap(),seededInput);QVERIFY(!view.workspace.activeReader()->hasAiUserState());
     }
     void auditViewerWorksWithoutAPdfAndClearsOnlyTheReviewedLocalSnapshot() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});const auto cache=scratch.path()+"/cache";qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());

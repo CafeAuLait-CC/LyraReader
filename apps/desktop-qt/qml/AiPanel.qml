@@ -180,7 +180,7 @@ Pane {
         request.selection=null;
         const accounts=app.session ? app.session.chatGptAccounts : null;
         if(accounts && !connectChatGpt(request,accounts,accounts.connectionMode==="chatGPT"))return;
-        request.language = input.summaryLanguage || null;
+        request.language = app.defaultAiOutputLanguage || null;
         owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
     }
     onWorkspaceChanged: {

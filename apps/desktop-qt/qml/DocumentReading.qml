@@ -29,7 +29,7 @@ Popup {
         if(useChatGpt && accounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
         const settings=app.aiSettings;
         const request={action:"SummarizeDocument",document_knowledge:true,document_knowledge_text:null,document_knowledge_pages:[],
-            current_page:0,selection:null,question:null,language:null,history:[],region:null,
+            current_page:0,selection:null,question:null,language:app.defaultAiOutputLanguage || null,history:[],region:null,
             base_url:settings.baseUrl || "http://localhost:11434/v1",model:settings.model || "",
             temperature:Object.prototype.hasOwnProperty.call(settings,"temperature") ? settings.temperature : null,
             max_tokens:Object.prototype.hasOwnProperty.call(settings,"maxTokens") ? settings.maxTokens : null,

@@ -495,6 +495,9 @@ ApplicationWindow {
     property real brushWidth: 2
     property string annotationFont: "LyraReader Sans SC"
     property var aiSettings: session ? session.preference("ai", {}) : ({})
+    readonly property var aiOutputLanguageValue:session ? session.aiOutputLanguage : ""
+    readonly property bool aiOutputLanguageValid:typeof aiOutputLanguageValue==="string"
+    readonly property string defaultAiOutputLanguage:aiOutputLanguageValid ? aiOutputLanguageValue : ""
     property var previousReader: null
     property var pendingPosition: null
     property var pendingLayoutPosition: null
@@ -2123,6 +2126,10 @@ ApplicationWindow {
         return true;
     }
     function beginAiPreparation() {
+        if(!aiOutputLanguageValid) {
+            operationStatus=qsTr("Choose a supported output language in Settings before preparing a new AI request.");
+            return false;
+        }
         const accounts=session ? session.chatGptAccounts : null;
         const revision=accounts ? accounts.profileRevision : 0;
         if(!refreshAiConnection())return false;
@@ -2988,6 +2995,19 @@ ApplicationWindow {
     }
     Connections {
         target: root.session
+        function onAiOutputLanguageChanged() {
+            const owner=root.pendingAiReader;
+            if(!owner)return;
+            const view=owner.aiState.previewView;
+            const affected=root.pendingAiPurpose==="document-reading"
+                || (root.pendingAiPurpose==="assistant" && ["summary","note","region_note"].indexOf(view)>=0);
+            if(!affected)return;
+            const currentPlan=root.pendingAiPurpose==="document-reading" ? owner.documentReading.plan : owner.aiState.plan;
+            if(currentPlan && Object.keys(currentPlan).length>0)return;
+            root.credentialReadId=-1;
+            if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
+            root.pendingAiReader=null;root.pendingAiPlan=null;root.pendingAiToken="";
+        }
         function onPrintFinished(error) {
             root.operationStatus = error || qsTr("Print job completed.");
         }

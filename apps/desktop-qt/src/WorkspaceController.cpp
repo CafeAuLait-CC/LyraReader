@@ -37,6 +37,9 @@ QList<WorkspaceController *> &workspaces() {static QList<WorkspaceController *> 
 QVariantMap &readingPresetState() {static QVariantMap state;return state;}
 qulonglong &readingPresetRevision() {static qulonglong revision=0;return revision;}
 qulonglong &regionStyleRevision() {static qulonglong revision=0;return revision;}
+// UI-owned retry state: a failed settings flush must not turn a later same-value
+// Save into a no-op before the native readers have received the durable value.
+bool &outputLanguagePublicationPending() {static bool pending=false;return pending;}
 QVariantList normalizedRecents(const QVariantList &entries) {
     QVariantList result;QSet<QString> seen;
     for(const auto &value:entries) {
@@ -165,6 +168,8 @@ void WorkspaceController::connectReader(ReaderController *reader) {
 ReaderController *WorkspaceController::appendTab(bool notify) {
     auto *reader = new ReaderController(this);
     QQmlEngine::setObjectOwnership(reader,QQmlEngine::CppOwnership);
+    const auto language=aiOutputLanguage();
+    if(language.metaType()==QMetaType::fromType<QString>())reader->setDefaultAiOutputLanguage(language.toString());
     m_tabs.append(reader);
     connectReader(reader);
     if(notify)emit tabsChanged();
@@ -307,12 +312,12 @@ QString WorkspaceController::transferTabTo(WorkspaceController *target, ReaderCo
     const auto targetDocument=targetActive ? targetActive->documentHandle() : nullptr;
     const auto targetGeneration=targetActive ? targetActive->documentGeneration() : 0;
     const auto targetRevision=targetActive ? targetActive->editRevision() : 0;
-    const bool replaceEmpty=targetTabs.size()==1 && targetActive && !targetActive->pageCount() && targetActive->fileUrl().isEmpty() && targetActive->aiState().isEmpty();
+    const bool replaceEmpty=targetTabs.size()==1 && targetActive && !targetActive->pageCount() && targetActive->fileUrl().isEmpty() && !targetActive->hasAiUserState();
     const auto unchanged=[&] {
         return source && destination && reader && sourceActive && targetActive && (!before || anchor) &&
             source->m_tabs==sourceTabs && destination->m_tabs==targetTabs && source->activeReader()==sourceActive && destination->activeReader()==targetActive &&
             reader->documentHandle()==document && reader->documentGeneration()==generation && reader->editRevision()==revision &&
-            targetActive->documentHandle()==targetDocument && targetActive->documentGeneration()==targetGeneration && targetActive->editRevision()==targetRevision && (!replaceEmpty || targetActive->aiState().isEmpty());
+            targetActive->documentHandle()==targetDocument && targetActive->documentGeneration()==targetGeneration && targetActive->editRevision()==targetRevision && (!replaceEmpty || !targetActive->hasAiUserState());
     };
     QVariantMap sourceAiSettings,targetAiSettings;
     auto windowReason=[&](WorkspaceController *workspace) {
@@ -595,6 +600,48 @@ QVariantMap WorkspaceController::inspectReasoning(const QString &mode,const QStr
 }
 QVariantMap WorkspaceController::generationDefaults() const {
     return inspectNativeSettings([](LyraReaderBuffer *output,LyraReaderBuffer *error){return lyra_reader_desktop_generation_defaults(output,error);},tr("The generation defaults could not be loaded."),tr("The generation defaults returned an invalid response."));
+}
+QVariant WorkspaceController::aiOutputLanguage() const {
+    QSettings settings;
+    const QString key=QStringLiteral("reader/preferences/aiOutputLanguage");
+    // Preserve unknown future representations instead of converting them into
+    // a normal empty-language preference. The settings UI diagnoses them.
+    return settings.contains(key) ? settings.value(key) : QVariant(QString{});
+}
+bool WorkspaceController::setAiOutputLanguage(const QString &language) {
+    const auto previous=aiOutputLanguage();
+    // An undecodable stored value cannot be restored faithfully through QVariant
+    // after a failed flush. Keep its original representation until recovery.
+    if(!previous.isValid())return false;
+    if(previous.metaType()==QMetaType::fromType<QString>() && previous.toString()==language
+        && !outputLanguagePublicationPending())return true;
+    QSettings settings;
+    const QString key=QStringLiteral("reader/preferences/aiOutputLanguage");
+    const bool existed=settings.contains(key);
+    settings.setValue(key,language);
+    settings.sync();
+    if(settings.status()!=QSettings::NoError) {
+        outputLanguagePublicationPending()=true;
+        // QSettings keeps pending writes in its shared process cache even when
+        // the atomic disk flush fails. Restore decodable values or absence so
+        // another settings window cannot mistake an unsaved draft for a save.
+        if(existed && previous.isValid())settings.setValue(key,previous);
+        else if(!existed)settings.remove(key);
+        return false;
+    }
+    outputLanguagePublicationPending()=false;
+    QList<QPointer<WorkspaceController>> recipients;
+    for(auto *workspace:workspaces())recipients.append(workspace);
+    for(const auto &workspace:recipients)if(workspace) {
+        QList<QPointer<ReaderController>> readers;
+        for(auto *reader:workspace->m_tabs)readers.append(reader);
+        for(const auto &reader:readers) {
+            if(!workspace)break;
+            if(reader)reader->setDefaultAiOutputLanguage(language);
+        }
+        if(workspace)emit workspace->aiOutputLanguageChanged();
+    }
+    return true;
 }
 QVariant WorkspaceController::preference(const QString &key,const QVariant &fallback) const {
     QSettings settings;

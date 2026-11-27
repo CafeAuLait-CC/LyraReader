@@ -22,6 +22,7 @@ class WorkspaceController : public QObject {
     Q_PROPERTY(PreviewController *preview READ preview CONSTANT)
     Q_PROPERTY(CredentialStore *credentials READ credentials CONSTANT)
     Q_PROPERTY(ConnectionTestController *connectionTest READ connectionTest CONSTANT)
+    Q_PROPERTY(QVariant aiOutputLanguage READ aiOutputLanguage NOTIFY aiOutputLanguageChanged)
     Q_PROPERTY(ChatGptAccounts *chatGptAccounts READ chatGptAccounts CONSTANT)
     Q_PROPERTY(QuitCoordinator *quitCoordinator READ quitCoordinator CONSTANT)
     Q_PROPERTY(bool tabTransferInProgress READ tabTransferInProgress NOTIFY tabTransferStateChanged)
@@ -78,12 +79,15 @@ public:
     Q_INVOKABLE bool applyRegionConversationStyle(const QString &id);
     Q_INVOKABLE QVariantMap inspectReasoning(const QString &mode, const QString &encoding) const;
     Q_INVOKABLE QVariantMap generationDefaults() const;
+    QVariant aiOutputLanguage() const;
+    Q_INVOKABLE bool setAiOutputLanguage(const QString &language);
     Q_INVOKABLE QVariant preference(const QString &key, const QVariant &fallback = {}) const;
     Q_INVOKABLE void setPreference(const QString &key, const QVariant &value);
     Q_INVOKABLE QString localPath(const QUrl &url) const { return url.toLocalFile(); }
     Q_INVOKABLE QUrl urlForLocalPath(const QString &path) const { return QUrl::fromLocalFile(path); }
     Q_INVOKABLE QString writeTextFile(const QUrl &url, const QString &text);
 signals:
+    void aiOutputLanguageChanged();
     void readingPresetChanged();
     void regionConversationStyleChanged();
     void tabsChanged();

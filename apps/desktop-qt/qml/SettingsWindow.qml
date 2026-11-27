@@ -22,6 +22,10 @@ ApplicationWindow {
     property var initialMaxTokens:null
     property bool temperatureEdited:false
     property bool maxTokensEdited:false
+    property var initialOutputLanguage:""
+    property bool outputLanguageEdited:false
+    property string outputLanguageSaveError:""
+    readonly property bool unknownOutputLanguage:typeof initialOutputLanguage!=="string" && !outputLanguageEdited
     readonly property var generationSeeds:app.session ? app.session.generationDefaults() : ({valid:false})
     readonly property bool generationSeedsReady:!!generationSeeds.valid && validTemperature(generationSeeds.temperature) && validMaxTokens(generationSeeds.max_tokens)
     readonly property bool unknownTemperature:initialHasTemperature && initialTemperature!==null && !validTemperature(initialTemperature) && !temperatureEdited
@@ -87,6 +91,9 @@ ApplicationWindow {
         encoding.currentIndex=encodingValues.indexOf(initialReasoningEncoding);
         loadGenerationDraft();
         initialReduceMotion=reduceMotion.checked;initialGap=gap.value;initialAiDraft=aiDraft();
+        initialOutputLanguage=app.session ? app.session.aiOutputLanguage : "";
+        outputLanguage.text=typeof initialOutputLanguage==="string" ? initialOutputLanguage : "";
+        outputLanguageEdited=false;outputLanguageSaveError="";
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
         if(!policy.prepare(settings,app,saved,560,650)){auditOnOpen=false;app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
@@ -151,6 +158,14 @@ ApplicationWindow {
     }
     function save() {
         if(reasoningBlocksSave)return;
+        const languageChanged=outputLanguageEdited
+            && (typeof initialOutputLanguage!=="string" || outputLanguage.text!==initialOutputLanguage);
+        if(languageChanged && (!app.session || !app.session.setAiOutputLanguage(outputLanguage.text))) {
+            outputLanguageSaveError=initialOutputLanguage===undefined || initialOutputLanguage===null
+                ? qsTr("The saved output language could not be read and was kept. Recover the saved preference before replacing it.")
+                : qsTr("The output language could not be saved. The stored value was kept; try again when saving is available.");
+            return;
+        }
         const selectedPaper=app.readingPresets[paper.currentIndex];
         const selectedAppearance=["light","dark","system"][appearance.currentIndex];
         if(selectedPaper && (paperPresetEdited || selectedPaper.id!==initialPaper)
@@ -189,6 +204,15 @@ ApplicationWindow {
         function onConnectionModeChanged() {if(settings.connectionTest)settings.connectionTest.cancel();settings.connectionError="";if(settings.accounts.connectionMode==="chatGPT")apiKey.clear();}
     }
     Connections {target:settings.app;function onAiSettingsChanged(){if(settings.connectionTest)settings.connectionTest.cancel();}}
+    Connections {
+        target:settings.app.session
+        function onAiOutputLanguageChanged() {
+            // A Wayland open intent can still be waiting for its parent's first frame.
+            if(settings.outputLanguageEdited)return;
+            settings.initialOutputLanguage=settings.app.session.aiOutputLanguage;
+            outputLanguage.text=typeof settings.initialOutputLanguage==="string" ? settings.initialOutputLanguage : "";
+        }
+    }
     function connectionTestStatus() {
         const state=connectionTestState,phase=state.phase;
         if(connectionTest && connectionTest.busy)return state.model ? qsTr("Testing %1…").arg(state.model) : qsTr("Testing the connection…");
@@ -313,6 +337,30 @@ ApplicationWindow {
                     Layout.topMargin: 12
                 }
                 Button {objectName:"openAuditTrail";text:qsTr("Local audit trail…");onClicked:auditDialog.open()}
+                Label {text:qsTr("Reading workflow");font.weight:Font.DemiBold;textFormat:Text.PlainText;Layout.topMargin:8}
+                Label {text:qsTr("Output language (blank uses document language)");textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true}
+                ReadingTextField {
+                    id:outputLanguage
+                    objectName:"settingsOutputLanguage"
+                    app:settings.app
+                    font.pixelSize:13;topPadding:5;bottomPadding:5
+                    Layout.fillWidth:true
+                    placeholderText:settings.unknownOutputLanguage ? qsTr("Unrecognized saved language") : qsTr("Document language")
+                    Accessible.name:qsTr("Default AI output language")
+                    onTextEdited:{settings.outputLanguageEdited=true;settings.outputLanguageSaveError="";}
+                }
+                Label {
+                    text:qsTr("Applies when you save. Existing translation targets are kept.")
+                    textFormat:Text.PlainText;wrapMode:Text.Wrap;Layout.fillWidth:true
+                    font.pixelSize:11;color:settings.colors.textSecondary
+                }
+                Label {
+                    objectName:"settingsOutputLanguageIssue"
+                    Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;font.pixelSize:11
+                    visible:settings.unknownOutputLanguage || settings.outputLanguageSaveError.length>0
+                    color:settings.colors.errorFg
+                    text:settings.outputLanguageSaveError || qsTr("The saved output language is unrecognized. Enter a language, or clear the field, to replace it. Other settings keep the saved value.")
+                }
                 Label {text:qsTr("Use AI with");textFormat:Text.PlainText}
                 LyraReadingSegmentedPicker {
                     objectName: "settingsAiConnectionMode"

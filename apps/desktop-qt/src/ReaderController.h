@@ -106,6 +106,7 @@ public:
     Q_INVOKABLE bool cancelTranslation(const QString &id);
     QStringList translationCancellingRows()const{return m_translationRowsCancelling.values();}
     QVariantMap aiState()const{return m_aiState;}
+    bool hasAiUserState() const;
     QObject *readingTerm()const;
     Q_INVOKABLE bool startAiTerm(const QString &key,const QVariantMap &expectedPlan);
     QVariantMap summaryCatalog()const{return m_summaryCatalog;}
@@ -174,6 +175,7 @@ public:
     bool startChatGptRequest(const QString &account,const QString &token,const QVariantMap &plan,const QString &readingToken);
     Q_INVOKABLE void cancelAi();
     Q_INVOKABLE void setAiInput(const QString &key,const QVariant &value);
+    void setDefaultAiOutputLanguage(const QString &language);
     Q_INVOKABLE void invalidateAiPlan();
     Q_INVOKABLE void clearAiChat();
     Q_INVOKABLE void newAiChat();
@@ -388,6 +390,10 @@ private:
     void retainAiResult(const QString &state);
     QTimer m_aiTimer;
     QVariantMap m_aiState;
+    QVariantMap m_aiDefaultInput;
+    QString m_defaultAiOutputLanguage;
+    bool m_aiOutputLanguageInitialized=false;
+    QVariantMap initialAiLanguageInput() const;
     QVariantMap m_aiRegion;
     QVariantList m_aiRegionPreviousTurns;
     QVariantMap m_aiRegionPaper,m_aiRegionPaperSpec;

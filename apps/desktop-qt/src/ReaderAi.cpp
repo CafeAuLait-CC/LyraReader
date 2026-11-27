@@ -5,6 +5,7 @@
 #include <QFutureWatcher>
 #include <QJsonArray>
 #include <QJsonDocument>
+#include <QLocale>
 #include <QPointer>
 #include <QTextDocument>
 #include <QUuid>
@@ -51,6 +52,53 @@ void ReaderController::initAi() {
     });
     connect(this,&ReaderController::commandFinished,this,&ReaderController::handleAiCommand);
 }
+bool ReaderController::hasAiUserState() const {
+    if(m_aiState.isEmpty())return false;
+    return !m_aiOutputLanguageInitialized
+        || m_aiState!=QVariantMap{{QStringLiteral("input"),m_aiDefaultInput}};
+}
+QVariantMap ReaderController::initialAiLanguageInput() const {
+    if(!m_aiOutputLanguageInitialized)return {};
+    const auto preferred=QLocale::system().uiLanguages();
+    // A system with no preferred UI language uses the platform reader's
+    // explicit English fallback for translation.
+    const auto translation=m_defaultAiOutputLanguage.isEmpty()
+        ? (preferred.isEmpty()?QStringLiteral("English"):preferred.first()) : m_defaultAiOutputLanguage;
+    return {{QStringLiteral("summaryLanguage"),m_defaultAiOutputLanguage},
+            {QStringLiteral("summaryLanguageDraft"),m_defaultAiOutputLanguage},
+            {QStringLiteral("language"),translation}};
+}
+void ReaderController::setDefaultAiOutputLanguage(const QString &language) {
+    const bool first=!m_aiOutputLanguageInitialized;
+    if(!first && m_defaultAiOutputLanguage==language)return;
+    auto input=m_aiState.value(QStringLiteral("input")).toMap();
+    const auto oldSummary=input.value(QStringLiteral("summaryLanguage"),m_defaultAiOutputLanguage).toString();
+    m_defaultAiOutputLanguage=language;m_aiOutputLanguageInitialized=true;
+    if(first) {
+        const auto seeds=initialAiLanguageInput();
+        m_aiDefaultInput=seeds;
+        for(auto it=seeds.cbegin();it!=seeds.cend();++it)if(!input.contains(it.key()))input.insert(it.key(),it.value());
+    } else {
+        m_aiDefaultInput.insert(QStringLiteral("summaryLanguage"),language);
+        m_aiDefaultInput.insert(QStringLiteral("summaryLanguageDraft"),language);
+        // Global changes update Summary, preserving an already chosen
+        // translation target and a newer, unapplied summary text draft.
+        if(!input.contains(QStringLiteral("summaryLanguageDraft"))
+            || input.value(QStringLiteral("summaryLanguageDraft")).toString()==oldSummary)
+            input.insert(QStringLiteral("summaryLanguageDraft"),language);
+        input.insert(QStringLiteral("summaryLanguage"),language);
+    }
+    m_aiState.insert(QStringLiteral("input"),input);
+    m_aiState.remove(QStringLiteral("cachedWholeSummary"));m_summaryCacheId=0;
+    QPointer<ReaderController> alive(this);
+    const auto view=m_aiState.value(QStringLiteral("previewView")).toString();
+    if(!m_aiState.value(QStringLiteral("running")).toBool()
+        && (view==QStringLiteral("summary") || view==QStringLiteral("note") || view==QStringLiteral("region_note")))
+        invalidateAiPlan();
+    if(!alive)return;
+    invalidateDocumentReadingPreview();
+    if(alive)emit aiStateChanged();
+}
 void ReaderController::resetAi(bool preserveTranslationViews) {
     QPointer<ReaderController> termOwner(this);const auto termGeneration=m_generation;
     if(m_readingTerm)m_readingTerm->cancel();
@@ -72,6 +120,9 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     m_regionHistory.clear();m_aiRegionSaveId=0;m_generatedRegionNoteSaveId=0;emit regionHistoryChanged();
     m_chatDraftTimer.stop();m_chatDraftSaveId=0;m_savedChatDraft.clear();m_chatDraftSnapshot.clear();m_afterChatDraft.reset();
     m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiState.clear();
+    const auto input=initialAiLanguageInput();
+    m_aiDefaultInput=input;
+    if(!input.isEmpty())m_aiState.insert(QStringLiteral("input"),input);
     QPointer<ReaderController> alive(this);
     emit regionNoteDraftChanged();if(alive)emit aiStateChanged();
 }
@@ -305,6 +356,7 @@ void ReaderController::prepareAiRegion(const QVariantMap &settings,bool knowledg
     if(!m_aiRegion.value(QStringLiteral("persisted")).toBool() || revision.isEmpty()
         || !m_regionNoteDraft.isEmpty() || !m_regionSaveError.isEmpty())return;
     request.insert(QStringLiteral("action"),QStringLiteral("SummarizeDocument"));
+    request.insert(QStringLiteral("language"),m_defaultAiOutputLanguage.isEmpty()?QVariant{}:QVariant(m_defaultAiOutputLanguage));
     request.insert(QStringLiteral("region"),QVariant{});
     request.insert(QStringLiteral("question"),QVariant{});
     prepareAi(request,{},{{QStringLiteral("kind"),QStringLiteral("region_note")},{QStringLiteral("detail"),QStringLiteral("Standard")},
