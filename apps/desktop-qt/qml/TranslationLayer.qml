@@ -1,32 +1,45 @@
 import QtQuick
 import QtQuick.Controls
-import QtQuick.Layouts
+import "TranslationPlacement.js" as Placement
 
 Item {
     id: translationLayer
     objectName:"translationLayer"+page
-    clip:true
+    // A block's control can sit beside the sheet; the canvas viewport owns clipping.
+    clip:false
     required property var app
     required property int page
     required property var paperMap
     readonly property var owner: app.currentReader
     readonly property var generation: owner.documentGeneration
     readonly property bool loading: owner.loading
+    readonly property bool sourceCurrent: !!paperMap && paperMap.controller===owner && !loading
     readonly property var entries: owner.translationOverlays.filter(function(e){return e.target.page===translationLayer.page;})
+    readonly property rect displayViewport: {
+        const source=paperMap.visibleRegion;
+        const view=app.pageList;
+        if(!view)return Qt.rect(source.x*app.zoom,source.y*app.zoom,source.width*app.zoom,source.height*app.zoom);
+        // Track scrolling explicitly: mapToItem itself is not a notifying property.
+        const scrollX=view.contentX,scrollY=view.contentY;
+        const origin=mapToItem(view,0,0);
+        return Qt.rect(-origin.x,-origin.y,view.width,view.height);
+    }
     function restore() { if(!loading)owner.inspectTranslations(page); }
     function closeDisclosure() {
         disclosedContext=null;
         if(disclosure)disclosure.close();
-        disclosedText="";disclosedLanguage="";disclosedModel="";
+        disclosedText="";disclosedSource="";disclosedTitle="";disclosedAnchor=null;
     }
-    function restoreMenuFocus(context) {
-        // A menu or value-model change can retire its old button before the popup closes.
+    function restoreChipFocus(context) {
+        // A value-model change can retire the button that owned the disclosure.
         Qt.callLater(function() {
             if(!context || owner!==context.reader || generation!==context.generation || !app.active)return;
+            const window=translationLayer.Window.window;
+            if(window && window.activeFocusItem && window.activeFocusItem.objectName==="inplaceTranslationText")return;
             for(let i=0;i<passages.count;++i) {
                 const item=passages.itemAt(i);
-                if(item && item.modelData.id===context.id && item.menuButton.visible) {
-                    item.menuButton.forceActiveFocus(Qt.TabFocusReason);return;
+                if(item && item.modelData.id===context.id && item.chipControl.visible) {
+                    item.chipControl.focusControl(context.disclosure===true);return;
                 }
             }
         });
@@ -34,11 +47,14 @@ Item {
     function toggleOriginal(id) {
         const context={reader:owner,generation:generation,id:id};
         owner.toggleTranslation(id);
-        restoreMenuFocus(context);
+        restoreChipFocus(context);
     }
-    function showFull(entry) {
-        disclosedContext={reader:owner,generation:generation,id:entry.id};
-        disclosedText=entry.text;disclosedLanguage=entry.language || "";disclosedModel=entry.model || "";
+    function showFull(entry, anchor) {
+        if(!sourceCurrent || !entry || !entry.text.length || !anchor)return;
+        disclosedContext={reader:owner,generation:generation,id:entry.id,disclosure:true};
+        disclosedText=entry.text;disclosedSource=entry.target.source_text;
+        disclosedTitle=entry.target.is_block ? qsTr("Full translation") : qsTr("Full translation of the selection");
+        disclosedAnchor=anchor;
         disclosure.open();
     }
     Component.onCompleted: restore()
@@ -46,13 +62,18 @@ Item {
     onPageChanged: {closeDisclosure();restore();}
     onGenerationChanged: {closeDisclosure();restore();}
     onLoadingChanged: restore()
+    onSourceCurrentChanged: if(!sourceCurrent)closeDisclosure()
+    onEntriesChanged: {
+        const context=disclosedContext;
+        if(context && !entries.some(function(entry){return entry.id===context.id;}))closeDisclosure();
+    }
     Repeater {
         id:passages
         model: translationLayer.entries
         Item {
             id: overlay
             required property var modelData
-            property alias menuButton:chip
+            property alias chipControl:chip
             readonly property var target: modelData.target
             readonly property var r: target.rect
             readonly property rect source: Qt.rect(r.x_pt,r.y_pt,r.width_pt,r.height_pt)
@@ -60,15 +81,32 @@ Item {
                 const loaded=translationLayer.paperMap.loaded;
                 const refined=translationLayer.paperMap.refined;
                 const mode=translationLayer.paperMap.paperAppearance;
-                return loaded ? translationLayer.paperMap.translationPaperColor(source) : "transparent";
+                return translationLayer.sourceCurrent && loaded ? translationLayer.paperMap.translationPaperColor(source) : "transparent";
             }
             readonly property bool inViewport: {
                 const v=translationLayer.paperMap.visibleRegion;
                 return source.x<v.x+v.width && v.x<source.x+source.width && source.y<v.y+v.height && v.y<source.y+source.height;
             }
             readonly property bool original: !!modelData.original
-            readonly property bool paintReady: translationLayer.paperMap.loaded && paper.a>0
-            readonly property real textSize: Math.max(7,Math.min(18,target.source_font_pt))*app.zoom
+            readonly property bool paintReady: translationLayer.sourceCurrent && translationLayer.paperMap.loaded && paper.a>0
+            readonly property bool clipped: modelData.text.length > 8192
+                || fitProbe.contentHeight > fitProbe.height + 0.01
+                || fitProbe.contentWidth > fitProbe.width + 0.01
+            Text {
+                id: fitProbe
+                visible: false
+                Accessible.ignored: true
+                // Fit in source-page points, as on Mac. Display scaling must not
+                // turn the same completed translation into a clipped one.
+                width: Math.max(1,overlay.source.width-4)
+                height: Math.max(1,overlay.source.height-2)
+                text: overlay.paintText; textFormat: Text.PlainText
+                font.pixelSize: overlay.textSize
+                fontSizeMode: Text.Fit
+                minimumPixelSize: 7
+                wrapMode: Text.Wrap
+            }
+            readonly property real textSize: Math.max(7,Math.min(18,target.source_font_pt))
             readonly property string paintText: {
                 if(modelData.text.length<=8192)return modelData.text;
                 let end=8192;
@@ -77,124 +115,127 @@ Item {
                 return modelData.text.slice(0,end)+"…";
             }
             anchors.fill: parent
-            Component {
-                id: passagePaint
-                Rectangle {
-                    color: overlay.paper
-                    clip: true
-                    Accessible.ignored:true
-                    Text {
-                        objectName: "inplaceTranslationText"
-                        Accessible.ignored:true
-                        anchors.fill: parent
-                        anchors.leftMargin: 2*app.zoom; anchors.rightMargin: 2*app.zoom
-                        anchors.topMargin: app.zoom; anchors.bottomMargin: app.zoom
-                        text: overlay.paintText; textFormat: Text.PlainText
-                        color: translationLayer.paperMap.translationInkColor(overlay.paper)
-                        font.pixelSize: overlay.textSize
-                        fontSizeMode: Text.Fit
-                        minimumPixelSize: Math.max(1,Math.ceil(7*app.zoom))
-                        wrapMode: Text.Wrap; elide: Text.ElideRight
-                        maximumLineCount: Math.max(1,Math.floor(height/Math.max(1,7*app.zoom)))
-                    }
-                }
-            }
-            PaperStaticRegion {
+            TranslationTextRegion {
                 app:translationLayer.app;paperMap:translationLayer.paperMap;sourceRect:overlay.source
-                paintActive:overlay.inViewport && !overlay.original && overlay.paintReady
-                visible: !overlay.original && overlay.paintReady && translationLayer.paperMap.paperGeometryActive && mapped && bounded && geometryHit
-                // Preserve the base component's hit/visibility contract through an explicit query.
-                readonly property bool geometryHit: translationLayer.paperMap.paperRegion(overlay.source,translationLayer.paperMap.paperGeometryRevision).hit===true
-                paint:passagePaint
-                accessibleName: qsTr("Translated passage. Use its menu for the full text or original.")
-            }
-            Loader {
-                active: overlay.inViewport && !translationLayer.paperMap.paperGeometryActive && !overlay.original && overlay.paintReady
-                x:overlay.source.x*app.zoom;y:overlay.source.y*app.zoom
-                width:overlay.source.width*app.zoom;height:overlay.source.height*app.zoom
-                sourceComponent:passagePaint
+                showing:overlay.inViewport && !overlay.original && overlay.paintReady
+                translatedText:overlay.modelData.text
+                displayText:overlay.paintText
+                fontSize:fitProbe.fontInfo.pixelSize
+                paper:overlay.paper
             }
             PaperRegion {id: geometry;app:translationLayer.app;paperMap:translationLayer.paperMap;sourceRect:overlay.source}
             readonly property var chipRegion: {
-                const viewport=translationLayer.paperMap.visibleRegion;
-                const revision=translationLayer.paperMap.paperGeometryRevision;
-                let best=null,bestArea=0;
-                for(const piece of geometry.packet.pieces || []) {
-                    const p=translationLayer.paperMap.paperGeometryActive ? translationLayer.paperMap.paperPoint(Qt.point(piece.x,piece.y)) : {hit:true,x:piece.x,y:piece.y};
-                    if(!p.hit)continue;
-                    const left=Math.max(p.x,viewport.x),top=Math.max(p.y,viewport.y);
-                    const right=Math.min(p.x+piece.width,viewport.x+viewport.width),bottom=Math.min(p.y+piece.height,viewport.y+viewport.height);
-                    const area=Math.max(0,right-left)*Math.max(0,bottom-top);
-                    if(area>bestArea){bestArea=area;best={x:piece.x+(left-p.x),y:piece.y+(top-p.y),width:right-left,height:bottom-top};}
-                }
-                if(!best)return null;
+                const zoom=app.zoom;
+                const pieces=(geometry.packet.pieces || []).map(function(piece) {
+                    return {x:piece.x*zoom,y:piece.y*zoom,width:piece.width*zoom,height:piece.height*zoom};
+                });
                 const pageInfo=translationLayer.owner.pages[translationLayer.page];
-                if(!pageInfo)return null;
+                if(!pageInfo || !geometry.hit)return null;
                 const whole=Qt.rect(0,0,pageInfo.width,pageInfo.height);
-                const segments=translationLayer.paperMap.paperGeometryActive ? translationLayer.paperMap.paperRegion(whole,revision).pieces || [] : [whole];
-                for(const segment of segments) {
-                    if(best.y<segment.y || best.y>=segment.y+segment.height)continue;
-                    const origin=translationLayer.paperMap.paperGeometryActive ? translationLayer.paperMap.paperPoint(Qt.point(segment.x,segment.y)) : {hit:true,x:segment.x,y:segment.y};
-                    if(!origin.hit)continue;
-                    const top=Math.max(origin.y,viewport.y),bottom=Math.min(origin.y+segment.height,viewport.y+viewport.height);
-                    if((bottom-top)*app.zoom<22)return null;
-                    best.chipX=Math.max(0,(best.x+best.width)*app.zoom-24);
-                    best.chipY=Math.max((segment.y+top-origin.y)*app.zoom,Math.min(best.y*app.zoom,(segment.y+bottom-origin.y)*app.zoom-22));
-                    return best;
+                const segments=translationLayer.paperMap.paperGeometryActive
+                    ? translationLayer.paperMap.paperRegion(whole,translationLayer.paperMap.paperGeometryRevision).pieces || [] : [];
+                let gap=null;
+                if(segments.length===2) {
+                    const first=segments[0],last=segments[1];
+                    gap={x:first.x*zoom,y:(first.y+first.height)*zoom,width:first.width*zoom,
+                        height:(last.y-first.y-first.height)*zoom};
                 }
-                return null;
+                return Placement.place(pieces,translationLayer.displayViewport,{width:chip.width,height:chip.height},gap);
             }
-            Button {
+            Rectangle {
+                // Clear the entire inside control rectangle, including its rounded
+                // corners, with the sampled paper color. No glyph can show through.
+                objectName:"translationChipTextExclusion"
+                visible:chip.visible && overlay.chipRegion.inside && !overlay.original && overlay.paintReady
+                x:chip.x;y:chip.y;width:chip.width;height:chip.height
+                color:overlay.paper
+                Accessible.ignored:true
+            }
+            TranslationChip {
                 id: chip
-                objectName: "translationDisclosure"
-                visible: !!overlay.chipRegion
-                x: visible ? overlay.chipRegion.chipX : 0
-                y: visible ? overlay.chipRegion.chipY : 0
-                width:24;height:22;padding:0
-                text:"⋯";font.pixelSize:16
-                Accessible.name:qsTr("Translation for page %1: %2").arg(translationLayer.page+1).arg(Array.from(overlay.target.source_text.slice(0,162)).slice(0,80).join(""))
-                Accessible.description:qsTr("%1 using %2. Open the menu for full text or the original.").arg(overlay.modelData.language || "").arg(overlay.modelData.model || "")
-                ToolTip.visible:hovered;ToolTip.text:qsTr("Full translation or original")
-                // A page-local disclosure keeps its own anchor, independently of toolbar menus.
-                onClicked:menu.popup(0,height)
-                LyraMenu {
-                    id:menu
-                    objectName:"translationMenu"
-                    parent:chip;focus:true
-                    LyraMenuItem {
-                        objectName:"translationToggleOriginal"
-                        text: overlay.original ? qsTr("Show saved translation") : qsTr("Show original")
-                        onTriggered:translationLayer.toggleOriginal(overlay.modelData.id)
-                    }
-                    LyraMenuItem {objectName:"translationShowFull";text:qsTr("Full translation…");onTriggered:translationLayer.showFull(overlay.modelData)}
-                }
+                app: translationLayer.app
+                visible: translationLayer.sourceCurrent && !!overlay.chipRegion
+                readonly property string placement: overlay.chipRegion ? overlay.chipRegion.position : ""
+                x: visible ? overlay.chipRegion.x : 0
+                y: visible ? overlay.chipRegion.y : 0
+                original: overlay.original
+                clipped: overlay.clipped
+                contextDescription: qsTr("Page %1 · %2 using %3. %4").arg(translationLayer.page+1)
+                    .arg(overlay.modelData.language || "").arg(overlay.modelData.model || "")
+                    .arg(Array.from(overlay.target.source_text.slice(0,162)).slice(0,80).join(""))
+                onToggleRequested: translationLayer.toggleOriginal(overlay.modelData.id)
+                onDisclosureRequested: translationLayer.showFull(overlay.modelData,chip)
             }
 
         }
     }
-    property var disclosedContext:null
+    property var disclosedContext: null
+    property var disclosedAnchor: null
     property string disclosedText: ""
-    property string disclosedLanguage: ""
-    property string disclosedModel: ""
-            Dialog {
-                id:disclosure
-                objectName:"translationFullText"
-                parent:Overlay.overlay;anchors.centerIn:parent
-                width:Math.min(640,app.width-40);height:Math.min(480,app.height-40)
-                title:qsTr("Full translation");modal:true;standardButtons:Dialog.Close
-                onClosed: {
-                    const context=translationLayer.disclosedContext;
-                    translationLayer.disclosedContext=null;
-                    translationLayer.disclosedText="";translationLayer.disclosedLanguage="";translationLayer.disclosedModel="";
-                    translationLayer.restoreMenuFocus(context);
+    property string disclosedSource: ""
+    property string disclosedTitle: ""
+    Dialog {
+        id: disclosure
+        objectName: "translationFullText"
+        parent: Overlay.overlay
+        width: Math.min(440,app.width-16)
+        height: Math.min(260,app.height-16)
+        padding: 12
+        margins: 8
+        modal: false
+        focus: true
+        standardButtons: Dialog.NoButton
+        closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+        onAboutToShow: {
+            const anchor=translationLayer.disclosedAnchor;
+            const point=anchor ? anchor.mapToItem(parent,0,anchor.height) : Qt.point((parent.width-width)/2,(parent.height-height)/2);
+            if(anchor && point.y+height>parent.height-8) {
+                const above=anchor.mapToItem(parent,0,0).y-height;
+                if(above>=8)point.y=above;
+            }
+            x=Math.max(8,Math.min(parent.width-width-8,point.x));
+            y=Math.max(8,Math.min(parent.height-height-8,point.y));
+        }
+        onOpened: translatedBody.forceActiveFocus(Qt.TabFocusReason)
+        onClosed: {
+            const context=translationLayer.disclosedContext;
+            translationLayer.disclosedContext=null;
+            translationLayer.disclosedText="";translationLayer.disclosedSource="";
+            translationLayer.disclosedTitle="";translationLayer.disclosedAnchor=null;
+            translationLayer.restoreChipFocus(context);
+        }
+        background: Rectangle {color:app.colors.menuBg;radius:8;border.width:1;border.color:app.colors.controlBorder}
+        contentItem: AiReadingScrollView {
+            id: disclosureScroll
+            contentWidth: availableWidth
+            Column {
+                width: disclosureScroll.availableWidth
+                spacing: 8
+                Label {
+                    width:parent.width;text:translationLayer.disclosedTitle;textFormat:Text.PlainText
+                    font.pixelSize:12;font.weight:Font.DemiBold;color:app.colors.textPrimary;wrapMode:Text.Wrap
                 }
-                ColumnLayout {
-                    anchors.fill:parent
-                    Label {text:translationLayer.disclosedLanguage+" · "+translationLayer.disclosedModel;textFormat:Text.PlainText;Layout.fillWidth:true;elide:Text.ElideRight;color:app.colors.textSecondary}
-                    ScrollView {
-                    Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth
-                    TextArea {objectName:"translationDisclosureText";width:parent.width;text:translationLayer.disclosedText;textFormat:TextEdit.PlainText;readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap}
-                    }
+                Label {
+                    width:parent.width;text:qsTr("The full translation, including the part the fitted overlay clipped:");textFormat:Text.PlainText
+                    font.pixelSize:11;color:app.colors.textSecondary;wrapMode:Text.Wrap
+                }
+                TextArea {
+                    id: translatedBody
+                    objectName:"translationDisclosureText"
+                    width:parent.width;text:translationLayer.disclosedText;textFormat:TextEdit.PlainText
+                    font.pixelSize:12;color:app.colors.textPrimary;padding:0;background:null
+                    readOnly:true;selectByMouse:true;selectByKeyboard:true;wrapMode:TextEdit.Wrap
+                    Accessible.name:qsTr("Full translation")
+                }
+                Label {text:qsTr("Source");font.pixelSize:11;font.weight:Font.DemiBold;color:app.colors.textSecondary}
+                TextArea {
+                    objectName:"translationDisclosureSource"
+                    width:parent.width;text:translationLayer.disclosedSource;textFormat:TextEdit.PlainText
+                    font.pixelSize:11;color:app.colors.textSecondary;padding:0;background:null
+                    readOnly:true;selectByMouse:true;selectByKeyboard:true;wrapMode:TextEdit.Wrap
+                    Accessible.name:qsTr("Translation source")
                 }
             }
+        }
+    }
 }

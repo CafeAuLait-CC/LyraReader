@@ -7913,6 +7913,115 @@ Rectangle {
         std::weak_ptr<NativeRasterSource> weak=reader.renderSource();reader.requestAnnotationPassages(0,QVariantList{QVariantMap{{"id","old"},{"start",2},{"end",7},{"regions",QVariantList{}}}});reader.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/multipage.pdf"));QTRY_VERIFY(!reader.loading() && reader.pageCount()==3);QVERIFY(reader.annotationPassages().isEmpty());QTRY_VERIFY_WITH_TIMEOUT(weak.expired(),10000);
     }
 
+    void inplaceTranslationChipsKeepMacSurfacesAndIndependentActions_data() {
+        QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
+    }
+    void inplaceTranslationChipsKeepMacSurfacesAndIndependentActions() {
+        QFETCH(QString,theme);QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(900,650);window->setProperty("appearance",theme);
+        QQmlComponent component(&view.engine,QUrl("qrc:/qml/TranslationChip.qml"));QScopedPointer<QObject> object(component.createWithInitialProperties({{"app",QVariant::fromValue(window)}}));QVERIFY2(object,qPrintable(component.errorString()));auto *chip=qobject_cast<QQuickItem *>(object.data());QVERIFY(chip);chip->setParentItem(window->contentItem());chip->setPosition({40,220});chip->setZ(1000);
+        auto *primary=visualItem(chip,"translationPrimary"),*full=visualItem(chip,"translationDisclosure");auto *colors=window->property("colors").value<QObject *>();QVERIFY(primary && full && colors);
+        QCOMPARE(chip->height(),22.);QVERIFY(chip->width()>=48);QCOMPARE(chip->property("radius").toDouble(),5.);QCOMPARE(QQmlProperty(chip,"border.width").read().toDouble(),1.);QCOMPARE(primary->position(),QPointF(7,1));QCOMPARE(primary->height(),20.);QCOMPARE(QQmlProperty(primary,"font.pixelSize").read().toInt(),10);QCOMPARE(QQmlProperty(primary,"font.weight").read().toInt(),int(QFont::Medium));QVERIFY(!full->isVisible());
+        QTest::mouseMove(window,QPoint(5,5),20);QCOMPARE(chip->property("color").value<QColor>(),colors->property("accentSoft").value<QColor>());
+        const auto plainWidth=chip->width();chip->setProperty("clipped",true);QTRY_VERIFY(full->isVisible());QCOMPARE(chip->width(),plainWidth+18);const auto disclosedWidth=chip->width();chip->setVisible(false);QCOMPARE(chip->width(),disclosedWidth);chip->setVisible(true);QCOMPARE(chip->width(),disclosedWidth);
+        QSignalSpy toggles(chip,SIGNAL(toggleRequested())),disclosures(chip,SIGNAL(disclosureRequested()));QVERIFY(toggles.isValid() && disclosures.isValid());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);primary->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QCOMPARE(toggles.size(),1);QCOMPARE(disclosures.size(),0);
+        auto *accessible=QAccessible::queryAccessibleInterface(primary);QVERIFY(accessible);QCOMPARE(accessible->text(QAccessible::Name),QString("Show original text"));chip->setProperty("original",true);QVERIFY(!full->isVisible());QCOMPARE(primary->property("text").toString(),QString("Translate"));QCOMPARE(accessible->text(QAccessible::Name),QString("Show the cached translation"));QCOMPARE(chip->property("color").value<QColor>(),colors->property("raisedBg").value<QColor>());QTest::keyClick(window,Qt::Key_Space);QCOMPARE(toggles.size(),2);QCOMPARE(disclosures.size(),0);
+        chip->setProperty("original",false);QTRY_VERIFY(full->isVisible());full->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QCOMPARE(disclosures.size(),1);QCOMPARE(toggles.size(),2);auto *disclosureAccessible=QAccessible::queryAccessibleInterface(full);QVERIFY(disclosureAccessible);QCOMPARE(disclosureAccessible->text(QAccessible::Name),QString("Show full translation"));
+        QTest::mouseMove(window,primary->mapToScene({primary->width()/2,10}).toPoint(),20);QTRY_VERIFY(primary->property("hovered").toBool());QCOMPARE(chip->property("color").value<QColor>(),colors->property("hoverBg").value<QColor>());QVERIFY(qAbs(QQmlProperty(chip,"border.color").read().value<QColor>().alphaF()-.8)<.01);
+        const auto evidence=qEnvironmentVariable("LYRA_READER_INLINE_CHIP_EVIDENCE");if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/chip-controls-"+theme+".png"));}
+    }
+
+    void inplaceTranslationControlsChooseVisiblePiecesAndAvoidTextAndTears() {
+        QQmlEngine engine;QQmlComponent component(&engine);component.setData(R"QML(import QtQuick
+import "qrc:/qml/TranslationPlacement.js" as Placement
+QtObject { function place(pieces,viewport,size,gap) { return Placement.place(pieces,viewport,size,gap); } }
+)QML",QUrl("synthetic-placement.qml"));QScopedPointer<QObject> object(component.create());QVERIFY2(object,qPrintable(component.errorString()));
+        const auto rect=[](double x,double y,double width,double height){return QVariantMap{{"x",x},{"y",y},{"width",width},{"height",height}};};
+        const auto place=[&](const QVariantList &pieces,const QVariantMap &gap=QVariantMap{}){QVariant result;const bool invoked=QMetaObject::invokeMethod(object.data(),"place",Q_RETURN_ARG(QVariant,result),Q_ARG(QVariant,pieces),Q_ARG(QVariant,rect(0,0,400,300)),Q_ARG(QVariant,QVariantMap({{"width",80},{"height",22}})),Q_ARG(QVariant,gap));return invoked ? result.value<QJSValue>().toVariant().toMap() : QVariantMap{};};
+        auto result=place({rect(100,100,100,50)});QCOMPARE(result.value("position").toString(),QString("right"));QCOMPARE(result.value("x").toDouble(),204.);QCOMPARE(result.value("y").toDouble(),100.);QVERIFY(!result.value("inside").toBool());
+        QCOMPARE(place({rect(100,100,295,50)}).value("position").toString(),QString("above"));
+        QCOMPARE(place({rect(100,0,295,50)}).value("position").toString(),QString("below"));
+        QCOMPARE(place({rect(100,0,295,298)}).value("position").toString(),QString("left"));
+        QCOMPARE(place({rect(100,0,295,90)},rect(0,90,400,80)).value("position").toString(),QString("left"));
+        result=place({rect(0,0,400,300)});QCOMPARE(result.value("position").toString(),QString("inside"));QVERIFY(result.value("inside").toBool());QCOMPARE(result.value("x").toDouble(),316.);QCOMPARE(result.value("y").toDouble(),4.);
+        result=place({rect(100,-100,100,50),rect(100,120,100,60)});QCOMPARE(result.value("anchorIndex").toInt(),1);QCOMPARE(result.value("y").toDouble(),120.);
+        result=place({rect(100,200,100,20),rect(100,100,100,20)});QCOMPARE(result.value("anchorIndex").toInt(),1);QCOMPARE(result.value("y").toDouble(),100.);
+        QVERIFY(place({rect(100,400,100,20)}).isEmpty());QVERIFY(place({rect(qQNaN(),0,100,20)}).isEmpty());
+    }
+
+    void inplaceTranslationFitDecisionsStayInPdfPointsAcrossDisplayScales() {
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(900,760);view.workspace.openFile(QUrl::fromLocalFile(root+"/tests/fixtures/text-page.pdf"));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));auto *page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page && page->loaded());
+        // Exercise a real native text layout at its one-line boundary. The
+        // presentation model is synthetic: it cannot dispatch or persist a job.
+        const QString text="abcdefghijabcdefghijabcdefghijabcdefghij";auto font=QGuiApplication::font();font.setPixelSize(7);const QFontMetricsF metrics(font);const double width=qCeil(metrics.horizontalAdvance(text))+5,height=qCeil(metrics.height())+3;
+        QQmlComponent appComponent(&view.engine);appComponent.setData(R"QML(import QtQuick
+QtObject {
+    id: model
+    required property var colors
+    required property var pages
+    required property var sourcePage
+    property real zoom: 1
+    property real width: 900
+    property real height: 760
+    property bool active: true
+    property string operationStatus: ""
+    property var selection: ({page:0,start:0,end:2})
+    function focusReadingView() {}
+    property QtObject currentReader: QtObject {
+        property real documentGeneration: 1
+        property bool loading: false
+        property var pages: model.pages
+        property var translationOverlays: []
+        function inspectTranslations(page) {}
+    }
+    property QtObject paperMap: QtObject {
+        property bool detached: false
+        readonly property var controller: detached ? null : model.currentReader
+        readonly property bool loaded: model.sourcePage.loaded
+        readonly property bool refined: model.sourcePage.refined
+        readonly property var paperAppearance: model.sourcePage.paperAppearance
+        readonly property rect visibleRegion: model.sourcePage.visibleRegion
+        readonly property bool paperGeometryActive: false
+        readonly property real paperGeometryRevision: 0
+        readonly property real paperSceneLimit: model.sourcePage.paperSceneLimit
+        function translationPaperColor(rect) { return model.sourcePage.translationPaperColor(rect); }
+        function translationInkColor(paper) { return model.sourcePage.translationInkColor(paper); }
+        function paperRegion(rect, revision) { return model.sourcePage.paperRegion(rect, revision); }
+        function paperPoint(point) { return model.sourcePage.paperPoint(point); }
+    }
+})QML",QUrl("synthetic-inline-fit.qml"));
+        QScopedPointer<QObject> app(appComponent.createWithInitialProperties({{"colors",window->property("colors")},{"pages",reader->pages()},{"sourcePage",QVariant::fromValue(page)}}));QVERIFY2(app,qPrintable(appComponent.errorString()));auto *owner=app->property("currentReader").value<QObject *>();QVERIFY(owner);
+        const QVariantMap target{{"page",0},{"start",0},{"end",39},{"source_text","PUBLIC_SYNTHETIC_FIT_SOURCE"},{"source_font_pt",18.},{"is_block",true},{"rect",QVariantMap{{"x_pt",40.},{"y_pt",60.},{"width_pt",width},{"height_pt",height}}}};
+        owner->setProperty("translationOverlays",QVariantList{QVariantMap{{"id","synthetic-fit"},{"target",target},{"text",text},{"original",false},{"language","French"},{"model","synthetic"}}});
+        QQmlComponent component(&view.engine,QUrl("qrc:/qml/TranslationLayer.qml"));QScopedPointer<QObject> layerObject(component.createWithInitialProperties({{"app",QVariant::fromValue(app.data())},{"page",0},{"paperMap",app->property("paperMap")}}));QVERIFY2(layerObject,qPrintable(component.errorString()));auto *layer=qobject_cast<QQuickItem *>(layerObject.data());QVERIFY(layer);layer->setParentItem(page);layer->setSize(page->size());layer->setZ(1000);
+        auto *chip=visualItem(layer,"translationChip");QVERIFY(chip);QTRY_VERIFY(!chip->property("clipped").toBool());const auto firstWidth=chip->width();QCOMPARE(chip->property("placement").toString(),QString("right"));QVERIFY(qAbs(chip->x()-(40+width+4))<.01);
+        for(double zoom:{.25,1.,3.,.5,1.}){app->setProperty("zoom",zoom);QTest::qWait(20);QVERIFY2(!chip->property("clipped").toBool(),qPrintable(QString("A fitting source passage became clipped solely at scale %1").arg(zoom)));QCOMPARE(chip->width(),firstWidth);QCOMPARE(chip->height(),22.);}
+        MockChatServer sentinel;QVERIFY(sentinel.listen());QString large(8191,QChar('x'));large+=QString::fromUcs4(U"🚀");large+=QString(100,QChar('z'));large+="\n<img src='"+sentinel.baseUrl()+"/never-load'>";
+        auto sourceTarget=target;sourceTarget.insert("source_text","<b>Literal source</b> <img src='"+sentinel.baseUrl()+"/never-load'>");owner->setProperty("translationOverlays",QVariantList{QVariantMap{{"id","synthetic-fit"},{"target",sourceTarget},{"text",large},{"original",false},{"language","French"},{"model","synthetic"}}});
+        QTRY_VERIFY((chip=visualItem(layer,"translationChip")) && chip->isVisible() && chip->property("clipped").toBool());auto *paint=visualItem(layer,"inplaceTranslationText");QVERIFY(paint);QVERIFY(paint->property("readOnly").toBool());QVERIFY(paint->activeFocusOnTab());QVERIFY(paint->property("selectByMouse").toBool() && paint->property("selectByKeyboard").toBool());QCOMPARE(paint->property("text").toString(),QString(8191,QChar('x'))+QChar(0x2026));
+        auto *full=visualItem(chip,"translationDisclosure");QTRY_VERIFY2(full && full->isVisible(),qPrintable(QString("chip visible=%1 clipped=%2 original=%3").arg(chip->isVisible()).arg(chip->property("clipped").toBool()).arg(chip->property("original").toBool())));QVERIFY(QMetaObject::invokeMethod(full,"clicked"));auto *popup=layer->findChild<QObject *>("translationFullText");QVERIFY(popup);QTRY_VERIFY(popup->property("visible").toBool());auto *body=layer->findChild<QObject *>("translationDisclosureText"),*source=layer->findChild<QObject *>("translationDisclosureSource");QVERIFY(body && source);QCOMPARE(body->property("text").toString(),large);QCOMPARE(source->property("text").toString(),sourceTarget.value("source_text").toString());QCOMPARE(body->property("textFormat").toInt(),int(Qt::PlainText));QCOMPARE(source->property("textFormat").toInt(),int(Qt::PlainText));QVERIFY(body->property("readOnly").toBool() && body->property("selectByMouse").toBool());QVERIFY(body->property("selectByKeyboard").toBool() && source->property("selectByKeyboard").toBool());body->setProperty("focus",true);QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier);QTest::keyClick(window,Qt::Key_Right,Qt::ShiftModifier);QCOMPARE(body->property("selectedText").toString(),QString("x"));
+        QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);paint->forceActiveFocus(Qt::MouseFocusReason);QTRY_VERIFY(paint->hasActiveFocus());QTRY_COMPARE(paint->property("text").toString(),large);QVERIFY(app->property("selection").isNull());
+        QCOMPARE(window->activeFocusItem(),paint);QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QTRY_COMPARE(window->activeFocusItem(),paint);QTRY_COMPARE(paint->property("selectedText").toString(),large);QTest::keyClick(window,Qt::Key_C,Qt::ControlModifier);QCOMPARE(QGuiApplication::clipboard()->text(),large);QCOMPARE(paint->property("textFormat").toInt(),int(Qt::PlainText));
+        for(double zoom:{.25,3.,1.}){app->setProperty("zoom",zoom);QTest::qWait(20);QVERIFY(paint->hasActiveFocus());QCOMPARE(paint->property("selectedText").toString(),large);}
+        QTest::keyClick(window,Qt::Key_F10,Qt::ShiftModifier);auto *textMenu=paint->findChild<QObject *>("translationTextMenu");QVERIFY(textMenu);QTRY_VERIFY(textMenu->property("visible").toBool());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!textMenu->property("visible").toBool());QTRY_COMPARE(window->activeFocusItem(),paint);QCOMPARE(paint->property("selectedText").toString(),large);
+        QTest::keyClick(window,Qt::Key_Z);QCOMPARE(paint->property("text").toString(),large);
+        QVERIFY(QMetaObject::invokeMethod(full,"clicked"));QTRY_VERIFY(popup->property("visible").toBool());owner->setProperty("documentGeneration",2.);QTRY_VERIFY(!popup->property("visible").toBool());QTest::qWait(50);QVERIFY(sentinel.requests.isEmpty());
+        QPointer<QQuickItem> oldPaint(paint);auto *paperFacade=app->property("paperMap").value<QObject *>();QVERIFY(paperFacade);paperFacade->setProperty("detached",true);QTRY_VERIFY(!chip->isVisible());QTRY_VERIFY(!oldPaint || !oldPaint->isVisible());
+    }
+
+    void inplaceTranslationShortAnswersFitWithoutDisclosureAcrossZoom() {
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-short-chip.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        MockChatServer server;QVERIFY(server.listen());server.responder=[](const QByteArray &){return MockChatServer::Response{{MockChatServer::delta({{"content","Oui"}}),QByteArray("data: [DONE]\n\n")},20};};
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->resize(900,760);window->setProperty("reduceMotion",true);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());reader->requestText(0);QTRY_VERIFY(reader->textPages().contains("0"));const auto chars=reader->textPages().value("0").toMap().value("chars").toList();
+        const QVariantMap request{{"action","TranslateSelection"},{"current_page",0},{"selection",QVariantMap{{"page",0},{"start",0},{"end",chars.size()-1}}},{"question",QVariant{}},{"language","French"},{"history",QVariantList{}},{"region",QVariant{}},{"base_url",server.baseUrl()},{"model","synthetic-short"},{"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"},{"document_knowledge",false},{"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}}};
+        QVERIFY(reader->prepareInplaceTranslation(request));QTRY_COMPARE(reader->pendingCommands(),0);const auto plan=reader->aiState().value("plan").toMap();const auto parts=plan.value("parts").toList();QVERIFY(!parts.isEmpty());QVERIFY(server.requests.isEmpty());QVERIFY(reader->startAi("local",plan));QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),parts.size());
+        QVERIFY(QMetaObject::invokeMethod(window,"applyFit",Q_ARG(QVariant,"page"),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));QPointer<QQuickItem> chip=visualItem(window->contentItem(),"translationChip");QVERIFY(chip && chip->isVisible());auto *full=visualItem(chip,"translationDisclosure");QVERIFY(full);QTRY_VERIFY(!full->isVisible());QVERIFY(!chip->property("clipped").toBool());const auto width=chip->width();
+        auto *text=visualItem(window->contentItem(),"inplaceTranslationText");QVERIFY(text && text->isVisible());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",2}});const auto hit=text->mapToScene(QPointF(1,1)).toPoint();QVERIFY(window->contentItem()->contains(hit));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,hit);QTRY_COMPARE(window->activeFocusItem(),text);QVERIFY(window->property("selection").isNull() || window->property("selection").value<QJSValue>().isNull());QVERIFY(!window->property("readerPageNavigationEnabled").toBool());QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);QCOMPARE(text->property("selectedText").toString(),QString("Oui"));QTest::keyClick(window,Qt::Key_C,Qt::ControlModifier);QCOMPARE(QGuiApplication::clipboard()->text(),QString("Oui"));QTest::keyClick(window,Qt::Key_Z);QCOMPARE(text->property("text").toString(),QString("Oui"));QCOMPARE(server.requests.size(),parts.size());
+        const auto beforeScroll=window->property("pageList").value<QObject *>();QVERIFY(beforeScroll);const auto oldY=beforeScroll->property("contentY").toDouble();QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QCOMPARE(beforeScroll->property("contentY").toDouble(),oldY);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(window->activeFocusItem()!=text);
+        for(double zoom:{.25,1.,3.}){window->setProperty("fitting",false);QVERIFY(QMetaObject::invokeMethod(window,"changeZoom",Q_ARG(QVariant,zoom),Q_ARG(QVariant,0),Q_ARG(QVariant,0)));QVERIFY(settleReaderViewport(window));QVERIFY(chip);QCOMPARE(chip->height(),22.);QCOMPARE(chip->width(),width);QVERIFY(!chip->property("clipped").toBool());QCOMPARE(server.requests.size(),parts.size());}
+    }
+
     void inplaceTranslationKeepsPreviewCacheAndPaperGeometry_data() {
         QTest::addColumn<QString>("theme");QTest::newRow("light")<<QString("light");QTest::newRow("dark")<<QString("dark");
     }
@@ -7942,19 +8051,20 @@ Rectangle {
         QVERIFY(settleReaderViewport(window));QVERIFY(settleRasterWork(reader));
         auto *page=qobject_cast<PageItem *>(visualItem(window->contentItem(),"pdfPage0"));QVERIFY(page);QTRY_VERIFY(page->loaded());
         QTRY_VERIFY(visualItem(window->contentItem(),"inplaceTranslationText"));
-        auto *chip=visualItem(window->contentItem(),"translationDisclosure");QVERIFY(chip && chip->isVisible());
-        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);chip->forceActiveFocus();QTest::keyClick(window,Qt::Key_Space);
-        auto *menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());
-        auto *menuContent=menu->property("contentItem").value<QQuickItem *>();QVERIFY(menuContent);const auto menuOrigin=menuContent->mapToGlobal(QPointF(-menu->property("leftPadding").toDouble(),-menu->property("topPadding").toDouble()));const auto menuAnchor=chip->mapToGlobal(QPointF(0,chip->height()));QVERIFY2(QLineF(menuOrigin,menuAnchor).length()<2,"A keyboard-opened translation menu must be anchored to its own button");auto *full=visualItem(menuContent,"translationShowFull");QVERIFY(full);full->forceActiveFocus();QVERIFY(full->window());QTest::keyClick(full->window(),Qt::Key_Return);
-        auto *translationLayer=visualItem(window->contentItem(),"translationLayer0");QVERIFY(translationLayer);
-        auto *disclosure=translationLayer->findChild<QObject *>("translationFullText");QVERIFY(disclosure);QTRY_VERIFY(disclosure->property("visible").toBool());
-        auto *disclosed=translationLayer->findChild<QObject *>("translationDisclosureText");QVERIFY(disclosed);QVERIFY(disclosed->property("text").toString().size()>1000);
-        QTest::keyClick(window,Qt::Key_Tab);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!disclosure->property("visible").toBool());QCOMPARE(server.requests.size(),parts.size());
-        chip=visualItem(window->contentItem(),"translationDisclosure");QVERIFY(chip);QTRY_VERIFY2(chip->hasActiveFocus(),"Closing the full-text dialog must restore its owning translation menu button");QTest::keyClick(window,Qt::Key_Space);
-        menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());
-        menuContent=menu->property("contentItem").value<QQuickItem *>();auto *toggle=visualItem(menuContent,"translationToggleOriginal");QVERIFY(toggle);toggle->forceActiveFocus();QTest::keyClick(toggle->window(),Qt::Key_Return);
-        QTRY_VERIFY(visualItem(window->contentItem(),"translationDisclosure") && visualItem(window->contentItem(),"translationDisclosure")->hasActiveFocus());
-        chip=visualItem(window->contentItem(),"translationDisclosure");QTest::keyClick(window,Qt::Key_Space);menu=chip->findChild<QObject *>("translationMenu");QVERIFY(menu);QTRY_VERIFY(menu->property("visible").toBool());QTest::keyClick(chip->window(),Qt::Key_Escape);
+        auto *chip=visualItem(window->contentItem(),"translationChip");QVERIFY(chip && chip->isVisible());
+        auto *primary=visualItem(chip,"translationPrimary");auto *full=visualItem(chip,"translationDisclosure");QVERIFY(primary && full && full->isVisible());
+        QCOMPARE(chip->height(),22.);QVERIFY(chip->width()>=48);QCOMPARE(QQmlProperty(primary,"font.pixelSize").read().toInt(),10);QCOMPARE(QQmlProperty(primary,"font.weight").read().toInt(),int(QFont::Medium));QCOMPARE(primary->property("text").toString(),QString("Show original"));
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);primary->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);
+        QTRY_VERIFY(reader->translationOverlays().first().toMap().value("original").toBool());QTRY_VERIFY((chip=visualItem(window->contentItem(),"translationChip")) && (primary=visualItem(chip,"translationPrimary")) && primary->hasActiveFocus());
+        QCOMPARE(primary->property("text").toString(),QString("Translate"));full=visualItem(chip,"translationDisclosure");QVERIFY(full && !full->isVisible());QCOMPARE(server.requests.size(),parts.size());
+        QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(!reader->translationOverlays().first().toMap().value("original").toBool());QTRY_VERIFY((chip=visualItem(window->contentItem(),"translationChip")) && (full=visualItem(chip,"translationDisclosure")) && full->isVisible());
+        primary=visualItem(chip,"translationPrimary");QVERIFY(primary);auto *chipAccessible=QAccessible::queryAccessibleInterface(primary);QVERIFY(chipAccessible);QVERIFY(chipAccessible->text(QAccessible::Description).contains("synthetic-inplace"));QVERIFY(chipAccessible->text(QAccessible::Description).contains("Page 1"));
+        const auto coverBeforeDisclosure=reader->translationOverlays().first().toMap();full->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);
+        auto *translationLayer=visualItem(window->contentItem(),"translationLayer0");QVERIFY(translationLayer);auto *disclosure=translationLayer->findChild<QObject *>("translationFullText");QVERIFY(disclosure);QTRY_VERIFY(disclosure->property("visible").toBool());QVERIFY(!disclosure->property("modal").toBool());QCOMPARE(disclosure->property("width").toDouble(),440.);QCOMPARE(disclosure->property("height").toDouble(),260.);
+        auto *disclosed=translationLayer->findChild<QObject *>("translationDisclosureText");auto *source=translationLayer->findChild<QObject *>("translationDisclosureSource");QVERIFY(disclosed && source);QVERIFY(disclosed->property("text").toString().size()>1000);QCOMPARE(source->property("text").toString(),coverBeforeDisclosure.value("target").toMap().value("source_text").toString());
+        const auto chipEvidence=qEnvironmentVariable("LYRA_READER_INLINE_CHIP_EVIDENCE");if(!chipEvidence.isEmpty()){QVERIFY(QDir().mkpath(chipEvidence));QVERIFY(window->grabWindow().save(chipEvidence+"/chip-disclosure-"+theme+".png"));}
+        QTest::keyClick(window,Qt::Key_Tab);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!disclosure->property("visible").toBool());QCOMPARE(server.requests.size(),parts.size());QTRY_VERIFY((chip=visualItem(window->contentItem(),"translationChip")) && (full=visualItem(chip,"translationDisclosure")) && full->hasActiveFocus());
+        primary=visualItem(chip,"translationPrimary");QVERIFY(primary);primary->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);QTRY_VERIFY(reader->translationOverlays().first().toMap().value("original").toBool());
         const auto toggled=reader->translationOverlays().first().toMap();QVERIFY(toggled.value("original").toBool());reader->toggleTranslation(toggled.value("id").toString());
         const auto cover=reader->translationOverlays().first().toMap();const auto id=cover.value("id").toString();
         reader->toggleTranslation(id);QVERIFY(reader->translationOverlays().first().toMap().value("original").toBool());
@@ -7964,15 +8074,18 @@ Rectangle {
         const QRectF bounds(rect.value("x_pt").toDouble(),rect.value("y_pt").toDouble(),rect.value("width_pt").toDouble(),rect.value("height_pt").toDouble());
         const auto paper=page->translationPaperColor(bounds);QVERIFY(paper.isValid());QVERIFY(page->translationInkColor(paper).isValid());QVERIFY(!page->translationPaperColor(QRectF(qQNaN(),0,2,2)).isValid());
         const auto completed=reader->completedRasters();
+        QPointer<QQuickItem> nativeText(visualItem(window->contentItem(),"inplaceTranslationText"));QVERIFY(nativeText);nativeText->forceActiveFocus(Qt::MouseFocusReason);QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);const auto nativeSelection=nativeText->property("selectedText").toString();QVERIFY(!nativeSelection.isEmpty());
         QVERIFY(page->configurePaper(reader->pages().first().toMap().value("height").toDouble(),bounds.center().y(),80));
+        QTRY_VERIFY(nativeText && nativeText->hasActiveFocus());QCOMPARE(nativeText->property("selectedText").toString(),nativeSelection);
         QTest::qWait(80);QCOMPARE(server.requests.size(),parts.size());QCOMPARE(reader->completedRasters(),completed);
         reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),parts.size());
         const auto evidence=qEnvironmentVariable("LYRA_READER_TRANSLATION_EVIDENCE");if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/translation-"+theme+".png"));}
-        const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->documentGeneration()!=generation && reader->pageCount()==1 && !reader->loading());QTRY_COMPARE(reader->pendingCommands(),0);
+        chip=visualItem(window->contentItem(),"translationChip");QVERIFY(chip);full=visualItem(chip,"translationDisclosure");QVERIFY(full && full->isVisible());QVERIFY(QMetaObject::invokeMethod(full,"clicked"));QTRY_VERIFY(disclosure->property("visible").toBool());QPointer<QObject> previousDisclosure(disclosure);
+        const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->documentGeneration()!=generation && reader->pageCount()==1 && !reader->loading());QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!previousDisclosure || !previousDisclosure->property("visible").toBool());
         reader->inspectTranslations(0);QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(reader->translationOverlays().size(),parts.size());
         QVERIFY(reader->prepareInplaceTranslation(request));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->aiState().value("plan").toMap().isEmpty());QCOMPARE(server.requests.size(),parts.size());
         QVERIFY(pdf.open(QIODevice::ReadOnly));QCOMPARE(pdf.readAll(),original);QVERIFY(!reader->hasUnsavedChanges());
-        for(const auto &record:warnings)for(const auto &warning:qvariant_cast<QList<QQmlError>>(record.first()))QVERIFY2(!warning.url().toString().contains("TranslationLayer.qml"),qPrintable(warning.toString()));
+        for(const auto &record:warnings)for(const auto &warning:qvariant_cast<QList<QQmlError>>(record.first()))QVERIFY2(!warning.url().toString().contains("TranslationLayer.qml") && !warning.url().toString().contains("TranslationChip.qml"),qPrintable(warning.toString()));
     }
     void inplaceTranslationCanvasKeyboardSelectionKeepsTheExplicitSendBoundary() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
