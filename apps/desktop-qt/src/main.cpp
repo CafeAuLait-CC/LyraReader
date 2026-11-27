@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
     qmlRegisterType<AnnotationPassageText>("LyraReader",1,0,"AnnotationPassageText");
     qmlRegisterType<ReadingSourceHighlight>("LyraReader",1,0,"ReadingSourceHighlight");
     qmlRegisterType<AuditController>("LyraReader",1,0,"AuditController");
+    qmlRegisterUncreatableType<ConnectionTestController>("LyraReader",1,0,"ConnectionTestController","Created by workspace");
     qmlRegisterType<NavigationController>("LyraReader",1,0,"NavigationController");
     qmlRegisterType<FileDialogNavigation>("LyraReader",1,0,"FileDialogNavigation");
     qmlRegisterType<DisplayCalibration>("LyraReader",1,0,"DisplayCalibration");

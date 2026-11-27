@@ -1,6 +1,7 @@
 #pragma once
 #include "ReaderController.h"
 #include "CredentialStore.h"
+#include "ConnectionTestController.h"
 #include "ChatGptAccounts.h"
 #include "PreviewController.h"
 #include <QVariantList>
@@ -20,6 +21,7 @@ class WorkspaceController : public QObject {
     Q_PROPERTY(QVariantList recentDocuments READ recentDocuments NOTIFY recentDocumentsChanged)
     Q_PROPERTY(PreviewController *preview READ preview CONSTANT)
     Q_PROPERTY(CredentialStore *credentials READ credentials CONSTANT)
+    Q_PROPERTY(ConnectionTestController *connectionTest READ connectionTest CONSTANT)
     Q_PROPERTY(ChatGptAccounts *chatGptAccounts READ chatGptAccounts CONSTANT)
     Q_PROPERTY(QuitCoordinator *quitCoordinator READ quitCoordinator CONSTANT)
     Q_PROPERTY(bool tabTransferInProgress READ tabTransferInProgress NOTIFY tabTransferStateChanged)
@@ -33,6 +35,7 @@ public:
     QVariantList recentDocuments() const { return m_recent; }
     PreviewController *preview()const{return m_preview;}
     CredentialStore *credentials() const { return m_credentials; }
+    ConnectionTestController *connectionTest() const {return m_connectionTest;}
     ChatGptAccounts *chatGptAccounts() const { return ChatGptAccounts::instance(); }
     QuitCoordinator *quitCoordinator()const;
     static QList<WorkspaceController *> allWorkspaces();
@@ -112,4 +115,5 @@ private:
     int m_activeIndex = 0;
     PreviewController *m_preview = new PreviewController(this);
     CredentialStore *m_credentials=nullptr;
+    ConnectionTestController *m_connectionTest=nullptr;
 };

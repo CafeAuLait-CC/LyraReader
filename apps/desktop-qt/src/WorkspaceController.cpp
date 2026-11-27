@@ -103,6 +103,7 @@ std::optional<NativeTabDrag> &nativeTabDrag() {
 
 WorkspaceController::WorkspaceController(QObject *parent,CredentialStore *credentials) : QObject(parent),m_windowTransferId(QUuid::createUuid().toString(QUuid::WithoutBraces)),m_credentials(credentials ? credentials : new CredentialStore(this)) {
     m_credentials->setParent(this);
+    m_connectionTest=new ConnectionTestController(m_credentials,this);
     connect(m_preview,&PreviewController::externalRequested,this,&WorkspaceController::openExternal);
     QSettings settings;
     m_recent = normalizedRecents(settings.value(QStringLiteral("reader/recentDocuments")).toList());

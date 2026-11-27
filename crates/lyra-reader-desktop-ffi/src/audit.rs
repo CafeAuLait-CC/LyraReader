@@ -23,6 +23,7 @@ const MAX_BYTES: usize = 256 * 1024;
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
+    ConnectionTest,
     Summarise,
     SelectionQuestion,
     Translation,
@@ -253,6 +254,12 @@ pub fn observer(root: PathBuf, action: AiActionRecord, local: bool) -> Arc<dyn R
         | AiActionRecord::SummarizeSection
         | AiActionRecord::SummarizePageLine => Action::SummaryLayer,
     };
+    make_observer(root, action, local)
+}
+pub(super) fn connection_test_observer(root: PathBuf, local: bool) -> Arc<dyn RequestAudit> {
+    make_observer(root, Action::ConnectionTest, local)
+}
+fn make_observer(root: PathBuf, action: Action, local: bool) -> Arc<dyn RequestAudit> {
     Arc::new(Audit {
         directory: root.join("Audit"),
         action,

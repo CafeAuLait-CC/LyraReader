@@ -10,6 +10,8 @@
 //! 1. **API-key transport**: `crates/lyra-reader-ai/src/openai.rs`, one `ureq` agent and one
 //!    `agent.post(&spec.url)`. The URL is the endpoint of the previewed `ChatPlan`, so the host
 //!    is the reader's configured provider — never a second hard-coded destination.
+//!    Settings' explicit Test Connection uses this same call with the shared fixed-ping plan;
+//!    it has no document, selection, history or image and is audited per HTTP attempt.
 //! 2. **ChatGPT plan transport**: `ChatGPTResponses.swift`, one `URLRequest` to the fixed
 //!    `https://api.openai.com/v1/responses` endpoint.
 //! 3. **ChatGPT sign-in**: `ChatGPTSignIn.swift`, OAuth token/authorize/revocation and

@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 
-inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 23;
+inline constexpr std::uint32_t LYRA_READER_DESKTOP_ABI_VERSION = 24;
 
 // Owned Rust allocations: free each Buffer exactly once using buffer_free.
 // Output buffers must be zero initialized; calls do not free previous contents.
@@ -37,6 +37,13 @@ bool lyra_reader_desktop_math_markup(const std::uint8_t *text,std::size_t len,
 bool lyra_reader_desktop_inspect_reasoning(const std::uint8_t *mode,std::size_t mode_len,
     const std::uint8_t *encoding,std::size_t encoding_len,LyraReaderBuffer *output,LyraReaderBuffer *error);
 bool lyra_reader_desktop_generation_defaults(LyraReaderBuffer *output,LyraReaderBuffer *error);
+struct LyraReaderConnectionTest;
+inline constexpr std::size_t LYRA_READER_CONNECTION_TEST_MAX_COMMAND_BYTES = 128u * 1024u;
+LyraReaderConnectionTest *lyra_reader_desktop_connection_test_new(LyraReaderBuffer *error);
+void lyra_reader_desktop_connection_test_cancel(const LyraReaderConnectionTest *service);
+void lyra_reader_desktop_connection_test_free(LyraReaderConnectionTest *service);
+bool lyra_reader_desktop_connection_test_command(const LyraReaderConnectionTest *service,
+    const std::uint8_t *input,std::size_t length,LyraReaderBuffer *output,LyraReaderBuffer *error);
 struct LyraReaderBitmap {
     std::uint32_t width, height, stride;
     double scale;

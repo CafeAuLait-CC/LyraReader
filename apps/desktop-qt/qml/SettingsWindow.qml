@@ -41,6 +41,21 @@ ApplicationWindow {
     objectName:"settingsWindow"
     required property var app
     readonly property var accounts: app.session ? app.session.chatGptAccounts : null
+    readonly property var connectionTest:app.session ? app.session.connectionTest : null
+    readonly property var connectionTestState:connectionTest ? connectionTest.state : ({})
+    component ConnectionTestButton:Button {
+        id:probeButton
+        required property var colors
+        palette.buttonText:enabled ? colors.textPrimary : colors.textDisabled
+        background:Rectangle {
+            implicitWidth:80;implicitHeight:26;radius:4
+            color:!probeButton.enabled ? probeButton.colors.fieldBg : probeButton.down ? probeButton.colors.pressedBg
+                : probeButton.hovered ? probeButton.colors.hoverBg : probeButton.colors.fieldBg
+            border.width:probeButton.visualFocus ? 2 : 1
+            border.color:!probeButton.enabled ? probeButton.colors.textDisabled
+                : probeButton.visualFocus ? probeButton.colors.focusRing : probeButton.colors.controlBorder
+        }
+    }
     property string connectionError: ""
     readonly property var colors:app.colors
     title:qsTr("Settings · LyraReader")
@@ -52,6 +67,7 @@ ApplicationWindow {
     palette:app.palette
     AuxiliaryWindowPolicy {id:policy}
     function open() {
+        if(connectionTest)connectionTest.cancel();
         connectionError="";
         if(accounts && !accounts.refreshConnection())connectionError=accounts.status;
         if(visible){requestActivate();return;}
@@ -170,7 +186,17 @@ ApplicationWindow {
     }
     Connections {
         target: settings.accounts
-        function onConnectionModeChanged() {settings.connectionError="";if(settings.accounts.connectionMode==="chatGPT")apiKey.clear();}
+        function onConnectionModeChanged() {if(settings.connectionTest)settings.connectionTest.cancel();settings.connectionError="";if(settings.accounts.connectionMode==="chatGPT")apiKey.clear();}
+    }
+    Connections {target:settings.app;function onAiSettingsChanged(){if(settings.connectionTest)settings.connectionTest.cancel();}}
+    function connectionTestStatus() {
+        const state=connectionTestState,phase=state.phase;
+        if(connectionTest && connectionTest.busy)return state.model ? qsTr("Testing %1…").arg(state.model) : qsTr("Testing the connection…");
+        if(phase==="success")return qsTr("Connected to %1 in %2 ms.").replace(/%([12])/g,function(_,index){return index==="1" ? String(state.model) : String(state.elapsed_ms);});
+        if(phase!=="failed")return "";
+        const hint=state.failure==="Offline" ? qsTr("Check your network connection and try again.")
+            : state.failure==="LocalServer" ? qsTr("Start the local server and confirm its address.") : "";
+        return (state.message || qsTr("The connection test failed."))+(hint.length ? "\n"+hint : "");
     }
     function revealFocusedControl() {
         const item=activeFocusItem;
@@ -183,6 +209,7 @@ ApplicationWindow {
     }
     onActiveFocusItemChanged:revealFocusedControl()
     onClosing: {
+        if(connectionTest)connectionTest.cancel();
         policy.cancelPresentation();
         auditOnOpen=false;
         if(app.session)app.session.setPreference("auxiliarySettingsGeometry",policy.geometry());
@@ -329,6 +356,7 @@ ApplicationWindow {
                         placeholderText: qsTr("Base URL, e.g. http://localhost:11434/v1")
                         text: app.aiSettings.baseUrl || "http://localhost:11434/v1"
                         Accessible.name: qsTr("AI base URL")
+                        onTextEdited:if(settings.connectionTest)settings.connectionTest.cancel()
                     }
                     TextField {
                         id: modelName
@@ -337,6 +365,39 @@ ApplicationWindow {
                         placeholderText: qsTr("Model name")
                         text: app.aiSettings.model || ""
                         Accessible.name: qsTr("AI model")
+                        onTextEdited:if(settings.connectionTest)settings.connectionTest.cancel()
+                    }
+                    RowLayout {
+                        Layout.fillWidth:true
+                        ConnectionTestButton {
+                            colors:settings.colors
+                            objectName:"testAiConnection";text:qsTr("Test Connection")
+                            enabled:!!settings.connectionTest && !settings.connectionTest.busy
+                            onClicked:settings.connectionTest.start(baseUrl.text,modelName.text,apiKey.text)
+                        }
+                        BusyIndicator {Layout.preferredWidth:22;Layout.preferredHeight:22;running:!!settings.connectionTest && settings.connectionTest.busy;visible:running}
+                        ConnectionTestButton {
+                            colors:settings.colors
+                            objectName:"cancelAiConnectionTest";text:qsTr("Cancel")
+                            Accessible.name:qsTr("Cancel connection test")
+                            visible:!!settings.connectionTest && settings.connectionTest.busy
+                            onClicked:settings.connectionTest.cancel()
+                        }
+                        Item {Layout.fillWidth:true}
+                    }
+                    TextArea {
+                        objectName:"aiConnectionTestStatus"
+                        Layout.fillWidth:true;implicitHeight:contentHeight+topPadding+bottomPadding
+                        visible:text.length>0;text:settings.connectionTestStatus()
+                        readOnly:true;selectByMouse:true;selectByKeyboard:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
+                        background:null;leftPadding:0;rightPadding:0;topPadding:0;bottomPadding:0;font.pixelSize:11
+                        color:settings.connectionTestState.phase==="failed" ? settings.colors.errorFg : settings.colors.textSecondary
+                        selectionColor:settings.colors.selectedBg;selectedTextColor:settings.colors.selectedFg
+                        Accessible.name:qsTr("Connection test status");Accessible.description:text
+                    }
+                    Label {
+                        Layout.fillWidth:true;wrapMode:Text.Wrap;font.pixelSize:11;color:settings.colors.textSecondary
+                        text:qsTr("Test sends only a fixed ‘ping’ to the address and model above, without document content.")
                     }
                     LyraCheckBox {
                         colors:settings.colors
@@ -448,6 +509,7 @@ ApplicationWindow {
                         placeholderText: qsTr("API key — saved only in the system keychain")
                         echoMode: TextInput.Password
                         Accessible.name: qsTr("AI API key")
+                        onTextEdited:if(settings.connectionTest)settings.connectionTest.cancel()
                     }
                     Label {
                         textFormat: Text.PlainText

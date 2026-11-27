@@ -22,7 +22,7 @@ Dialog {
     onClosed:confirmation.close()
     function cancelTop(){if(confirmation.visible)confirmation.reject();else audit.reject();}
     function actionName(key) {
-        const names={summarise:qsTr("Summary"),selection_question:qsTr("Selection question"),translation:qsTr("Translation"),document_chat:qsTr("Document chat"),region_question:qsTr("Region question"),summary_layer:qsTr("Layered summary")};
+        const names={summarise:qsTr("Summary"),selection_question:qsTr("Selection question"),translation:qsTr("Translation"),document_chat:qsTr("Document chat"),region_question:qsTr("Region question"),summary_layer:qsTr("Layered summary"),connection_test:qsTr("Connection test")};
         return names[key] || qsTr("Unknown action");
     }
     function outcomeName(key){return key==="sent" ? qsTr("Completed") : key==="failed" ? qsTr("Failed") : key==="cancelled" ? qsTr("Stopped") : qsTr("Pending or interrupted");}
