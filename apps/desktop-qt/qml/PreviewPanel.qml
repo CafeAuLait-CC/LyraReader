@@ -212,6 +212,7 @@ Popup {
                             Layout.fillWidth: true
                             readOnly: true
                             selectByMouse: true
+                            selectByKeyboard: true
                             wrapMode: Text.Wrap
                             color: app.colors.textPrimary
                             background: null

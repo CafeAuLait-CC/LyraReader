@@ -490,7 +490,7 @@ Item {
             TextArea {
                 id:questionEditor;objectName:"aiRegionQuestion"
                 width:composer.availableWidth;text:card.attachment.question || ""
-                readOnly:card.running
+                readOnly:card.running;selectByKeyboard:true
                 wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
                 placeholderText:card.attachment.completed_turn_count || card.result.state==="finished"
                     ? qsTr("Ask a follow-up…") : qsTr("Ask about this region…")
@@ -624,7 +624,7 @@ Item {
                 Label {visible:!!card.attachment.text_warning;Layout.fillWidth:true;wrapMode:Text.Wrap;text:card.attachment.text_warning || "";textFormat:Text.PlainText;color:card.app.colors.warningFg}
                 Label {visible:!!card.attachment.text_truncated;Layout.fillWidth:true;wrapMode:Text.Wrap;text:qsTr("The region text was limited to 12,000 characters.");color:card.app.colors.textSecondary}
                 ToolButton {id:showText;visible:!!card.attachment.text;text:qsTr("Captured text");checkable:true}
-                TextArea {objectName:"aiRegionText";visible:showText.visible && showText.checked;text:card.attachment.text || "";readOnly:true;selectByMouse:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;Layout.fillWidth:true}
+                TextArea {objectName:"aiRegionText";Accessible.name:qsTr("Captured text");visible:showText.visible && showText.checked;text:card.attachment.text || "";readOnly:true;selectByMouse:true;selectByKeyboard:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText;Layout.fillWidth:true}
                 Label {
                     visible:!!card.attachment.image_png;Layout.fillWidth:true;wrapMode:Text.Wrap
                     text: {
@@ -669,7 +669,7 @@ Item {
             Label {Layout.fillWidth:true;wrapMode:Text.Wrap;text:qsTr("PNG bytes are hidden in this text view. The image above is the attachment; Copy payload includes the complete bytes.")}
             ScrollView {
                 Layout.fillWidth:true;Layout.fillHeight:true;contentWidth:availableWidth
-                TextArea {objectName:"aiRegionDisplayedPayload";width:parent.width;readOnly:true;selectByMouse:true;textFormat:TextEdit.PlainText;wrapMode:TextEdit.Wrap;text:payload.displayedBody}
+                TextArea {objectName:"aiRegionDisplayedPayload";Accessible.name:qsTr("Region request preview");width:parent.width;readOnly:true;selectByMouse:true;selectByKeyboard:true;textFormat:TextEdit.PlainText;wrapMode:TextEdit.Wrap;text:payload.displayedBody}
             }
             Button {text:qsTr("Copy payload");enabled:!!payload.snapshot;onClicked:if(card.app.session)card.app.session.copyText(payload.snapshot.parts.map(p=>p.wire_body).join("\n\n"))}
         }

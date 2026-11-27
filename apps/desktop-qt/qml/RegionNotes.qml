@@ -348,7 +348,7 @@ Pane {
                 }
                 TextArea {
                     id:noteText;objectName:"regionKnowledgeNote"
-                    readOnly:!!notes.history.writes_blocked;selectByMouse:true
+                    readOnly:!!notes.history.writes_blocked;selectByMouse:true;selectByKeyboard:true
                     Layout.fillWidth:true;wrapMode:TextEdit.Wrap;textFormat:TextEdit.PlainText
                     placeholderText:qsTr("Keep your own reading note…");Accessible.name:qsTr("Knowledge note")
                     Keys.priority:Keys.BeforeItem

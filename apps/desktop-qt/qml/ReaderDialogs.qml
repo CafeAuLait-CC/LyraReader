@@ -479,8 +479,36 @@ Item {
             };
         }
         ScrollView {
+            id: informationScroll
             anchors.fill: parent
             contentWidth: availableWidth
+            function revealFocus() {
+                if(!information.visible)return;
+                const item=dialogs.app.activeFocusItem,source=dialogs.app.currentReader;
+                const generation=source ? source.documentGeneration : -1;
+                Qt.callLater(function() {
+                    if(!information.visible || !item || dialogs.app.activeFocusItem!==item
+                            || source!==dialogs.app.currentReader || !source || generation!==source.documentGeneration)return;
+                    const f=informationScroll.contentItem;
+                    if(!f || f.height<=0)return;
+                    let parent=item;
+                    while(parent && parent!==f)parent=parent.parent;
+                    if(!parent)return;
+                    let rect=item.mapToItem(f.contentItem,0,0,item.width,item.height);
+                    if(rect.height>f.height-4 && typeof item.cursorRectangle!=="undefined") {
+                        const cursor=item.cursorRectangle;
+                        rect=item.mapToItem(f.contentItem,cursor.x,cursor.y,cursor.width,cursor.height);
+                    }
+                    let y=f.contentY;
+                    if(rect.y<y+2)y=rect.y-2;
+                    else if(rect.y+rect.height>y+f.height-2)y=rect.y+rect.height-f.height+2;
+                    f.contentY=Math.max(0,Math.min(Math.max(0,f.contentHeight-f.height),y));
+                });
+            }
+            onAvailableWidthChanged:revealFocus()
+            onAvailableHeightChanged:revealFocus()
+            Connections {target:dialogs.app;function onActiveFocusItemChanged(){informationScroll.revealFocus();}}
+            Connections {target:informationScroll.contentItem;function onContentHeightChanged(){informationScroll.revealFocus();}}
             ColumnLayout {
                 width: parent.width
                 spacing: 9
@@ -588,8 +616,10 @@ Item {
                 TextArea {
                     textFormat: TextEdit.PlainText
                     text: app.bibtex
+                    Accessible.name: qsTr("BibTeX")
                     readOnly: true
                     selectByMouse: true
+                    selectByKeyboard: true
                     wrapMode: Text.WrapAnywhere
                     Layout.fillWidth: true
                     font.family: "monospace"
@@ -863,9 +893,11 @@ Item {
                 id: noteText
                 textFormat: TextEdit.PlainText
                 objectName: "annotationNoteText"
+                Accessible.name: qsTr("Annotation note")
                 Layout.fillWidth: true
                 implicitHeight: 150
                 readOnly: app.xfaReadOnly || !!(app.selectedAnnotation && (app.selectedAnnotation.foreign || app.selectedAnnotation.kind === "signature"))
+                selectByKeyboard: true
                 wrapMode: Text.Wrap
                 placeholderText: qsTr("Note")
                 onTextChanged: if (dialogs.noteReady && annotation.visible && !readOnly) {

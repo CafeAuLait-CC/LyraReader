@@ -796,6 +796,7 @@ Pane {
                 textFormat: TextEdit.PlainText; wrapMode: TextEdit.Wrap
                 padding: 10; background: null; font.pixelSize: 14
                 readOnly: aiPanel.workspace === "chat" && (!!aiPanel.viewState.chatReadOnly || aiPanel.owner.documentRevisionPending)
+                selectByKeyboard: true
                 placeholderText: aiPanel.workspace === "chat" ? qsTr("Ask about this document…") : qsTr("Question about selected text…")
                 Accessible.name: aiPanel.workspace === "chat" ? qsTr("Question about document") : qsTr("Question about selection")
                 // TextEdit can normalize displayed line separators. Only real edits
@@ -1071,6 +1072,7 @@ Pane {
                 Layout.fillWidth: true; Layout.fillHeight: true; contentWidth: availableWidth
                 TextArea {
                     objectName: "aiWirePayload"
+                    Accessible.name: qsTr("Exact AI request body")
                     text: {
                         const plan = aiPanel.plan;
                         if (!plan) return "";
@@ -1078,7 +1080,7 @@ Pane {
                         const row = (plan.summary_rows || plan.translation_rows || [])[payloadRow.currentIndex];
                         return row && plan.parts[row.part_index] ? plan.parts[row.part_index].wire_body : "";
                     }
-                    readOnly: true; selectByMouse: true; wrapMode: TextEdit.WrapAnywhere; textFormat: TextEdit.PlainText; font.family: "monospace"
+                    readOnly: true; selectByMouse: true; selectByKeyboard: true; wrapMode: TextEdit.WrapAnywhere; textFormat: TextEdit.PlainText; font.family: "monospace"
                 }
             }
             ReadingPrimaryButton {

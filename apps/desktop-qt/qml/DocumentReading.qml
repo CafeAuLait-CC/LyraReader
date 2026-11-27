@@ -97,6 +97,6 @@ Popup {
         standardButtons:Dialog.Close
         onAboutToShow:body=(reading.plan ? reading.plan.parts.map(p=>p.wire_body) : []).concat(reading.state.merge_payloads || []).join("\n\n")
         onClosed:body=""
-        ScrollView {anchors.fill:parent;contentWidth:availableWidth;TextArea {objectName:"documentReadingPayloadText";width:parent.width;text:payload.body;readOnly:true;selectByMouse:true;textFormat:TextEdit.PlainText;wrapMode:TextEdit.Wrap}}
+        ScrollView {anchors.fill:parent;contentWidth:availableWidth;TextArea {objectName:"documentReadingPayloadText";Accessible.name:qsTr("Document reading request body");width:parent.width;text:payload.body;readOnly:true;selectByMouse:true;selectByKeyboard:true;textFormat:TextEdit.PlainText;wrapMode:TextEdit.Wrap}}
     }
 }

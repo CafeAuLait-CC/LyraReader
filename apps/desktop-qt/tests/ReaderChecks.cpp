@@ -282,6 +282,25 @@ static QQuickItem *visualItem(QQuickItem *root,const QString &name) {
     for(auto *child:root->childItems())if(auto *found=visualItem(child,name))return found;
     return nullptr;
 }
+// Read-only UI inspection must preserve its model and use real native key events.
+static void verifyReadOnlyKeyboard(QQuickWindow *window,QQuickItem *field,bool allowEmpty=false) {
+    QVERIFY(field && field->isVisible() && field->isEnabled());
+    QVERIFY(field->property("readOnly").toBool());
+    auto *accessible=QAccessible::queryAccessibleInterface(field);QVERIFY(accessible && !accessible->text(QAccessible::Name).isEmpty());
+    QVERIFY2(field->property("selectByKeyboard").toBool(),qPrintable(field->objectName()+": read-only text must support keyboard inspection"));
+    const auto original=field->property("text").toString();QVERIFY(allowEmpty || !original.isEmpty());
+    window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);
+    field->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(field->hasActiveFocus());
+    QTest::keyClick(window,Qt::Key_End,Qt::ControlModifier);QTRY_COMPARE(field->property("cursorPosition").toInt(),original.size());
+    QTest::keyClick(window,Qt::Key_Home,Qt::ControlModifier|Qt::ShiftModifier);QCOMPARE(field->property("selectedText").toString(),original);
+    if(!original.isEmpty()){QTest::keyClick(window,Qt::Key_C,Qt::ControlModifier);QCOMPARE(QGuiApplication::clipboard()->text(),original);}
+    QTest::keyClick(window,Qt::Key_X);QCOMPARE(field->property("text").toString(),original);
+}
+static QQuickItem *visibleReadOnlyText(QQuickItem *item,const QString &text) {
+    if(item->isVisible() && item->property("readOnly").toBool() && item->property("text").toString()==text)return item;
+    for(auto *child:item->childItems())if(auto *found=visibleReadOnlyText(child,text))return found;
+    return nullptr;
+}
 static bool clickDialogButton(QQuickWindow *window,QObject *dialog,const QString &text) {
     auto *footer=qvariant_cast<QQuickItem *>(dialog->property("footer"));
     if(!footer)return false;
@@ -2505,6 +2524,7 @@ private slots:
         QVERIFY(show({literal},"One"));QTRY_VERIFY(panel->property("opened").toBool());QTest::qWait(50);
         auto *heading=visualItem(window->contentItem(),"referenceEntryHeading0");QVERIFY(heading);QCOMPARE(heading->property("textFormat").toInt(),int(Qt::PlainText));QVERIFY(heading->property("text").toString().contains("<b>1</b>"));
         const double shortHeight=panel->property("height").toDouble();QVERIFY2(shortHeight>=120 && shortHeight<200,qPrintable(QString("Short citation height %1").arg(shortHeight)));
+        auto *reference=visibleReadOnlyText(window->contentItem(),"A short citation.");verifyReadOnlyKeyboard(window,reference);QVERIFY(!QTest::currentTestFailed());
         QVERIFY(show({entry(1,"First entry."),entry(2,"Second entry."),entry(3,"Third entry.")},"Three"));QTest::qWait(60);
         QVERIFY(panel->property("height").toDouble()>shortHeight+40);
         panel->setProperty("preferredHeight",240);panel->setProperty("manuallySized",true);QTest::qWait(30);
@@ -5182,7 +5202,7 @@ LyraMenu {
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);reader->setAiInput("action",3);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().value("plan").toMap().value("action").toString()=="TranslateSelection");QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->documentReading().value("choice_pending").toBool());
         reader->setAiInput("action",0);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().value("plan").toMap().value("action").toString()=="SummarizePage");QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->documentReading().value("choice_pending").toBool());auto *skip=view.window->findChild<QObject *>("skipDocumentReadingChoice");QVERIFY(skip);QVERIFY(QMetaObject::invokeMethod(skip,"clicked"));QVERIFY(!reader->documentReading().value("choice_pending").toBool());QCOMPARE(server.requests.size(),0);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->documentReading().value("choice_pending").toBool());window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QTest::keyClick(window,Qt::Key_K,Qt::ControlModifier|Qt::ShiftModifier);auto *reading=window->findChild<QObject *>("documentReadingPopup");QVERIFY(reading);QTRY_VERIFY(reading->property("visible").toBool());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!reading->property("visible").toBool());QCOMPARE(window->property("selection").toMap(),selection);QCOMPARE(server.requests.size(),0);
-        QVERIFY(QMetaObject::invokeMethod(window,"openDocumentReading"));QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);auto *inspect=window->findChild<QObject *>("inspectDocumentReading");QVERIFY(inspect);QVERIFY(QMetaObject::invokeMethod(inspect,"clicked"));auto *payload=window->findChild<QObject *>("documentReadingPayload");QVERIFY(payload);QTRY_VERIFY(payload->property("visible").toBool());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(reading->property("visible").toBool());QCOMPARE(window->property("selection").toMap(),selection);
+        QVERIFY(QMetaObject::invokeMethod(window,"openDocumentReading"));QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);auto *inspect=window->findChild<QObject *>("inspectDocumentReading");QVERIFY(inspect);QVERIFY(QMetaObject::invokeMethod(inspect,"clicked"));auto *payload=window->findChild<QObject *>("documentReadingPayload");QVERIFY(payload);QTRY_VERIFY(payload->property("visible").toBool());auto *wire=window->findChild<QQuickItem *>("documentReadingPayloadText");verifyReadOnlyKeyboard(window,wire);QVERIFY(!QTest::currentTestFailed());QCOMPARE(server.requests.size(),0);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(reading->property("visible").toBool());QCOMPARE(window->property("selection").toMap(),selection);
         window->resize(380,600);QTest::qWait(100);QVERIFY(reading->property("width").toDouble()<=window->width()-20);QVERIFY(reading->property("height").toDouble()<=window->height()-40);const auto evidenceBase=qEnvironmentVariable("LYRA_READER_AI_EVIDENCE_DIR");const auto evidence=evidenceBase.isEmpty()?QString():evidenceBase+"/"+theme;if(!evidence.isEmpty()){QVERIFY(QDir().mkpath(evidence));QVERIFY(window->grabWindow().save(evidence+"/reading-preview-light-narrow.png"));}QCOMPARE(server.requests.size(),0);reader->stopDocumentReading();QTRY_COMPARE(reader->pendingCommands(),0);
         auto *notice=window->findChild<QObject *>("flattenExportNotice");QVERIFY(notice);
         QVariantList metrics;
@@ -5213,6 +5233,22 @@ LyraMenu {
         const auto loops=qmlBindingLoops(qmlWarnings);QVERIFY2(loops.isEmpty(),qPrintable(loops.join("\n")));
 
     }
+    void documentInformationBibtexSupportsKeyboardInspectionWithoutWriting() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-metadata-inspection.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));QFile original(path);QVERIFY(original.open(QIODevice::ReadOnly));const auto bytes=original.readAll();original.close();
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(QMetaObject::invokeMethod(window,"showDocumentInformation"));QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!window->property("bibtex").toString().isEmpty());
+        auto *body=visibleReadOnlyText(window->contentItem(),window->property("bibtex").toString());QVERIFY(body);
+        window->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),window);QStringList focusTrail;
+        for(int step=0;step<24 && !body->hasActiveFocus();++step) {
+            QTest::keyClick(window,Qt::Key_Backtab,Qt::ShiftModifier);auto *focus=window->activeFocusItem();const auto rect=focus?focus->mapRectToScene(focus->boundingRect()):QRectF{};
+            focusTrail.append(focus?QString("%1:%2 text=%3 rect=%4,%5,%6,%7").arg(focus->objectName(),QString::fromLatin1(focus->metaObject()->className()),focus->property("text").toString().left(32)).arg(rect.x()).arg(rect.y()).arg(rect.width()).arg(rect.height()):QString("none"));
+        }
+        qInfo()<<"Document information backward focus trail"<<focusTrail;QVERIFY2(body->hasActiveFocus(),qPrintable(focusTrail.join(" -> ")));
+        const auto cursorVisible=[&]{auto rect=body->property("cursorRectangle").toRectF();auto *item=body;while(item){if(item->clip() && !item->boundingRect().adjusted(-1,-1,1,1).contains(rect))return false;auto *parent=item->parentItem();if(parent)rect=item->mapRectToItem(parent,rect);item=parent;}return true;};
+        QTRY_VERIFY2(cursorVisible(),qPrintable(focusTrail.join(" -> ")));
+        verifyReadOnlyKeyboard(window,body);QVERIFY(!QTest::currentTestFailed());QVERIFY(!reader->hasUnsavedChanges());
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!body->isVisible());QVERIFY(original.open(QIODevice::ReadOnly));QCOMPARE(original.readAll(),bytes);
+    }
     void documentQuestionUsesRetrievedSourcesAndRejectsUnsentCitations() {
         MockChatServer server;QVERIFY(server.listen());server.responses.append({{MockChatServer::delta({{"content","Document answer [p.1], invented [p.99], invalid [p.0]."}}),MockChatServer::usage(),QByteArray("data: [DONE]\n\n")},20,200});
         QTemporaryDir scratch;const auto path=scratch.path()+"/question.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/multipage.pdf",path));
@@ -5222,6 +5258,7 @@ LyraMenu {
         auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY2_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty(),qPrintable(reader->aiState().value("status").toString()),10000);const auto plan=reader->aiState().value("plan").toMap();QCOMPARE(plan.value("action").toString(),QStringLiteral("DocumentChat"));const auto sources=plan.value("sources").toList();QVERIFY(!sources.isEmpty());QCOMPARE(server.requests.size(),0);
         const auto wireBody=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();QVERIFY(!wireBody.isEmpty());
         auto *payload=window->findChild<QObject *>("aiWirePayload");QVERIFY(payload);QCOMPARE(payload->property("text").toString().toUtf8(),wireBody);
+        QVERIFY(QMetaObject::invokeMethod(panel,"inspectPayload"));auto *requestDialog=window->findChild<QObject *>("aiPayloadDialog");QVERIFY(requestDialog);QTRY_VERIFY(requestDialog->property("visible").toBool());verifyReadOnlyKeyboard(window,qobject_cast<QQuickItem *>(payload));QVERIFY(!QTest::currentTestFailed());QCOMPARE(server.requests.size(),0);QCOMPARE(reader->aiState().value("plan").toMap(),plan);QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!requestDialog->property("visible").toBool());
         QVERIFY(reader->startAi("local",plan));QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("running").toBool(),10000);QVERIFY(reader->aiState().value("output").toString().contains("Document answer"));QTRY_VERIFY(window->findChild<QObject *>("aiAnswerText"));QVERIFY(!window->findChild<QObject *>("aiAnswerText")->property("text").toString().contains("href=\"p.99"));
         QCOMPARE(server.requests.size(),1);const auto sent=server.requests.first();const auto headerEnd=sent.indexOf("\r\n\r\n");QVERIFY(headerEnd>=0);QCOMPARE(sent.mid(headerEnd+4),wireBody);
         reader->setAiInput("question",QStringLiteral("A changed question"));QVERIFY(!reader->aiState().contains("plan"));
@@ -6543,6 +6580,7 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         const auto error=rejected.at(0).at(3).toString();
         QVERIFY2(error.contains("PDF changed outside LyraReader"),qPrintable(error));
         QVERIFY(archive.open(QIODevice::ReadOnly));QCOMPARE(archive.readAll(),savedWorkspace);
+        const auto archivedInput=reader->aiState().value("input").toMap();QVERIFY(archivedInput.value("question").toString().isEmpty());reader->setAiInput("question","SYNTHETIC_ARCHIVED_QUESTION");auto *archivedQuestion=window->findChild<QQuickItem *>("aiQuestion");QVERIFY(archivedQuestion);QTRY_VERIFY(archivedQuestion->isVisible() && archivedQuestion->property("readOnly").toBool());verifyReadOnlyKeyboard(window,archivedQuestion,true);QVERIFY(!QTest::currentTestFailed());QCOMPARE(reader->aiState().value("input").toMap(),archivedInput);
         QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QVERIFY(plan().isEmpty());QCOMPARE(server.requests.size(),3);
     }
 
@@ -8690,6 +8728,7 @@ QtObject {
         QTRY_COMPARE_WITH_TIMEOUT(crop->property("status").toInt(),1,10000);
         QVERIFY2(qAbs(crop->property("width").toDouble()/crop->property("height").toDouble()-double(picture.width())/picture.height())<.001,"The captured area must keep its pixel aspect ratio in the bounded preview");
         window->setProperty("paperAppearance","night");QCOMPARE(reader->aiRegion().value("image_png"),attachment.value("image_png"));QCOMPARE(crop->property("paperAppearance").toString(),QString("original"));
+        QQmlExpression capturedToggle(QQmlEngine::contextForObject(crop),crop,"showText");auto *toggle=qobject_cast<QQuickItem *>(capturedToggle.evaluate().value<QObject *>());QVERIFY(!capturedToggle.hasError() && toggle);toggle->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(window,Qt::Key_Space);auto *capturedText=window->findChild<QQuickItem *>("aiRegionText");QVERIFY(capturedText);QTRY_VERIFY(capturedText->isVisible());verifyReadOnlyKeyboard(window,capturedText);QVERIFY(!QTest::currentTestFailed());QCOMPARE(server.requests.size(),0);
         QVERIFY(QMetaObject::invokeMethod(popup,"close"));QTRY_VERIFY(!popup->property("visible").toBool());
         QSignalSpy imageChanges(reader,&ReaderController::aiRegionImageChanged);const auto imageUrl=reader->aiRegionImage();
         reader->setAiRegionQuestion("What is shown in this synthetic area?");QCOMPARE(imageChanges.size(),0);QCOMPARE(reader->aiRegionImage(),imageUrl);QVERIFY(QMetaObject::invokeMethod(card,"prepare"));
@@ -8700,6 +8739,7 @@ QtObject {
         const auto plan=reader->aiState().value("plan").toMap();const auto body=plan.value("parts").toList().first().toMap().value("wire_body").toString();QVERIFY(body.contains("data:image/png;base64,"+attachment.value("image_png").toString()));QVERIFY(!body.contains("paper_plan"));QCOMPARE(server.requests.size(),0);
         auto *payload=window->findChild<QObject *>("aiRegionPayload"),*displayedPayload=window->findChild<QObject *>("aiRegionDisplayedPayload");QVERIFY(payload && displayedPayload);QVERIFY(displayedPayload->property("text").toString().isEmpty());
         QVERIFY(QMetaObject::invokeMethod(payload,"open"));QTRY_VERIFY(payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().contains("Captured PNG bytes"));QVERIFY(!displayedPayload->property("text").toString().contains(attachment.value("image_png").toString()));QCOMPARE(payload->property("snapshot").toMap().value("parts").toList().first().toMap().value("wire_body").toString(),body);
+        verifyReadOnlyKeyboard(window,qobject_cast<QQuickItem *>(displayedPayload));QVERIFY(!QTest::currentTestFailed());QCOMPARE(server.requests.size(),0);QCOMPARE(reader->aiState().value("plan").toMap(),plan);
         QVERIFY(QMetaObject::invokeMethod(payload,"close"));QTRY_VERIFY(!payload->property("visible").toBool());QVERIFY(displayedPayload->property("text").toString().isEmpty());
         const auto snapshots=qEnvironmentVariable("LYRA_READER_REGION_SNAPSHOT");if(!snapshots.isEmpty()){QTest::qWait(100);QVERIFY(window->grabWindow().save(snapshots));}
         auto *send=window->findChild<QQuickItem *>("sendAiRegion");QVERIFY(send && send->isEnabled());QVERIFY(settleRegionControl(window,paperCard,send,reader));QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,send->mapToScene(QPointF(send->width()/2,send->height()/2)).toPoint());
@@ -9504,6 +9544,7 @@ QtObject {
         QCOMPARE(reader->data().value("marks").toMap().value("annotations").toList().size(),0);
         for(const auto &command:readingCommands)QVERIFY(command[1].toString()!="file_adopt" && !command[1].toString().startsWith("mark_"));
         QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!body->isVisible());QVERIFY(QMetaObject::invokeMethod(window,"selectAnnotation",Q_ARG(QVariant,note),Q_ARG(QVariant,true)));QTRY_VERIFY(body->isVisible());
+        QVERIFY(QMetaObject::invokeMethod(window,"showAnnotationProperties"));auto *propertiesText=window->findChild<QQuickItem *>("annotationNoteText");QVERIFY(propertiesText);QTRY_VERIFY(propertiesText->isVisible());verifyReadOnlyKeyboard(window,propertiesText);QVERIFY(!QTest::currentTestFailed());QVERIFY(!reader->hasUnsavedChanges());QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!propertiesText->isVisible());
         QTest::qWait(40);QTest::mouseMove(window,body->mapToScene(QPointF(12,12)).toPoint(),20);QTest::mouseClick(window,Qt::LeftButton,Qt::NoModifier,body->mapToScene(QPointF(12,12)).toPoint());QTRY_VERIFY_WITH_TIMEOUT(!body->property("readOnly").toBool() && body->hasActiveFocus(),10000);const auto adopted=reader->data().value("marks").toMap().value("annotations").toList();QCOMPARE(adopted.size(),1);QCOMPARE(adopted.first().toMap().value("fileIdentity").toString(),fileId);QTest::keyClick(window,Qt::Key_A,Qt::ControlModifier);for(const char typed:QByteArray("SAVED_NOTE_AFTER_EXPLICIT_EDIT"))QTest::keyClick(window,typed);QTest::keyClick(window,Qt::Key_Return,Qt::ControlModifier);QTRY_VERIFY_WITH_TIMEOUT(!editing->property("active").toBool() && !reader->pendingCommands(),10000);QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);file.close();
         reader->submit("document_save");QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,15000);QVERIFY2(reader->error().isEmpty(),qPrintable(reader->error()));QVERIFY(!reader->hasUnsavedChanges());bool found=false;for(const auto &v:reader->data().value("marks").toMap().value("file_annotations").toList())if(v.toMap().value("contents").toString()=="SAVED_NOTE_AFTER_EXPLICIT_EDIT")found=true;QVERIFY(found);
     }
@@ -9544,6 +9585,7 @@ QtObject {
         reader->prepareAiRegion(settings);QTRY_VERIFY_WITH_TIMEOUT(!reader->aiState().value("plan").toMap().isEmpty() && !reader->pendingCommands(),10000);const auto plan=reader->aiState().value("plan").toMap();
         QVERIFY(reader->startAi("local",plan));QTRY_VERIFY2_WITH_TIMEOUT(reader->aiState().value("output").toString().contains("DURABLE_PARTIAL"),qPrintable(QJsonDocument::fromVariant(reader->aiState()).toJson(QJsonDocument::Compact)),10000);
         QTRY_VERIFY_WITH_TIMEOUT(reader->aiRegion().value("saved").toBool() && reader->aiState().value("running").toBool() && !reader->pendingCommands(),10000);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionTool"));auto *question=window->findChild<QQuickItem *>("aiRegionQuestion");QVERIFY(question);QTRY_VERIFY(question->isVisible() && question->property("readOnly").toBool());verifyReadOnlyKeyboard(window,question);QVERIFY(!QTest::currentTestFailed());QCOMPARE(reader->aiRegion().value("question").toString(),QString("EXACT_SENT_QUESTION"));QCOMPARE(server.requests.size(),1);
         QSignalSpy reads(reader,&ReaderController::commandFinished);const auto read=reader->submit("region_get",{{"id",id}});QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVariantMap partial;for(const auto &row:reads)if(row[0].toULongLong()==read)partial=row[2].toMap();
         QCOMPARE(partial.value("turns").toList().size(),1);const auto turn=partial.value("turns").toList().first().toMap();QCOMPARE(turn.value("state").toString(),QString("empty"));QVERIFY(turn.value("answer").toString().contains("DURABLE_PARTIAL"));const auto created=turn.value("createdAt");
         const auto wire=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();QCOMPARE(server.requests.size(),1);QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),wire);
@@ -9640,6 +9682,15 @@ QtObject {
         reader->setAiRegionQuestion("LOCAL_TYPING_WINS");QVERIFY(reader->reopenAiRegion(id,reader->regionHistory().value("revision").toString()));QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QCOMPARE(reader->aiRegion().value("question").toString(),QString("LOCAL_TYPING_WINS"));
         QVERIFY(reader->reopenAiRegion(id,reader->regionHistory().value("revision").toString()));reader->clearAiRegion();QTRY_COMPARE_WITH_TIMEOUT(reader->pendingCommands(),0,10000);QVERIFY(!reader->aiRegion().contains("image_png"));QTRY_VERIFY(!window->findChild<QObject *>("aiRegionCard")->property("opened").toBool());
         QVERIFY(originalFile.open(QIODevice::ReadOnly));QCOMPARE(originalFile.readAll(),original);
+    }
+    void blockedRegionKnowledgeNoteRemainsKeyboardReadable() {
+        QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const auto path=scratch.filePath("synthetic-readonly-knowledge.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));MockChatServer sentinel;QVERIFY(sentinel.listen());NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-no-send"}});view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());const auto id=reader->aiRegion().value("history_id").toString();QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE(reader->pendingCommands(),0);reader->submit("region_note",{{"id",id},{"text",QString::fromUtf8("Synthetic protected knowledge 中文 🙂")}});QTRY_COMPARE(reader->pendingCommands(),0);reader->clearAiRegion();QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));QTRY_COMPARE(reader->pendingCommands(),0);auto *notes=window->findChild<QObject *>("regionNotes");QVERIFY(notes);QVERIFY(QMetaObject::invokeMethod(notes,"load",Q_ARG(QVariant,id)));QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *text=window->findChild<QQuickItem *>("regionKnowledgeNote");QVERIFY(text);QTRY_VERIFY(text->isVisible() && !text->property("text").toString().isEmpty());
+        QDirIterator files(qEnvironmentVariable("LYRA_READER_DOCUMENT_CACHE_DIR"),{"region-conversations-v1.json"},QDir::Files,QDirIterator::Subdirectories);QVERIFY(files.hasNext());const auto history=files.next();QFile source(history);QVERIFY(source.open(QIODevice::ReadOnly));const auto before=source.readAll();source.close();auto damagedRows=QJsonDocument::fromJson(before).array();damagedRows.append(QJsonObject{{"id","00000003-1111-4222-8333-000000000003"}});const QByteArray damaged=QJsonDocument(damagedRows).toJson();{QSaveFile changed(history);QVERIFY(changed.open(QIODevice::WriteOnly));QCOMPARE(changed.write(damaged),damaged.size());QVERIFY(changed.commit());}
+        reader->submit("region_list");QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(text->property("readOnly").toBool());verifyReadOnlyKeyboard(window,text);QVERIFY(!QTest::currentTestFailed());QVERIFY(!reader->hasUnsavedReadingNotes());QCOMPARE(sentinel.requests.size(),0);QVERIFY(source.open(QIODevice::ReadOnly));QCOMPARE(source.readAll(),damaged);source.close();
+        {QSaveFile repaired(history);QVERIFY(repaired.open(QIODevice::WriteOnly));QCOMPARE(repaired.write(before),before.size());QVERIFY(repaired.commit());}reader->submit("region_list");QTRY_COMPARE(reader->pendingCommands(),0);
     }
     void regionNotesEmptyActionAndSavedAnswerPreviewsStayLocal() {
         QTemporaryDir scratch;
