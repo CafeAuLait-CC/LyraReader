@@ -8,6 +8,7 @@ ApplicationWindow {
     objectName: "aiTaskReviewWindow"
     required property var app
     property var ticket: null
+    signal cancelled(var abandoned)
     property bool bodyExpanded: false
     property bool restoreParentFocus: false
     property var cursorIntent: null
@@ -50,8 +51,10 @@ ApplicationWindow {
     }
     function cancel() {
         policy.cancelPresentation();
+        const abandoned = ticket;
         ticket = null;
         if (visible) { restoreParentFocus = active; close(); }
+        if (abandoned) cancelled(abandoned);
     }
     function validate() { if (ticket && !app.aiTaskReviewIsCurrent(ticket)) cancel(); }
     function requestBodyCursor() {
@@ -79,10 +82,12 @@ ApplicationWindow {
         if (approved.reader) app.sendAi(approved.reader, approved.plan, approved.purpose, approved.token);
     }
     onClosing: {
+        const abandoned = ticket;
         policy.cancelPresentation(); ticket = null; bodyExpanded = false;
         const restore = restoreParentFocus || active;
         restoreParentFocus = false;
         if (restore) policy.returnFocus();
+        if (abandoned) cancelled(abandoned);
     }
     Connections {
         target: review.owner

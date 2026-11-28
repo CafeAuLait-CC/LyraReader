@@ -24,7 +24,7 @@ Dialog {
     function refresh() { editor.refresh(); }
     function finishInput() { editor.finishInput(); }
     function change(field, value) { editor.change(field, value); }
-    onAboutToHide: editor.finishInput()
+    onAboutToHide: { editor.finishInput(); editor.endPreview(); }
     onClosed: editor.reset()
     contentItem: AiReadingNotesContent {
         id: editor

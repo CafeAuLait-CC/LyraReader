@@ -97,7 +97,8 @@ ApplicationWindow {
     }
     AiRegionCard {id:aiRegionCard;app:root}
     DocumentReading {id:documentReadingPopup;app:root}
-    AiTaskReviewWindow {id:aiTaskReview;app:root}
+    signal aiTaskReviewCancelled(var ticket)
+    AiTaskReviewWindow {id:aiTaskReview;app:root;onCancelled:function(ticket){root.aiTaskReviewCancelled(ticket)}}
     function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
     function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"regions");}}
     function openReadingNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
@@ -2164,16 +2165,20 @@ ApplicationWindow {
             return state.phase==="preview" && sameAiReviewPlan(state.plan,ticket.plan);
         }
         const state=ticket.reader.aiState;
+        if(ticket.purpose === "note-update" && (ticket.token !== ticket.reader.aiPreviewRevision
+                || !ticket.plan || ticket.plan.note_id !== ticket.reader.aiPreviewNoteId
+                || ticket.reader.hasUnsavedReadingNotes || ticket.reader.readingNoteSaving))return false;
         return !state.running && !state.planSent && sameAiReviewPlan(state.plan,ticket.plan);
     }
     function dispatchAiTaskFromUi(owner, plan, purpose, token) {
         const ticket={reader:owner,plan:plan,generation:owner ? owner.documentGeneration : 0,
             purpose:purpose || "assistant",token:token || "",workflowRevision:aiReviewRevision};
         if(!aiTaskReviewIsCurrent(ticket)) {
-            operationStatus=qsTr("The task changed. Prepare it again before sending.");return;
+            operationStatus=qsTr("The task changed. Prepare it again before sending.");return false;
         }
-        if(requiresAiTaskReview)aiTaskReview.open(ticket);
-        else sendAi(owner,plan,ticket.purpose,ticket.token);
+        if(requiresAiTaskReview)return aiTaskReview.open(ticket);
+        sendAi(owner,plan,ticket.purpose,ticket.token);
+        return true;
     }
     readonly property var aiTaskReviewTicket:aiTaskReview ? aiTaskReview.ticket : null
     function cancelAiTaskReview(owner,purpose) {
@@ -2198,6 +2203,11 @@ ApplicationWindow {
             if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
             credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;pendingAiToken="";
         }
+    }
+    function abandonNoteUpdateCredential(owner,token) {
+        if (pendingAiPurpose !== "note-update" || pendingAiReader !== owner || pendingAiToken !== token) return;
+        credentialReadId=-1; pendingAiReader=null; pendingAiPlan=null; pendingAiToken="";
+        if (dialogs.credentialDialog.visible) dialogs.credentialDialog.reject();
     }
     function sendAi(owner, plan, purpose, token) {
         if (!owner || !plan || !refreshAiConnection() || !owner)
@@ -3047,7 +3057,7 @@ ApplicationWindow {
             if(!owner)return;
             const view=owner.aiState.previewView;
             const affected=root.pendingAiPurpose==="document-reading"
-                || (["assistant","region"].indexOf(root.pendingAiPurpose)>=0 && ["summary","note","region_note"].indexOf(view)>=0);
+                || (["assistant","region","note-update"].indexOf(root.pendingAiPurpose)>=0 && ["summary","note","region_note"].indexOf(view)>=0);
             if(!affected)return;
             const currentPlan=root.pendingAiPurpose==="document-reading" ? owner.documentReading.plan : owner.aiState.plan;
             if(currentPlan && Object.keys(currentPlan).length>0)return;

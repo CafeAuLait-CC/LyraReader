@@ -2682,7 +2682,11 @@ private slots:
         QTRY_COMPARE(reader->pendingCommands(),0);
         const auto activate=[&](QQuickWindow *host,QQuickItem *button) {
             host->requestActivate();if(!QTest::qWaitFor([&]{return QGuiApplication::focusWindow()==host;},3000))return false;
-            button->forceActiveFocus(Qt::TabFocusReason);QTest::keyClick(host,Qt::Key_Space);return true;
+            button->forceActiveFocus(Qt::TabFocusReason);
+            if(!QTest::qWaitFor([&]{return button->hasActiveFocus() && host->activeFocusItem()==button;},3000))return false;
+            QSignalSpy clicked(button,SIGNAL(clicked()));
+            QTest::keyClick(host,Qt::Key_Space);
+            return QTest::qWaitFor([&]{return !clicked.isEmpty();},3000);
         };
         QByteArray reviewedBody;
         for(int attempt=0;attempt<(requiresReview?2:1);++attempt) {
@@ -2690,7 +2694,10 @@ private slots:
             QVERIFY(activate(window,generate));QTRY_COMPARE(reader->pendingCommands(),0);
             if(!requiresReview)break;
             auto *review=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(review);
-            QTRY_VERIFY(review->isVisible());QCOMPARE(review->modality(),Qt::NonModal);QCOMPARE(review->transientParent(),window);
+            QTRY_VERIFY2(review->isVisible(),qPrintable(QString("attempt=%1 focus=%2 pending=%3 requires=%4 status=%5 plan=%6")
+                .arg(attempt).arg(QGuiApplication::focusWindow()==window).arg(reader->pendingCommands())
+                .arg(window->property("requiresAiTaskReview").toBool()).arg(window->property("operationStatus").toString())
+                .arg(!reader->aiState().value("plan").toMap().isEmpty())));QCOMPARE(review->modality(),Qt::NonModal);QCOMPARE(review->transientParent(),window);
             QCOMPARE(review->flags()&Qt::WindowType_Mask,Qt::WindowFlags(Qt::Dialog));
             QVERIFY(review->minimumWidth()<review->maximumWidth());QCOMPARE(server.requests.size(),0);
             auto *disclosure=visualItem(review->contentItem(),"showAiReviewBody");QVERIFY(disclosure);
@@ -11814,8 +11821,141 @@ QtObject {
         QVERIFY(notes->setProperty("sourceFocusTicket",QVariant()));
         QVERIFY(retiredRevealCleared);
     }
+    void previewOwnershipDoesNotMakeAnEmptyTabContainUserInput() {
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *reader=view.workspace.activeReader();
+        QVERIFY(!reader->hasAiUserState());const auto original=reader->aiState();const auto revision=reader->aiPreviewRevision();
+        reader->invalidateAiPlan();QVERIFY(reader->aiPreviewRevision()!=revision);QVERIFY(!reader->hasAiUserState());QCOMPARE(reader->aiState(),original);
+        reader->setAiInput("question","Unsent local input");QVERIFY(reader->hasAiUserState());
+    }
+    void readingNoteUpdateConsumesTheGlobalReviewChoice_data() {
+        QTest::addColumn<bool>("reviewEnabled");QTest::addColumn<QString>("outcome");
+        QTest::newRow("review")<<true<<QString("send");QTest::newRow("direct")<<false<<QString("send");
+        for(const auto *mode:{"cancel","window-close","notes-close","close-preparing","tab","draft","policy","replace","language","late-credential"})QTest::newRow(mode)<<true<<QString(mode);
+        QTest::newRow("direct-close-preparing")<<false<<QString("close-preparing");
+        QTest::newRow("direct-replace-preparing")<<false<<QString("replace-preparing");
+        QTest::newRow("sidebar-review")<<true<<QString("sidebar:send");
+        QTest::newRow("sidebar-direct")<<false<<QString("sidebar:send");
+        QTest::newRow("sidebar-close-preparing")<<false<<QString("sidebar:close-preparing");
+    }
+    void readingNoteUpdateConsumesTheGlobalReviewChoice() {
+        QFETCH(bool,reviewEnabled);QFETCH(QString,outcome);
+        const bool sidebar=outcome.startsWith("sidebar:");if(sidebar)outcome=outcome.mid(8);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;
+        stored.setValue("reader/preferences/aiReviewBeforeSending",reviewEnabled);
+        stored.setValue("chatGptPlan/connectionMode","apiKey");stored.remove("chatGptPlan/accounts");stored.sync();QVERIFY(ChatGptAccounts::instance()->refreshConnection());
+        MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;
+        const auto path=scratch.filePath("synthetic-note-workflow.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");
+        const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);
+        QCOMPARE(view.workspace.preference("aiReviewBeforeSending",QVariant()).toBool(),reviewEnabled);
+        QCOMPARE(window->property("requiresAiTaskReview").toBool(),reviewEnabled);
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        const QVariantMap settings{{"baseUrl",server.baseUrl()},{"model","synthetic-note-workflow"}};window->setProperty("aiSettings",settings);
+        QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
+        QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
+        const auto region=reader->aiRegion().value("history_id").toString();
+        QVERIFY(reader->saveAiRegionNote());QTRY_COMPARE(reader->pendingCommands(),0);
+        const QString original="Retain the original synthetic note.";
+        QVERIFY(reader->setRegionNoteDraft(region,original));QVERIFY(reader->saveRegionNoteDraft());QTRY_COMPARE(reader->pendingCommands(),0);
+        QVERIFY(QMetaObject::invokeMethod(window,"openRegionNotes"));auto *regionNotes=window->findChild<QObject *>("regionNotes");QVERIFY(regionNotes);
+        QVERIFY(QMetaObject::invokeMethod(regionNotes,"load",Q_ARG(QVariant,region)));auto *keep=regionNotes->findChild<QObject *>("keepRegionKnowledgeNote");QVERIFY(keep);
+        QTRY_VERIFY(keep->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(keep,"clicked"));
+        auto *notes=window->findChild<QObject *>("aiReadingNotes");QVERIFY(notes);
+        QTRY_COMPARE(notes->property("note").toMap().value("content").toString(),original);
+        const auto id=notes->property("note").toMap().value("id").toString();QVERIFY(QMetaObject::invokeMethod(notes,"close"));
+        QTRY_VERIFY(!notes->property("visible").toBool());QTRY_VERIFY(!notes->property("reader").value<QObject *>());
+        QTRY_VERIFY(!reader->pendingCommands() && !reader->regionPersistencePending());
+        reader->setAiRegionQuestion("Explain this synthetic region.");
+        QTRY_VERIFY(!reader->hasUnsavedReadingNotes() && !reader->pendingCommands() && !reader->regionPersistencePending());
+        reader->prepareAiRegion(settings);QTRY_COMPARE(reader->pendingCommands(),0);
+        QCOMPARE(reader->aiState().value("plan").toMap().value("action").toString(),QString("RegionQuestion"));
+        server.responses.append({{MockChatServer::delta({{"content","New completed discussion."}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QVERIFY(reader->startAi("local",reader->aiState().value("plan").toMap()));QTRY_VERIFY(!reader->aiState().value("running").toBool());
+        reader->flushAiRegionNote(false);QTRY_VERIFY(!reader->regionPersistencePending() && !reader->pendingCommands());QCOMPARE(server.requests.size(),1);
+        if(sidebar) {
+            QVERIFY(QMetaObject::invokeMethod(window,"openReadingNotes"));notes=window->findChild<QObject *>("readingNotesSidebar");QVERIFY(notes);
+            QTRY_VERIFY(notes->property("visible").toBool() && notes->property("width").toDouble()>200 && notes->property("reader").value<QObject *>()==reader);
+            const auto listed=[&]{for(const auto &entry:notes->property("entries").toList())if(entry.toMap().value("id").toString()==id)return true;return false;};
+            QTRY_VERIFY(listed());QTRY_VERIFY(!notes->property("command").toDouble() && !reader->pendingCommands());
+            QVERIFY(QMetaObject::invokeMethod(notes,"loadNote",Q_ARG(QVariant,id)));
+        } else QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));
+        auto *contents=sidebar ? notes : notes->findChild<QObject *>("aiReadingNotesContent");QVERIFY(contents);
+        QTRY_COMPARE(notes->property("note").toMap().value("id").toString(),id);
+        QTRY_VERIFY(contents->property("noteWriteReady").toBool() && contents->property("canUpdateDiscussion").toBool() && !contents->property("reviewing").toBool());
+        auto *update=notes->findChild<QObject *>("previewAiReadingNoteUpdate");QVERIFY(update);
+        QTRY_VERIFY(update->property("visible").toBool() && update->property("enabled").toBool());
+        QVERIFY2(window->property("aiOutputLanguageValid").toBool(),qPrintable(QString("global language=%1").arg(window->property("defaultAiOutputLanguage").toString())));
+        auto *accounts=view.workspace.chatGptAccounts();const auto connectionRevision=accounts->profileRevision();QVERIFY(accounts->refreshConnection());
+        QCOMPARE(accounts->profileRevision(),connectionRevision);
+        server.responses.append({{MockChatServer::delta({{"content","A new suggestion, still awaiting Apply."}}),QByteArray("data: [DONE]\n\n")},5,200});
+        QVERIFY(QMetaObject::invokeMethod(update,"clicked"));
+        QVERIFY2(reader->aiState().value("previewView").toString()=="note",qPrintable(QString("UI status=%1; AI status=%2; ready=%3; update=%4; review=%5; inputDraft=%6").arg(window->property("operationStatus").toString(),reader->aiState().value("status").toString()).arg(contents->property("noteWriteReady").toBool()).arg(contents->property("canUpdateDiscussion").toBool()).arg(contents->property("reviewing").toBool()).arg(reader->hasUnsavedReadingNotes())));
+        if(outcome=="close-preparing"){if(sidebar)QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,false)));else QVERIFY(QMetaObject::invokeMethod(notes,"close"));}
+        if(outcome=="replace-preparing") {
+            const auto replaced=reader->aiPreviewRevision();auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepareReadingNoteUpdate",Q_ARG(QVariant,id)));
+            QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(contents->property("updateIntent").isNull());QCOMPARE(server.requests.size(),1);
+            QCOMPARE(reader->aiState().value("plan").toMap().value("kind").toString(),QString("reading_note_suggestion"));QVERIFY(reader->aiPreviewRevision()!=replaced);return;
+        }
+        QTRY_COMPARE(reader->pendingCommands(),0);
+        auto *review=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(review);
+        if(outcome=="close-preparing") {
+            QTRY_VERIFY(!review->isVisible());QCOMPARE(server.requests.size(),1);QVERIFY(reader->aiState().value("plan").toMap().isEmpty());return;
+        }
+        QCOMPARE(reader->aiState().value("previewView").toString(),QString("note"));
+        const auto preparedRevision=reader->aiPreviewRevision();
+        const auto prepared=reader->aiState().value("plan").toMap();
+        QCOMPARE(prepared.value("kind").toString(),QString("reading_note_suggestion"));QCOMPARE(prepared.value("note_id").toString(),id);
+        const auto parts=prepared.value("parts").toList();QCOMPARE(parts.size(),1);const auto exact=parts.first().toMap().value("wire_body").toString();QVERIFY(!exact.isEmpty());QVERIFY(exact.contains(original));
+        const auto captureDirectory=qEnvironmentVariable("LYRA_READER_NOTE_REVIEW_EVIDENCE");
+        const auto capture=[&](QQuickWindow *surface,const QString &name) {
+            if(captureDirectory.isEmpty())return true;
+            QDir().mkpath(captureDirectory);surface->update();QTest::qWait(40);
+            return surface->grabWindow().save(captureDirectory+"/"+QString::fromLatin1(QTest::currentDataTag())+"-"+name+".png");
+        };
+        if(reviewEnabled) {
+            QTRY_VERIFY(review->isVisible());QCOMPARE(server.requests.size(),1);
+            QTRY_VERIFY(review->property("canSend").toBool());
+            if(outcome!="send") {
+                if(outcome=="cancel")QVERIFY(QMetaObject::invokeMethod(review,"cancel"));
+                else if(outcome=="window-close")QVERIFY(review->close());
+                else if(outcome=="notes-close")QVERIFY(QMetaObject::invokeMethod(notes,"close"));
+                else if(outcome=="tab")view.workspace.newTab();
+                else if(outcome=="draft")QVERIFY(reader->setReadingNoteDraft({{"id",id},{"expected_modified",notes->property("note").toMap().value("modified")},{"thoughts","Late thoughts must survive cancellation."}}));
+                else if(outcome=="policy"){QVERIFY(view.workspace.setAiReviewBeforeSending(false));QCOMPARE(window->property("requiresAiTaskReview").toBool(),false);}
+                else if(outcome=="language")QVERIFY(view.workspace.setAiOutputLanguage("German"));
+                else if(outcome=="late-credential") {
+                    // Model a delayed vault completion without accessing the real system vault.
+                    window->setProperty("credentialReadId",12345.);window->setProperty("pendingAiReader",QVariant::fromValue(reader));window->setProperty("pendingAiPlan",prepared);window->setProperty("pendingAiPurpose","note-update");window->setProperty("pendingAiToken",preparedRevision);
+                    QVERIFY(QMetaObject::invokeMethod(notes,"close"));QTRY_COMPARE(window->property("credentialReadId").toDouble(),-1.);QVERIFY(!window->property("pendingAiReader").value<QObject *>());
+                    auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepareReadingNoteUpdate",Q_ARG(QVariant,id)));QTRY_COMPARE(reader->pendingCommands(),0);
+                    emit view.workspace.credentials()->finished(12345,"read","synthetic-delayed-vault-reply",{});
+                }
+                else if(outcome=="replace"){auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepareReadingNoteUpdate",Q_ARG(QVariant,id)));}
+                QTRY_VERIFY(!review->isVisible());QTRY_COMPARE(reader->pendingCommands(),0);QTest::qWait(30);QCOMPARE(server.requests.size(),1);
+                if(outcome=="draft")QCOMPARE(reader->readingNoteDraft().value("thoughts").toString(),QString("Late thoughts must survive cancellation."));
+                if(outcome=="replace" || outcome=="late-credential"){QCOMPARE(reader->aiState().value("plan").toMap().value("kind").toString(),QString("reading_note_suggestion"));QVERIFY(reader->aiPreviewRevision()!=preparedRevision);QVERIFY(contents->property("updateIntent").isNull());}
+                else QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+                QSignalSpy queried(reader,&ReaderController::commandFinished);const auto request=reader->submit("ai_reading_note",{{"id",id}});
+                const auto fresh=[&]{for(const auto &row:queried)if(row[0].toULongLong()==request)return row[2].toMap();return QVariantMap{};};
+                QTRY_COMPARE(fresh().value("id").toString(),id);QCOMPARE(fresh().value("content").toString(),original);QVERIFY(fresh().value("suggestion").toMap().isEmpty());
+                return;
+            }
+            auto *detail=contents->findChild<QQuickItem *>("aiReadingNoteDetailScroll"),*legacyWire=contents->findChild<QQuickItem *>("aiReadingNoteWire");QVERIFY(detail && legacyWire);QVERIFY(detail->isVisible());QVERIFY(!legacyWire->isVisible());
+            QVERIFY(capture(window,"original-note"));review->setProperty("bodyExpanded",true);QVERIFY(capture(review,"review"));
+            QVERIFY(QMetaObject::invokeMethod(review,"send"));
+        }
+        QTRY_COMPARE(server.requests.size(),2);
+        const auto raw=server.requests.last();QCOMPARE(raw.mid(raw.indexOf("\r\n\r\n")+4),exact.toUtf8());
+        QTRY_COMPARE(notes->property("note").toMap().value("suggestion").toMap().value("content").toString(),QString("A new suggestion, still awaiting Apply."));
+        QCOMPARE(notes->property("note").toMap().value("content").toString(),original);QVERIFY(capture(window,"candidate"));
+    }
     void readingNoteSuggestionsRequireExactPreviewAndExplicitReview() {
         QTest::failOnWarning(QRegularExpression(QStringLiteral(".*(TypeError:|Binding loop|ReferenceError:).*")));
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;stored.setValue("reader/preferences/aiReviewBeforeSending",true);stored.setValue("chatGptPlan/connectionMode","apiKey");stored.remove("chatGptPlan/accounts");stored.sync();QVERIFY(ChatGptAccounts::instance()->refreshConnection());
         MockChatServer server;QVERIFY(server.listen());
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto path=scratch.filePath("synthetic-note-suggestion.pdf");
         QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
@@ -11869,14 +12009,14 @@ QtObject {
         const auto generate=[&](const QString &reply,int previousRequests) {
             QVERIFY(QMetaObject::invokeMethod(window,"openSavedReadingNote",Q_ARG(QVariant,id)));
             QTRY_COMPARE(note().value("id").toString(),id);QTRY_VERIFY(preview->property("visible").toBool() && preview->property("enabled").toBool());QVERIFY(QMetaObject::invokeMethod(preview,"clicked"));
-            QTRY_VERIFY(send->property("visible").toBool() && send->property("enabled").toBool());
+            auto *review=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(review);QTRY_VERIFY(review->isVisible() && review->property("canSend").toBool());QVERIFY(!send->property("visible").toBool());
             const auto reviewed=plan();QCOMPARE(reviewed.value("kind").toString(),QString("reading_note_suggestion"));
             const auto parts=reviewed.value("parts").toList();QCOMPARE(parts.size(),1);
             const auto exact=parts.first().toMap().value("wire_body").toString();
             QCOMPARE(wire->property("text").toString(),exact);
             QVERIFY(exact.contains(original));QVERIFY(exact.contains("Completed evidence"));QVERIFY(!exact.contains("data:image"));
             QCOMPARE(server.requests.size(),previousRequests);
-            respond(reply);QVERIFY(QMetaObject::invokeMethod(send,"clicked"));
+            respond(reply);QVERIFY(QMetaObject::invokeMethod(review,"send"));
             QTRY_COMPARE(server.requests.size(),previousRequests+1);const auto raw=server.requests.last();
             QCOMPARE(raw.mid(raw.indexOf("\r\n\r\n")+4),exact.toUtf8());
             QTRY_VERIFY(!reader->aiState().value("running").toBool());

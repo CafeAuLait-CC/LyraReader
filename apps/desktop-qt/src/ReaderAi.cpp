@@ -119,7 +119,7 @@ void ReaderController::resetAi(bool preserveTranslationViews) {
     m_aiRegionImage=QUrl{};emit aiRegionImageChanged();
     m_regionHistory.clear();m_aiRegionSaveId=0;m_generatedRegionNoteSaveId=0;emit regionHistoryChanged();
     m_chatDraftTimer.stop();m_chatDraftSaveId=0;m_savedChatDraft.clear();m_chatDraftSnapshot.clear();m_afterChatDraft.reset();
-    m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiState.clear();
+    m_aiTimer.stop();m_aiPreviewId=0;m_aiStartId=0;m_aiPollId=0;m_aiChatLoadId=0;m_aiPreviewNoteId.clear();m_aiState.clear();
     const auto input=initialAiLanguageInput();
     m_aiDefaultInput=input;
     if(!input.isEmpty())m_aiState.insert(QStringLiteral("input"),input);
@@ -649,6 +649,7 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     m_aiState.insert(QStringLiteral("previewSelection"),reading.isEmpty()?QVariant{}:input.value(QStringLiteral("selection")));
     m_aiState.insert(QStringLiteral("planSent"),false);
     m_aiState.insert(QStringLiteral("previewView"),previewView);
+    m_aiPreviewNoteId=readingKind==QStringLiteral("note")?reading.value(QStringLiteral("id")).toString():QString{};
     m_aiState.insert(QStringLiteral("previewChatGptAccount"),input.value(QStringLiteral("chatgpt_account")));
     m_aiState.insert(QStringLiteral("previewLayeredSummary"),!unit.isEmpty());
     m_aiState.insert(QStringLiteral("previewWholeDocument"),input.value(QStringLiteral("action"))==QStringLiteral("SummarizeDocument")

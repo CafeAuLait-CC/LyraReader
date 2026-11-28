@@ -20,6 +20,10 @@ Pane {
     property bool seeding: false
     property var editBaseline: ({})
     property string reviewId: ""
+    property var updateIntent: null
+    onNoteChanged: if (updateIntent) Qt.callLater(finishUiUpdate)
+    onReviewPlanChanged: if (updateIntent) Qt.callLater(finishUiUpdate)
+    onVisibleChanged: if (!visible && updateIntent) endPreview()
     property bool suggestionExpanded: false
     property var regionContext: ({})
     property double regionContextCommand: 0
@@ -266,7 +270,7 @@ Pane {
         refresh();
     }
     function beginEditing() {
-        if (!current() || !note || command || reader.documentRevisionPending || reader.readingNoteSaving
+        if (!current() || !note || command || reviewing || reader.documentRevisionPending || reader.readingNoteSaving
                 || (reader.readingNoteDraft.id && reader.readingNoteDraft.id !== note.id)) return;
         finishInput();
         reader.pauseReadingNoteAutosave();
@@ -313,15 +317,61 @@ Pane {
         command = reader.saveReadingNoteDraft();
     }
     function beginUpdate() {
-        if (!noteWriteReady || !note || !canUpdateDiscussion || note.suggestion || editing || reviewState.running) return;
+        finishInput();
+        if (!noteWriteReady || !note || !canUpdateDiscussion || note.suggestion || editing || reviewing || reviewState.running) return;
         debounce.stop();
         failure = "";
         reviewId = note.id;
+        const previous = reader.aiPreviewRevision;
+        updateIntent = {reader:reader,generation:generation,id:note.id,modified:note.modified,
+            source:JSON.stringify(note.source || {}),turns:regionEntry.completed_turn_count,
+            workflow:app.aiReviewRevision,language:app.defaultAiOutputLanguage,revision:"",dispatched:false};
         requestUpdate(reviewId);
+        if (reviewState.previewView !== "note" || reader.aiPreviewNoteId !== reviewId
+                || !reader.aiPreviewRevision || reader.aiPreviewRevision === previous) {
+            updateIntent = null; reviewId = "";
+            return;
+        }
+        updateIntent.revision = reader.aiPreviewRevision;
+        Qt.callLater(finishUiUpdate);
+    }
+    function updateIsCurrent(intent) {
+        return !!intent && current() && intent.reader === reader && intent.generation === generation
+            && !!note && note.id === intent.id && note.modified === intent.modified && !note.suggestion
+            && JSON.stringify(note.source || {}) === intent.source && !!regionEntry
+            && regionEntry.completed_turn_count === intent.turns && !editing && !dirty
+            && !reader.hasUnsavedReadingNotes && !reader.readingNoteSaving
+            && intent.workflow === app.aiReviewRevision && intent.language === app.defaultAiOutputLanguage
+            && reviewState.previewView === "note" && reader.aiPreviewNoteId === intent.id
+            && reader.aiPreviewRevision === intent.revision;
+    }
+    function finishUiUpdate() {
+        const intent = updateIntent;
+        if (!intent || !intent.revision) return;
+        if (!updateIsCurrent(intent)) { endPreview(); return; }
+        if (intent.dispatched || reader.pendingCommands || !reviewPlan) return;
+        intent.dispatched = true;
+        if (!app.dispatchAiTaskFromUi(reader,reviewPlan,"note-update",intent.revision)) endPreview();
+    }
+    function checkUiUpdate() {
+        if (updateIntent && updateIntent.revision && !updateIsCurrent(updateIntent)) endPreview();
     }
     function endPreview() {
-        if (reader && reviewing && !reviewRunning && reviewState.previewView === "note" && !reviewState.planSent)
-            reader.invalidateAiPlan();
+        const intent = updateIntent;
+        // Clear ownership before closing the review window: its cancellation signal is synchronous.
+        updateIntent = null;
+        if (intent) {
+            app.abandonNoteUpdateCredential(intent.reader,intent.revision);
+            const ticket = app.aiTaskReviewTicket;
+            if (ticket && ticket.reader === intent.reader && ticket.purpose === "note-update" && ticket.token === intent.revision)
+                app.cancelAiTaskReview(intent.reader,"note-update");
+        }
+        const owner = intent ? intent.reader : reader;
+        const state = owner ? owner.aiState : ({});
+        if (owner && reviewing && !(state.responseView === "note" && state.running)
+                && state.previewView === "note" && !state.planSent
+                && (intent ? owner.documentGeneration === intent.generation && owner.aiPreviewNoteId === intent.id
+                    && owner.aiPreviewRevision === intent.revision : !!reviewPlan)) owner.invalidateAiPlan();
         reviewId = "";
     }
     function resolveSuggestion(apply) {
@@ -333,12 +383,14 @@ Pane {
         if (!current() || !reviewing || reviewRunning) return;
         const result = reviewState.noteSuggestion;
         if (result && result.available && result.id === reviewId && !command) {
+            updateIntent = null;
             reviewId = "";
             command = reader.submit("ai_reading_note", {id: result.id});
         }
     }
     function reset() {
         finishInput();
+        endPreview();
         thoughtsFailureTicket = null;
         sourceFocusTicket = null;
         regionContext = ({}); regionContextCommand = 0;
@@ -352,6 +404,16 @@ Pane {
         search.text = "";
     }
     Connections {
+        target: notes.app
+        function onAiTaskReviewCancelled(ticket) {
+            const intent = notes.updateIntent;
+            if (intent && ticket.reader === intent.reader && ticket.purpose === "note-update" && ticket.token === intent.revision)
+                notes.endPreview();
+        }
+        function onAiReviewRevisionChanged() { notes.checkUiUpdate(); }
+        function onDefaultAiOutputLanguageChanged() { notes.checkUiUpdate(); }
+    }
+    Connections {
         target: notes.reader
         function onReadingNotesSynced(result, error) {
             if (!notes.current()) return;
@@ -361,12 +423,13 @@ Pane {
                 Qt.callLater(notes.refreshImportedNotes);
             }
         }
-        function onCommandsChanged() { if (notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes); }
-        function onRegionNoteDraftChanged() { if (notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes); }
+        function onCommandsChanged() { if (notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes); if(notes.updateIntent)Qt.callLater(notes.finishUiUpdate); }
+        function onRegionNoteDraftChanged() { notes.checkUiUpdate(); if (notes.importedRefreshWanted) Qt.callLater(notes.refreshImportedNotes); if(notes.updateIntent)Qt.callLater(notes.finishUiUpdate); }
         function onRegionHistoryChanged() {
             if (notes.current() && notes.sourceContext.region_id) notes.regionContext = notes.reader.regionHistory;
+            if(notes.updateIntent)Qt.callLater(notes.finishUiUpdate);
         }
-        function onAiStateChanged() { if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
+        function onAiStateChanged() { if(notes.updateIntent)Qt.callLater(notes.finishUiUpdate); if (notes.reviewing) Qt.callLater(notes.finishUpdate); }
         function onReadingNoteAutosaveFinished(noteId, result, error) {
             if (!notes.current() || error) return;
             notes.mergeNoteMetadata(result);
@@ -620,7 +683,7 @@ Pane {
             memoryKey: notes.note ? "note-" + notes.note.id : ""
             memoryReady: notes.current() && !notes.command
             Layout.fillWidth: true; Layout.fillHeight: true
-            visible: !notes.editing && !notes.reviewing && !!notes.note
+            visible: !notes.editing && (!notes.reviewing || !!notes.updateIntent) && !!notes.note
             objectName: "aiReadingNoteDetailScroll"
             ColumnLayout {
                 id: noteFlow
@@ -660,7 +723,7 @@ Pane {
                 NoteAction {
                     objectName: "editAiReadingNote"
                     text: qsTr("Edit note")
-                    enabled: notes.current() && !notes.command && !notes.reader.documentRevisionPending && !notes.reader.readingNoteSaving
+                    enabled: notes.current() && !notes.command && !notes.reviewing && !notes.reader.documentRevisionPending && !notes.reader.readingNoteSaving
                         && (!notes.reader.readingNoteDraft.id || notes.reader.readingNoteDraft.id === notes.selectedNoteId)
                     onClicked: notes.beginEditing()
                 }
@@ -669,7 +732,7 @@ Pane {
                     visible: !!(notes.note && notes.canUpdateDiscussion && !notes.note.suggestion)
                     text: qsTr("Update from conversation")
                     Accessible.description: qsTr("Review the exact request before sending.")
-                    enabled: notes.noteWriteReady && !notes.reviewState.running
+                    enabled: notes.noteWriteReady && !notes.reviewing && !notes.reviewState.running
                     onClicked: notes.beginUpdate()
                 }
                 ColumnLayout {
@@ -916,7 +979,7 @@ Pane {
             }
         }
         Label {
-            visible: notes.reviewing && !!notes.reviewPlan
+            visible: notes.reviewing && !notes.updateIntent && !!notes.reviewPlan
             Layout.fillWidth: true
             text: notes.reviewPlan ? qsTr("Endpoint: %1 · %2 request(s)").arg(notes.reviewPlan.host).arg(notes.reviewPlan.parts.length) : ""
             wrapMode: Text.Wrap; textFormat: Text.PlainText
@@ -924,7 +987,7 @@ Pane {
         }
         AiReadingScrollView {
             id: reviewedRequest
-            visible: notes.reviewing && !!notes.reviewPlan
+            visible: notes.reviewing && !notes.updateIntent && !!notes.reviewPlan
             Layout.fillWidth: true; Layout.fillHeight: true
             TextArea {
                 objectName:"aiReadingNoteWire"
@@ -1025,7 +1088,7 @@ Pane {
             Button {
                 objectName: "sendAiReadingNoteUpdate"
                 text: notes.reviewPlan && notes.reviewPlan.consolidation ? qsTr("Send note synthesis") : qsTr("Send")
-                visible: !!notes.reviewPlan && !notes.reviewState.planSent
+                visible: !notes.updateIntent && !!notes.reviewPlan && !notes.reviewState.planSent
                 enabled: notes.current() && !notes.reader.pendingCommands && !notes.reviewState.running
                 onClicked: app.sendAi(notes.reader, notes.reviewPlan)
             }

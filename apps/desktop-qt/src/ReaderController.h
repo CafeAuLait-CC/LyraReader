@@ -36,6 +36,8 @@ class ReaderController : public QObject {
     Q_PROPERTY(double documentHeight READ documentHeight NOTIFY documentChanged)
     Q_PROPERTY(QUrl fileUrl READ fileUrl NOTIFY documentChanged)
     Q_PROPERTY(QVariantMap aiState READ aiState NOTIFY aiStateChanged)
+    Q_PROPERTY(QString aiPreviewRevision READ aiPreviewRevision NOTIFY aiStateChanged)
+    Q_PROPERTY(QString aiPreviewNoteId READ aiPreviewNoteId NOTIFY aiStateChanged)
     Q_PROPERTY(QObject *readingTerm READ readingTerm CONSTANT)
     Q_PROPERTY(bool chatDraftPending READ chatDraftPending NOTIFY aiStateChanged)
     Q_PROPERTY(bool chatDraftSaving READ chatDraftSaving NOTIFY aiStateChanged)
@@ -106,6 +108,9 @@ public:
     Q_INVOKABLE bool cancelTranslation(const QString &id);
     QStringList translationCancellingRows()const{return m_translationRowsCancelling.values();}
     QVariantMap aiState()const{return m_aiState;}
+    // Transient UI ownership is separate from user-authored AI state and tab-transfer drafts.
+    QString aiPreviewRevision()const{return QString::number(m_aiPreviewEpoch);}
+    QString aiPreviewNoteId()const{return m_aiPreviewNoteId;}
     bool hasAiUserState() const;
     QObject *readingTerm()const;
     Q_INVOKABLE bool startAiTerm(const QString &key,const QVariantMap &expectedPlan);
@@ -426,6 +431,7 @@ private:
     bool startAiWithCredential(const QString &key,const QVariantMap &expectedPlan);
     bool startDocumentReadingWithCredential(const QString &key,const QVariantMap &plan,const QString &token);
     quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
+    QString m_aiPreviewNoteId;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
     quint64 m_aiChatLoadId=0,m_aiChatLoadEpoch=0;
     quint64 m_chatDraftSaveId=0;
