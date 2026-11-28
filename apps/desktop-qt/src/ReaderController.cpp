@@ -529,7 +529,7 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
         return result;
     };
     const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list") && operation!=QStringLiteral("region_thumbnail") && operation!=QStringLiteral("region_reopen");
-    if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel")){
+    if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel") || operation==QStringLiteral("knowledge_skip")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});
     }else watcher->setFuture(QtConcurrent::run(std::move(task)));

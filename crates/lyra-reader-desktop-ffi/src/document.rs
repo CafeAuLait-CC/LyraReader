@@ -26,7 +26,7 @@ pub struct DesktopDocument {
     pub(super) translation_scope: Arc<crate::summary_batch::Scope>,
     pub(super) translations: Mutex<crate::translation::Translations>,
     pub(super) summaries: Mutex<crate::summary_store::Store>,
-    pub(super) knowledge: Mutex<crate::knowledge::Knowledge>,
+    pub(super) knowledge: Arc<Mutex<crate::knowledge::Knowledge>>,
     pub(super) pending_summary: Mutex<Option<PendingSummary>>,
     pub(super) pending_note: Mutex<Option<PendingNote>>,
     pub(super) regions: Mutex<crate::region_store::RegionStore>,
@@ -556,7 +556,7 @@ impl DesktopDocument {
             ))),
             translation_scope,
             summaries: Mutex::new(crate::summary_store::Store::default()),
-            knowledge: Mutex::new(crate::knowledge::Knowledge::default()),
+            knowledge: Arc::new(Mutex::new(crate::knowledge::Knowledge::default())),
             pending_summary: Mutex::new(None),
             pending_note: Mutex::new(None),
             regions: Mutex::new(crate::region_store::RegionStore::default()),
@@ -678,6 +678,18 @@ impl DesktopDocument {
             .get("op")
             .and_then(Value::as_str)
             .ok_or("Missing operation")?;
+        if matches!(
+            op,
+            "ai_preview"
+                | "ai_start"
+                | "ai_summary_prepare"
+                | "ai_summary_batch_prepare"
+                | "ai_summary_batch_start"
+                | "translation_prepare"
+                | "translation_start"
+        ) {
+            self.ensure_reading_idle()?;
+        }
         if op.starts_with("translation_") {
             return self.translation_command(op, &r);
         }

@@ -27,6 +27,13 @@ ApplicationWindow {
     property string outputLanguageSaveError:""
     property var initialReviewBeforeSending:true
     property bool reviewBeforeSendingEdited:false
+    property var initialPrereadingPolicy:"ask"
+    property bool prereadingPolicyEdited:false
+    readonly property var prereadingPolicies:["ask","always","never"]
+    function loadPrereadingDraft() {
+        initialPrereadingPolicy=app.session ? app.session.aiPrereadingPolicy : "ask";
+        prereadingPolicy.currentIndex=prereadingPolicies.indexOf(initialPrereadingPolicy);
+    }
     readonly property bool unknownReviewBeforeSending:typeof initialReviewBeforeSending!=="boolean" && !reviewBeforeSendingEdited
     readonly property bool unknownOutputLanguage:typeof initialOutputLanguage!=="string" && !outputLanguageEdited
     readonly property var generationSeeds:app.session ? app.session.generationDefaults() : ({valid:false})
@@ -101,6 +108,7 @@ ApplicationWindow {
         reviewBeforeSending.checkState=typeof initialReviewBeforeSending==="boolean"
             ? (initialReviewBeforeSending ? Qt.Checked : Qt.Unchecked) : Qt.PartiallyChecked;
         reviewBeforeSendingEdited=false;
+        loadPrereadingDraft();prereadingPolicyEdited=false;
         apiKey.clear();
         const saved=app.session ? app.session.preference("auxiliarySettingsGeometry",{}) : ({});
         if(!policy.prepare(settings,app,saved,560,650)){auditOnOpen=false;app.operationStatus=qsTr("The Settings window could not find an available display.");return;}
@@ -172,6 +180,9 @@ ApplicationWindow {
         const workflow={};
         if(languageChanged)workflow.outputLanguage=outputLanguage.text;
         if(reviewChanged)workflow.reviewBeforeSending=reviewBeforeSending.checked;
+        if(prereadingPolicyEdited && prereadingPolicy.currentIndex>=0
+                && prereadingPolicies[prereadingPolicy.currentIndex]!==initialPrereadingPolicy)
+            workflow.prereadingPolicy=prereadingPolicies[prereadingPolicy.currentIndex];
         if(Object.keys(workflow).length && (!app.session || !app.session.setAiReadingWorkflow(workflow))) {
             outputLanguageSaveError=languageChanged && (initialOutputLanguage===undefined || initialOutputLanguage===null)
                 ? qsTr("The saved output language could not be read and was kept. Recover the saved preference before replacing it.")
@@ -225,6 +236,9 @@ ApplicationWindow {
             settings.initialReviewBeforeSending=settings.app.session.aiReviewBeforeSending;
             reviewBeforeSending.checkState=typeof settings.initialReviewBeforeSending==="boolean"
                 ? (settings.initialReviewBeforeSending ? Qt.Checked : Qt.Unchecked) : Qt.PartiallyChecked;
+        }
+        function onAiPrereadingPolicyChanged() {
+            if(!settings.prereadingPolicyEdited)settings.loadPrereadingDraft();
         }
         function onAiOutputLanguageChanged() {
             // A Wayland open intent can still be waiting for its parent's first frame.
@@ -358,6 +372,23 @@ ApplicationWindow {
                 }
                 Button {objectName:"openAuditTrail";text:qsTr("Local audit trail…");onClicked:auditDialog.open()}
                 Label {text:qsTr("Reading workflow");font.weight:Font.DemiBold;textFormat:Text.PlainText;Layout.topMargin:8}
+                Label {text:qsTr("Document prereading");textFormat:Text.PlainText}
+                ComboBox {
+                    id:prereadingPolicy;objectName:"settingsAiPrereadingPolicy"
+                    Layout.fillWidth:true
+                    model:[qsTr("Ask before reading"),qsTr("Always read first"),qsTr("Never read first")]
+                    displayText:currentIndex>=0 ? currentText : qsTr("Unrecognized saved preference")
+                    Accessible.name:qsTr("Document prereading")
+                    Accessible.description:displayText+". "+qsTr("During prereading, other AI requests wait. Ordinary PDF reading remains available.")
+                    onActivated:{settings.prereadingPolicyEdited=true;settings.outputLanguageSaveError="";}
+                }
+                Label {
+                    Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;font.pixelSize:11
+                    color:prereadingPolicy.currentIndex<0 ? settings.colors.warningFg : settings.colors.textSecondary
+                    text:prereadingPolicy.currentIndex<0
+                        ? qsTr("The saved prereading preference is unrecognized and is kept until you choose a value.")
+                        : qsTr("During prereading, other AI requests wait. Ordinary PDF reading remains available. Applies when you save.")
+                }
                 LyraCheckBox {
                     id:reviewBeforeSending
                     objectName:"settingsAiReviewBeforeSending"

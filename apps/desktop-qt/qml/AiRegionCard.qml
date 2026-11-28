@@ -268,6 +268,14 @@ Item {
     }
     function prepareFromUi(note) {
         if(!opened || closing || owner!==app.currentReader || !owner || owner.pendingCommands || running)return;
+        const reader=owner,generation=ownerGeneration,id=attachment.history_id,question=attachment.question || "";
+        app.requestAiTaskFromUi(reader,note ? "note" : "question",function(){
+            return opened && !closing && owner===reader && ownerGeneration===generation
+                && attachment.history_id===id && (attachment.question || "")===question;
+        },function(){card.prepareTaskFromUi(note);});
+    }
+    function prepareTaskFromUi(note) {
+        if(!opened || closing || owner!==app.currentReader || !owner || owner.pendingCommands || running)return;
         sendIntent={reader:owner,generation:ownerGeneration,id:attachment.history_id,
             question:attachment.question || "",note:!!note,workflowRevision:app.aiReviewRevision};
         if(!(note ? prepareKnowledge() : prepare())) {sendIntent=null;return;}

@@ -75,6 +75,14 @@ impl Default for Knowledge {
     }
 }
 impl Knowledge {
+    pub(super) fn ensure_foreground_ready(&self) -> Result<(), String> {
+        let gate = crate::prereading::inspect("never", self.phase, false, "note")?;
+        if gate.decision == "wait" {
+            Err(crate::prereading::BUSY.into())
+        } else {
+            Ok(())
+        }
+    }
     fn reviewed_plan(&self) -> Result<Value, String> {
         let mut plan = serde_json::to_value(&self.plan).map_err(|e| e.to_string())?;
         if let Some(account) = &self.account
@@ -134,6 +142,15 @@ fn current_hash(document: &LyraReaderDocument) -> Result<String, String> {
     Ok(current.sha256)
 }
 impl DesktopDocument {
+    pub(super) fn ensure_reading_idle(&self) -> Result<(), String> {
+        match self.knowledge.try_lock() {
+            Ok(state) => state.ensure_foreground_ready(),
+            Err(std::sync::TryLockError::WouldBlock) => Err(crate::prereading::BUSY.into()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                Err("Document reading state is unavailable".into())
+            }
+        }
+    }
     pub(super) fn invalidate_reading(&self) -> Result<(), String> {
         *self
             .pending_summary
@@ -149,19 +166,19 @@ impl DesktopDocument {
         request: &mut AiPlanRequestRecord,
         hash: &str,
     ) -> Result<(), String> {
-        if request.action == AiActionRecord::TranslateSelection {
-            return Ok(());
-        }
-        // Generated context is optional. In particular, final hash/cache I/O must not
-        // delay a foreground question. Busy state means this preview proceeds with its
-        // own sources; poisoned state remains an actual, diagnosable error.
+        // Never wait on cache I/O while holding up a foreground worker. A busy
+        // reading lane pauses admission instead of silently omitting its context.
         let state = match self.knowledge.try_lock() {
             Ok(state) => state,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(crate::prereading::BUSY.into()),
             Err(std::sync::TryLockError::Poisoned(_)) => {
                 return Err("Document reading state is unavailable".into());
             }
         };
+        state.ensure_foreground_ready()?;
+        if request.action == AiActionRecord::TranslateSelection {
+            return Ok(());
+        }
         if let Some(record) = state
             .understanding
             .as_ref()
@@ -220,8 +237,8 @@ impl DesktopDocument {
                 ..Knowledge::default()
             };
         }
-        // Hash/cache/text work is outside the state mutex. Foreground questions obtain an
-        // empty prior immediately while this optional plan is prepared, with no provider wait.
+        // Hash/cache/text work stays outside the state mutex. The published
+        // preparing phase pauses foreground AI without waiting for provider I/O.
         let prepared = (|| {
             let (active, cache) = self.reading_context()?;
             // Opening already computed this identity. A cache miss at open must not scan
@@ -612,12 +629,16 @@ impl DesktopDocument {
             }
             "knowledge_start" => self.start_reading(r),
             "knowledge_poll" => self.poll_reading(),
-            "knowledge_cancel" => {
+            "knowledge_cancel" | "knowledge_skip" => {
                 let mut s = self
                     .knowledge
                     .lock()
                     .map_err(|_| "Document reading state is unavailable")?;
                 s.cancel(false)?;
+                if op == "knowledge_skip" {
+                    s.phase = "skipped";
+                    s.message = Some("Continuing without document prereading.".into());
+                }
                 s.view()
             }
             _ => Err("Unknown document reading operation".into()),
@@ -714,6 +735,97 @@ mod tests {
     fn input() -> Value {
         json!({"action":"SummarizePage","document_knowledge":false,"current_page":0,"selection":null,"question":null,"language":null,"history":[],"region":null,"base_url":"http://127.0.0.1:1/v1","model":"mock","temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none","document_knowledge_text":null,"document_knowledge_pages":[]})
     }
+    #[test]
+    fn foreground_previews_wait_for_prereading_consent() {
+        let f = Fixture::new();
+        let consent = f.prepare();
+        assert_eq!(consent["phase"], "preview");
+        let foreground = f.doc.command(json!({"op":"ai_preview","request":input()}));
+        assert!(
+            foreground.is_err(),
+            "A second AI task prepared during prereading consent: {foreground:?}"
+        );
+        assert_eq!(
+            foreground.unwrap_err(),
+            "Document prereading is in progress. Continue when Lyra AI is ready."
+        );
+        assert_eq!(f.doc.knowledge.lock().unwrap().phase, "preview");
+    }
+
+    #[test]
+    fn preparing_consent_and_running_reading_guard_every_native_send_lane() {
+        let f = Fixture::new();
+        let term = crate::term::TermService::new(&f.doc).unwrap();
+        for phase in ["preparing", "preview", "starting", "reading", "stopping"] {
+            f.doc.knowledge.lock().unwrap().phase = phase;
+            for operation in [
+                "ai_preview",
+                "ai_start",
+                "ai_summary_prepare",
+                "ai_summary_batch_prepare",
+                "ai_summary_batch_start",
+                "translation_prepare",
+                "translation_start",
+            ] {
+                // Admission must fail before argument decoding, capture mutation or I/O.
+                assert_eq!(
+                    f.doc.command(json!({"op":operation})).unwrap_err(),
+                    crate::prereading::BUSY,
+                    "{phase}/{operation}"
+                );
+            }
+            for operation in ["prepare", "start"] {
+                assert_eq!(
+                    term.command(json!({"op":operation})).unwrap_err(),
+                    crate::prereading::BUSY,
+                    "{phase}/term/{operation}"
+                );
+            }
+        }
+        f.doc.knowledge.lock().unwrap().phase = "preview";
+        let skipped = f.doc.command(json!({"op":"knowledge_skip"})).unwrap();
+        assert_eq!(skipped["phase"], "skipped");
+        assert!(
+            f.doc
+                .command(json!({"op":"ai_preview","request":input()}))
+                .is_ok()
+        );
+        assert_eq!(f.doc.knowledge.lock().unwrap().phase, "skipped");
+        f.doc.invalidate_reading().unwrap();
+        assert_eq!(f.doc.knowledge.lock().unwrap().phase, "idle");
+    }
+
+    #[test]
+    fn a_frozen_term_does_not_extend_its_closed_owners_background_reading() {
+        let (term, cancel) = {
+            let f = Fixture::new();
+            f.prepare();
+            let term = crate::term::TermService::new(&f.doc).unwrap();
+            let cancel = CancellationToken::new();
+            let mut state = f.doc.knowledge.lock().unwrap();
+            state.job = Some(ReadingJob {
+                cancel: cancel.clone(),
+                _analysis: claim_test_analysis(&state),
+                progress: Arc::new(Mutex::new(Progress::default())),
+            });
+            state.phase = "reading";
+            drop(state);
+            assert!(cancel.check().is_ok());
+            assert_eq!(
+                term.command(json!({"op":"prepare"})).unwrap_err(),
+                crate::prereading::BUSY
+            );
+            (term, cancel)
+        };
+        assert!(cancel.check().is_err());
+        // The frozen term has its own PDF lease; closing its parent retires the
+        // parent's admission, rather than leaving an unreachable reading job.
+        assert_ne!(
+            term.command(json!({"op":"prepare"})).unwrap_err(),
+            crate::prereading::BUSY
+        );
+    }
+
     #[test]
     fn integer_zero_roundtrip_preserves_the_reviewed_plan_without_weakening_identity() {
         let f = Fixture::new();
@@ -980,8 +1092,11 @@ mod tests {
         let join = std::thread::spawn(move || {
             let mut request = crate::region::request(input()).unwrap();
             let result = worker.doc.enrich_reading(&mut request, &hash);
-            tx.send(result.is_ok() && request.document_knowledge_text.is_none())
-                .unwrap();
+            tx.send(
+                result == Err(crate::prereading::BUSY.into())
+                    && request.document_knowledge_text.is_none(),
+            )
+            .unwrap();
         });
         let response = rx.recv_timeout(Duration::from_secs(1));
         drop(guard);
@@ -1009,11 +1124,15 @@ mod tests {
         }
         let request =
             json!({"op":"ai_summary_prepare","unit":{"layer":"Page","index":0},"request":settings});
+        assert_eq!(
+            f.doc.command(request.clone()).unwrap_err(),
+            crate::prereading::BUSY
+        );
+        f.doc.invalidate_reading().unwrap();
         let local = f.doc.command(request.clone()).unwrap();
         let body = local["plan"]["parts"][0]["wire_body"].as_str().unwrap();
         assert!(!body.contains("UNVERIFIED_UNIT_CONTEXT"));
         assert!(!body.contains("UNFINISHED_UNIT_READING"));
-        f.doc.invalidate_reading().unwrap();
         let bytes = f.record().encode(1).unwrap();
         fs::write(f.file(), &bytes).unwrap();
         f.doc.command(json!({"op":"knowledge_load"})).unwrap();

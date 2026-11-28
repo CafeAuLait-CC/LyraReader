@@ -7,6 +7,10 @@ Popup {
     objectName:"documentReadingPopup"
     required property var app
     property var owner:null
+    property bool gateMode:false
+    property bool automatic:false
+    property bool preparePending:false
+    property bool autoDispatched:false
     readonly property var state:owner ? owner.documentReading : ({})
     readonly property var plan:state.plan || null
     readonly property bool busy:["preparing","starting","reading","stopping"].indexOf(state.phase)>=0
@@ -16,18 +20,52 @@ Popup {
     padding:14;modal:false;focus:true;closePolicy:Popup.CloseOnEscape
     background:Rectangle {color:reading.app.colors.panelBg;border.color:reading.app.colors.separator;radius:8}
     onAboutToShow:{owner=app.currentReader;owner.dismissDocumentReadingChoice();}
-    onAboutToHide:app.cancelAiTaskReview(owner,"document-reading")
-    onClosed:{payload.close();if(owner===app.currentReader)app.focusReadingView();}
+    onAboutToHide:{app.cancelAiTaskReview(owner,"document-reading");if(gateMode)app.cancelPrereadingIntent();}
+    onClosed:{payload.close();if(!visible){gateMode=false;automatic=false;preparePending=false;}if(owner===app.currentReader)app.focusReadingView();}
+    onOpened:Qt.callLater(continueGate)
     Connections {target:reading.app;function onCurrentReaderChanged(){if(reading.visible)reading.close();}}
     readonly property var accounts: app.session ? app.session.chatGptAccounts : null
     readonly property bool chatGptAvailable: !!accounts && accounts.connected && !!accounts.model
-    function prepare() { prepareForConnection(!!accounts && accounts.connectionMode==="chatGPT"); }
+    function openForGate(reader,readAutomatically) {
+        owner=reader;gateMode=true;automatic=readAutomatically;autoDispatched=false;
+        preparePending=!state.ready && state.phase!=="failed";
+        open();Qt.callLater(continueGate);
+    }
+    function continueGate() {
+        if(!visible || !opened || !gateMode || !owner || owner!==app.currentReader)return;
+        if(preparePending && !busy && !owner.pendingCommands) {preparePending=false;prepare();}
+        if(automatic && !autoDispatched && state.phase==="preview" && !owner.pendingCommands) {
+            autoDispatched=true;startReading();
+        }
+    }
+    function startReading() {
+        if(gateMode && !app.prereadingMayStart(owner)){app.cancelPrereadingIntent();return;}
+        app.dispatchAiTaskFromUi(owner,plan,"document-reading",state.token);
+    }
+    function continueWithout() {
+        if(gateMode && app.skipPrereadingIntent(owner))return;
+        if(owner)owner.skipDocumentReading();close();
+    }
+    Connections {
+        target:reading.owner
+        function onCommandsChanged(){Qt.callLater(reading.continueGate);}
+        function onDocumentReadingChanged(){Qt.callLater(reading.continueGate);}
+    }
+    function prepare() { prepareForConnection(!!accounts && (accounts.connectionMode==="chatGPT"
+        || (gateMode && accounts.connectionMode==="legacy" && accounts.useForWholeDocument))); }
     function prepareForConnection(useChatGpt) {
         if(!app.beginAiPreparation())return;
         if(accounts && (accounts.connectionMode==="apiKey" && useChatGpt
                 || accounts.connectionMode==="chatGPT" && !useChatGpt))return;
         if(useChatGpt && !chatGptAvailable) {app.operationStatus=qsTr("Sign in and choose a ChatGPT model in Settings.");return;}
         if(useChatGpt && accounts.busy) {app.operationStatus=qsTr("Wait for the ChatGPT connection operation to finish.");return;}
+        if(gateMode && state.phase==="failed") {
+            // Retry is a new explicit action. Reuse the portable idle-policy
+            // decision rather than silently retrying when a failure arrives.
+            const retry=app.session.prereadingGate(app.prereadingPolicyValue,"idle",false,"question");
+            if(!retry.valid){app.operationStatus=retry.message;return;}
+            automatic=retry.decision==="read";
+        }
         const settings=app.aiSettings;
         const request={action:"SummarizeDocument",document_knowledge:true,document_knowledge_text:null,document_knowledge_pages:[],
             current_page:0,selection:null,question:null,language:app.defaultAiOutputLanguage || null,history:[],region:null,
@@ -41,7 +79,10 @@ Popup {
             request.temperature=null;request.max_tokens=null;
             request.reasoning_mode="default";request.reasoning_encoding="none";
         }
+        autoDispatched=false;
+        const revision=owner.documentReadingRevision;
         owner.prepareDocumentReading(request);
+        if(gateMode && owner && owner.documentReadingRevision!==revision)app.adoptPrereadingPreview(owner);
     }
     contentItem:ColumnLayout {
         spacing:10
@@ -55,7 +96,7 @@ Popup {
                 width:parent.width;spacing:10
                 Label {
                     Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText
-                    text:qsTr("Lyra can read the document once and save its understanding locally. This is optional. You can ask questions immediately while reading runs in the background.")
+                    text:qsTr("Lyra can read the document once and save its understanding locally. You can keep reading the PDF while it works. Other AI requests wait until prereading finishes, or you can continue without it.")
                 }
                 Label {
                     Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;color:reading.app.colors.textSecondary
@@ -67,7 +108,7 @@ Popup {
                 }
                 Label {
                     visible:!!reading.plan;Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;color:reading.app.colors.infoFg
-                    text:reading.plan ? qsTr("All extracted document text is sent in %1 request(s). For multiple parts, one additional request combines the answers automatically. The PDF file is not uploaded. Nothing is sent before Read in Background.").arg(reading.plan.parts.length) : ""
+                    text:reading.plan ? qsTr("All extracted document text is sent in %1 request(s). For multiple parts, one additional request combines the answers automatically. The PDF file is not uploaded. Review before sending follows your reading workflow settings.").arg(reading.plan.parts.length) : ""
                 }
                 ProgressBar {visible:reading.state.phase==="reading";Layout.fillWidth:true;from:0;to:Math.max(1,reading.state.total || 1);value:reading.state.completed || 0}
                 Label {
@@ -79,7 +120,7 @@ Popup {
                 Label {visible:!!reading.state.cache_warning;Layout.fillWidth:true;wrapMode:Text.Wrap;textFormat:Text.PlainText;color:reading.app.colors.warningFg;text:reading.state.cache_warning || ""}
             }
         }
-        Button {objectName:"previewDocumentReading";text:reading.state.phase==="failed" ? qsTr("Retry: Preview Reading") : qsTr("Preview Document Reading");Layout.fillWidth:true;visible:!reading.state.ready;enabled:reading.app.aiConnectionReady && !!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading && !reading.busy && reading.owner.pendingCommands===0;onClicked:reading.prepare()}
+        Button {objectName:"previewDocumentReading";text:reading.state.phase==="failed" ? (reading.gateMode ? qsTr("Retry prereading") : qsTr("Retry: Preview Reading")) : qsTr("Preview Document Reading");Layout.fillWidth:true;visible:!reading.state.ready;enabled:reading.app.aiConnectionReady && !!reading.owner && reading.owner.pageCount>0 && !reading.owner.loading && !reading.busy && reading.owner.pendingCommands===0;onClicked:reading.prepare()}
         Button {
             objectName:"previewChatGptDocumentReading"
             text:qsTr("Preview Reading with ChatGPT plan")
@@ -90,8 +131,8 @@ Popup {
             onClicked:reading.prepareForConnection(true)
         }
         Button {objectName:"inspectDocumentReading";text:qsTr("Inspect Payload");Layout.fillWidth:true;visible:!!reading.plan;onClicked:payload.open()}
-        Button {objectName:"startDocumentReading";text:qsTr("Read in Background");Layout.fillWidth:true;visible:reading.state.phase==="preview";enabled:!!reading.owner && !reading.owner.pendingCommands;onClicked:reading.app.dispatchAiTaskFromUi(reading.owner,reading.plan,"document-reading",reading.state.token)}
-        Button {objectName:"skipDocumentReading";text:qsTr("Continue Without Reading");Layout.fillWidth:true;visible:!reading.state.ready && reading.state.phase!=="reading" && reading.state.phase!=="starting";onClicked:{if(reading.owner)reading.owner.stopDocumentReading();reading.close();}}
+        Button {objectName:"startDocumentReading";text:qsTr("Read in Background");Layout.fillWidth:true;visible:reading.state.phase==="preview";enabled:!!reading.owner && !reading.owner.pendingCommands;onClicked:reading.startReading()}
+        Button {objectName:"skipDocumentReading";text:qsTr("Continue Without Reading");Layout.fillWidth:true;visible:!reading.state.ready && reading.state.phase!=="reading" && reading.state.phase!=="starting";onClicked:reading.continueWithout()}
         Button {objectName:"stopDocumentReading";text:qsTr("Stop Reading");Layout.fillWidth:true;visible:reading.busy;enabled:reading.state.phase!=="stopping";onClicked:reading.owner.stopDocumentReading()}
     }
     Dialog {

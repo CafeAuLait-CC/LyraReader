@@ -30,6 +30,14 @@ Popup {
     enter: Transition {NumberAnimation {property: "opacity"; from: 0; to: 1; duration: app.reduceMotion ? 0 : 100}}
     exit: Transition {NumberAnimation {property: "opacity"; from: 1; to: 0; duration: app.reduceMotion ? 0 : 80}}
     function openFor(owner, generation, request, anchor, sourceRow) {
+        const record=sourceRow ? sourceRow.recordId : "",snapshot=JSON.stringify(request);
+        return app.requestAiTaskFromUi(owner,"term",function(){
+            return !!owner && owner===app.currentReader && owner.documentGeneration===generation
+                && (!anchor || anchor.visible) && (!sourceRow || sourceRow.recordId===record)
+                && JSON.stringify(request)===snapshot;
+        },function(){return popup.openPrepared(owner,generation,request,anchor,sourceRow);});
+    }
+    function openPrepared(owner, generation, request, anchor, sourceRow) {
         if (!owner || owner !== app.currentReader || owner.documentGeneration !== generation || !parent) return false;
         app.cancelAiTaskReview(reader,"term");
         if (ownsWorker) controller.dismiss();

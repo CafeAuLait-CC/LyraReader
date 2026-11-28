@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 pub struct TermService {
@@ -17,6 +17,8 @@ pub struct TermService {
     state: Mutex<State>,
     source: RenderSource,
     audit_root: PathBuf,
+    // Observe admission without keeping the owner's background job alive.
+    knowledge: Weak<Mutex<crate::knowledge::Knowledge>>,
 }
 
 #[derive(Default)]
@@ -52,10 +54,24 @@ impl TermService {
             source,
             audit_root,
             state: Mutex::new(State::default()),
+            knowledge: Arc::downgrade(&document.knowledge),
         })
     }
 
     pub fn command(&self, request: Value) -> Result<Value, String> {
+        if matches!(request["op"].as_str(), Some("prepare" | "start"))
+            && let Some(knowledge) = self.knowledge.upgrade()
+        {
+            match knowledge.try_lock() {
+                Ok(state) => state.ensure_foreground_ready()?,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(crate::prereading::BUSY.into());
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err("Document reading state is unavailable".into());
+                }
+            }
+        }
         let mut state = self
             .state
             .lock()

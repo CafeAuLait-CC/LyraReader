@@ -105,6 +105,14 @@ Pane {
         return reader.prepareInplaceTranslationRetry(request,ids);
     }
     function prepareFromUi() {
+        if(running){owner.cancelAi();return;}
+        const reader=owner,generation=ownerGeneration,view=workspace,snapshot=JSON.stringify(input);
+        const kind=view==="summary" ? "summary" : view==="translation" ? "translation" : "question";
+        app.requestAiTaskFromUi(reader,kind,function(){
+            return owner===reader && ownerGeneration===generation && workspace===view && JSON.stringify(input)===snapshot;
+        },function(){aiPanel.prepareTaskFromUi();});
+    }
+    function prepareTaskFromUi() {
         if (workspace !== "chat" && !referenceSummary && !referenceTranslation) { prepare(); return; }
         if (running) { owner.cancelAi(); return; }
         const selectedTask = selectedSummary || (referenceTranslation && !translateDocument);

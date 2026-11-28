@@ -601,6 +601,20 @@ QVariantMap WorkspaceController::inspectReasoning(const QString &mode,const QStr
 QVariantMap WorkspaceController::generationDefaults() const {
     return inspectNativeSettings([](LyraReaderBuffer *output,LyraReaderBuffer *error){return lyra_reader_desktop_generation_defaults(output,error);},tr("The generation defaults could not be loaded."),tr("The generation defaults returned an invalid response."));
 }
+QVariantMap WorkspaceController::prereadingGate(const QVariant &policy,const QString &phase,bool ready,const QString &kind) const {
+    const auto plain=policy.metaType()==QMetaType::fromType<QJSValue>() ? policy.value<QJSValue>().toVariant() : policy;
+    // An unknown representation stays unknown. Only tasks that consume the
+    // preference reject it; the shared gate still pauses every busy lane.
+    const auto text=plain.metaType()==QMetaType::fromType<QString>() ? plain.toString() : QString{};
+    if(text.size()>64 || phase.size()>64 || kind.size()>64)return settingsFailure(tr("Invalid document prereading input."));
+    const auto policyBytes=text.toUtf8(),phaseBytes=phase.toUtf8(),kindBytes=kind.toUtf8();
+    return inspectNativeSettings([&](LyraReaderBuffer *output,LyraReaderBuffer *error) {
+        return lyra_reader_desktop_prereading_gate(
+            reinterpret_cast<const std::uint8_t *>(policyBytes.constData()),std::size_t(policyBytes.size()),
+            reinterpret_cast<const std::uint8_t *>(phaseBytes.constData()),std::size_t(phaseBytes.size()),ready,
+            reinterpret_cast<const std::uint8_t *>(kindBytes.constData()),std::size_t(kindBytes.size()),output,error);
+    },tr("The document prereading policy could not be inspected."),tr("The document prereading policy returned an invalid response."));
+}
 QVariant WorkspaceController::aiOutputLanguage() const {
     QSettings settings;
     const QString key=QStringLiteral("reader/preferences/aiOutputLanguage");
@@ -613,6 +627,14 @@ QVariant WorkspaceController::aiReviewBeforeSending() const {
     const QString key=QStringLiteral("reader/preferences/aiReviewBeforeSending");
     // Keep the existing Linux preview-first workflow until the user opts out.
     return settings.contains(key) ? settings.value(key) : QVariant(true);
+}
+QVariant WorkspaceController::aiPrereadingPolicy() const {
+    QSettings settings;
+    const QString key=QStringLiteral("reader/preferences/aiPrereadingPolicy");
+    return settings.contains(key) ? settings.value(key) : QVariant(QStringLiteral("ask"));
+}
+bool WorkspaceController::setAiPrereadingPolicy(const QString &policy) {
+    return setAiReadingWorkflow({{QStringLiteral("prereadingPolicy"),policy}});
 }
 bool WorkspaceController::setAiOutputLanguage(const QString &language) {
     return setAiReadingWorkflow({{QStringLiteral("outputLanguage"),language}});
@@ -629,6 +651,10 @@ bool WorkspaceController::setAiReadingWorkflow(const QVariantMap &changes) {
         QString name;QVariant fallback;
         if(it.key()==QStringLiteral("outputLanguage")){name=QStringLiteral("aiOutputLanguage");fallback=QString{};}
         else if(it.key()==QStringLiteral("reviewBeforeSending")){name=QStringLiteral("aiReviewBeforeSending");fallback=true;}
+        else if(it.key()==QStringLiteral("prereadingPolicy")) {
+            name=QStringLiteral("aiPrereadingPolicy");fallback=QStringLiteral("ask");
+            if(!prereadingGate(it.value().toString(),QStringLiteral("idle"),false,QStringLiteral("question")).value("valid").toBool())return false;
+        }
         else return false;
         if(it.value().metaType()!=fallback.metaType())return false;
         const auto key=QStringLiteral("reader/preferences/")+name;
@@ -653,11 +679,12 @@ bool WorkspaceController::setAiReadingWorkflow(const QVariantMap &changes) {
         }
         return false;
     }
-    bool language=false,review=false;
+    bool language=false,review=false,prereading=false;
     for(const auto &write:writes) {
         pending.remove(write.key);
         language|=write.field==QStringLiteral("outputLanguage");
         review|=write.field==QStringLiteral("reviewBeforeSending");
+        prereading|=write.field==QStringLiteral("prereadingPolicy");
     }
     QList<QPointer<WorkspaceController>> recipients;
     for(auto *workspace:workspaces())recipients.append(workspace);
@@ -674,6 +701,7 @@ bool WorkspaceController::setAiReadingWorkflow(const QVariantMap &changes) {
             if(workspace)emit workspace->aiOutputLanguageChanged();
         }
         if(workspace && review)emit workspace->aiReviewBeforeSendingChanged();
+        if(workspace && prereading)emit workspace->aiPrereadingPolicyChanged();
     }
     return true;
 }

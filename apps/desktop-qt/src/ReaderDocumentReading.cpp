@@ -13,6 +13,7 @@ void ReaderController::initDocumentReading() {
     });
 }
 void ReaderController::resetDocumentReading() {
+    ++m_readingRevision;
     const bool pending=m_readingPreviewId || m_readingStartId || m_readingTimer.isActive();
     m_readingTimer.stop();m_readingPreviewId=0;m_readingStartId=0;m_readingPollId=0;m_readingCancelId=0;
     if(pending && m_document && !m_snapshotMode)submit(QStringLiteral("knowledge_cancel"));
@@ -33,6 +34,7 @@ void ReaderController::prepareDocumentReading(const QVariantMap &request) {
         return owner && generation==m_generation && m_documentReading.value(QStringLiteral("phase")).toString()==QStringLiteral("preparing");
     };
     m_readingChoiceShown=true;m_readingChoicePending=false;
+    ++m_readingRevision;
     m_documentReading={{QStringLiteral("phase"),QStringLiteral("preparing")}};
     if(request.contains(QStringLiteral("chatgpt_account")))
         m_documentReading.insert(QStringLiteral("chatgpt_account"),request.value(QStringLiteral("chatgpt_account")));
@@ -68,10 +70,20 @@ bool ReaderController::startDocumentReadingWithCredential(const QString &key,con
     return id!=0;
 }
 void ReaderController::stopDocumentReading() {
+    ++m_readingRevision;
     m_readingChoiceShown=true;m_readingChoicePending=false;
     m_readingTimer.stop();m_readingPreviewId=0;m_readingStartId=0;m_readingPollId=0;
     m_documentReading={{QStringLiteral("phase"),QStringLiteral("stopping")}};emit documentReadingChanged();
     if(m_document && !m_snapshotMode)m_readingCancelId=submit(QStringLiteral("knowledge_cancel"));
+}
+void ReaderController::skipDocumentReading() {
+    if(!m_document || m_snapshotMode || m_loading)return;
+    const QPointer<ReaderController> owner(this);const auto generation=m_generation;
+    ++m_readingRevision;
+    m_readingChoiceShown=true;m_readingChoicePending=false;
+    m_readingTimer.stop();m_readingPreviewId=0;m_readingStartId=0;m_readingPollId=0;
+    m_documentReading={{QStringLiteral("phase"),QStringLiteral("stopping")}};emit documentReadingChanged();
+    if(owner && generation==m_generation && m_document && !m_snapshotMode)m_readingCancelId=submit(QStringLiteral("knowledge_skip"));
 }
 void ReaderController::invalidateDocumentReadingPreview() {
     const auto phase=m_documentReading.value(QStringLiteral("phase")).toString();
@@ -82,7 +94,7 @@ void ReaderController::handleDocumentReadingCommand(quint64 id,const QString &op
     if(operation==QStringLiteral("knowledge_load") || operation==QStringLiteral("knowledge_prepare"))expected=&m_readingPreviewId;
     else if(operation==QStringLiteral("knowledge_start"))expected=&m_readingStartId;
     else if(operation==QStringLiteral("knowledge_poll"))expected=&m_readingPollId;
-    else if(operation==QStringLiteral("knowledge_cancel"))expected=&m_readingCancelId;
+    else if(operation==QStringLiteral("knowledge_cancel") || operation==QStringLiteral("knowledge_skip"))expected=&m_readingCancelId;
     if(!expected || !*expected || *expected!=id)return;
     *expected=0;
     if(error.isEmpty()) {

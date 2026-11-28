@@ -317,6 +317,12 @@ Pane {
         command = reader.saveReadingNoteDraft();
     }
     function beginUpdate() {
+        if(!reader || !note)return;
+        const owner=reader,generation=notes.generation,id=note.id,modified=note.modified;
+        app.requestAiTaskFromUi(owner,"note",function(){return notes.reader===owner && notes.generation===generation
+            && !!notes.note && notes.note.id===id && notes.note.modified===modified;},function(){notes.beginUpdateReady();});
+    }
+    function beginUpdateReady() {
         finishInput();
         if (!noteWriteReady || !note || !canUpdateDiscussion || note.suggestion || editing || reviewing || reviewState.running) return;
         debounce.stop();

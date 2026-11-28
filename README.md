@@ -162,13 +162,17 @@ can be retried or explicitly discarded after confirmation; discarding leaves sav
 Legacy answer page markers stay plain text. Actual HTTP attempts have a bounded local metadata audit
 trail, including retries. Settings and the AI panel open a metadata-only viewer, available without a
 PDF. Clearing it requires confirmation of the displayed snapshot; concurrent changes require a refresh.
-Document reading is optional: the first eligible question offers reading or Skip without blocking
-its request preview. Document Reading (Ctrl+Shift+K) previews the complete extracted text before an
-explicit background start, including the disclosed extra consolidation for multipart readings.
-Questions continue independently; Stop, retry and document changes cannot publish partial or stale
-understanding. A completed reading enriches new previews and is cached by PDF fingerprint; selected
-text translation keeps its original context. Corrupt, foreign or concurrently changed cache files
-are retained, with an in-memory result and a warning when a completed reading cannot be cached.
+Document prereading follows the Ask, Always or Never policy in Settings; Ask is the default.
+An eligible explicit question offers reading or Skip. Starting prereading pauses other AI tasks,
+while ordinary PDF reading remains available. Skip resumes only the unchanged explicit task;
+completion does not send the original question. Summaries, translations and note updates do not
+request an additional prereading pass, but still wait for an active one. Document Reading
+(Ctrl+Shift+K) can inspect the extracted text, including the disclosed extra consolidation for
+multipart readings. Sending follows the global Review before sending choice. Stop, explicit retry
+and document changes cannot publish partial or stale understanding. A completed reading enriches
+new previews and is cached by PDF fingerprint; selected text translation keeps its original context.
+Corrupt, foreign or concurrently changed cache files are retained, with an in-memory result and a
+warning when a completed reading cannot be cached.
 In-place translation previews each complete selected paragraph, or one partial selection, before
 explicit Send. Up to three audited requests run together. Completed passages appear over the paper;
 their menus show the original or the full translation when fitted text does not fit. Saved translations

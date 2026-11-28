@@ -22,6 +22,7 @@ mod note_markers;
 mod pages;
 mod paper;
 mod passages;
+mod prereading;
 mod quit;
 mod reading_history;
 mod reading_notes;
@@ -49,7 +50,7 @@ use std::{
 /// Version of the Qt boundary, including shared citation-card headings.
 #[unsafe(no_mangle)]
 pub extern "C" fn lyra_reader_desktop_abi_version() -> u32 {
-    25
+    26
 }
 
 /// Worker-only immutable capture for an independent term popover.
@@ -1625,7 +1626,7 @@ mod tests {
 
     #[test]
     fn image_byte_boundary_rejects_null_handles_and_reports_its_version() {
-        assert_eq!(lyra_reader_desktop_abi_version(), 25);
+        assert_eq!(lyra_reader_desktop_abi_version(), 26);
         assert_eq!(
             lyra_reader_desktop_zoom_preset_inset_pt(),
             lyra_reader_session::ZOOM_PRESET_INSET_PT

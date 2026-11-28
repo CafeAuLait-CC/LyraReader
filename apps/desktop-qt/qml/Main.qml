@@ -97,9 +97,24 @@ ApplicationWindow {
     }
     AiRegionCard {id:aiRegionCard;app:root}
     DocumentReading {id:documentReadingPopup;app:root}
+    AiPrereadingWorkflow {id:prereadingWorkflow;app:root}
     signal aiTaskReviewCancelled(var ticket)
     AiTaskReviewWindow {id:aiTaskReview;app:root;onCancelled:function(ticket){root.aiTaskReviewCancelled(ticket)}}
-    function openDocumentReading(){aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
+    function openDocumentReading(){prereadingWorkflow.cancel();documentReadingPopup.gateMode=false;aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
+    function requestAiTaskFromUi(owner,kind,valid,resume){return prereadingWorkflow.begin(owner,kind,valid,resume);}
+    function aiTaskUiAvailable(){return visible && !closeApproved && !closeOperation && closingTab===-2 && !dialogs.closePromptVisible;}
+    function showPrereadingChoice(owner,automatic){documentReadingPopup.openForGate(owner,automatic);}
+    function hidePrereadingChoice(owner){if(documentReadingPopup.owner===owner && documentReadingPopup.gateMode)documentReadingPopup.close();}
+    function adoptPrereadingPreview(owner){prereadingWorkflow.adopt(owner);}
+    function skipPrereadingIntent(owner){return prereadingWorkflow.skip(owner);}
+    function cancelPrereadingIntent(){prereadingWorkflow.cancel();}
+    function prereadingMayStart(owner){return prereadingWorkflow.mayStart(owner);}
+    function foregroundAiIsReady(owner) {
+        if(!owner || !session)return false;
+        const state=owner.documentReading;
+        const gate=session.prereadingGate("never",state.phase || "idle",!!state.ready,"note");
+        return !!gate.valid && gate.decision==="ready";
+    }
     function openRegionNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"regions");}}
     function openReadingNotes(){if(currentReader.pageCount>0){aiRegionCard.close();showAiPanelMode(true,"notes");}}
     function showReadingNotice(message, owner) {
@@ -504,6 +519,8 @@ ApplicationWindow {
     readonly property bool aiReviewPreferenceKnown:typeof aiReviewBeforeSendingValue==="boolean"
     readonly property bool requiresAiTaskReview:!aiReviewPreferenceKnown || aiReviewBeforeSendingValue
     property int aiReviewRevision:0
+    readonly property var prereadingPolicyValue:session ? session.aiPrereadingPolicy : "ask"
+    property int prereadingPolicyRevision:0
     property var previousReader: null
     property var pendingPosition: null
     property var pendingLayoutPosition: null
@@ -2158,8 +2175,10 @@ ApplicationWindow {
                 || closeApproved || closeOperation || closingTab!==-2 || dialogs.closePromptVisible)return false;
         if(ticket.purpose==="document-reading") {
             const state=ticket.reader.documentReading;
-            return state.phase==="preview" && state.token===ticket.token && sameAiReviewPlan(state.plan,ticket.plan);
+            return state.phase==="preview" && state.token===ticket.token && sameAiReviewPlan(state.plan,ticket.plan)
+                && (!documentReadingPopup.gateMode || prereadingWorkflow.mayStart(ticket.reader));
         }
+        if(!foregroundAiIsReady(ticket.reader))return false;
         if(ticket.purpose==="term") {
             const state=ticket.reader.readingTerm.state;
             return state.phase==="preview" && sameAiReviewPlan(state.plan,ticket.plan);
@@ -2187,6 +2206,8 @@ ApplicationWindow {
     }
     function startPreparedAi(owner,key,plan,purpose,token) {
         if(!owner || !refreshAiConnection() || !owner || !aiConnectionMatches(plan))return false;
+        if(purpose==="document-reading" && documentReadingPopup.gateMode && !prereadingWorkflow.mayStart(owner))return false;
+        if(purpose!=="document-reading" && !foregroundAiIsReady(owner))return false;
         if(purpose==="term")return owner.startAiTerm(key,plan);
         return purpose==="document-reading" ? owner.startDocumentReading(key,plan,token) : owner.startAi(key,plan);
     }
@@ -2209,7 +2230,15 @@ ApplicationWindow {
         credentialReadId=-1; pendingAiReader=null; pendingAiPlan=null; pendingAiToken="";
         if (dialogs.credentialDialog.visible) dialogs.credentialDialog.reject();
     }
+    function abandonPrereadingCredential(owner,token) {
+        if(pendingAiPurpose!=="document-reading" || pendingAiReader!==owner || pendingAiToken!==token)return;
+        credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;pendingAiToken="";
+        if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
+    }
     function sendAi(owner, plan, purpose, token) {
+        if(purpose!=="document-reading" && !foregroundAiIsReady(owner)) {
+            operationStatus=qsTr("Document prereading is in progress. Continue when Lyra AI is ready.");return;
+        }
         if (!owner || !plan || !refreshAiConnection() || !owner)
             return;
         if(!aiConnectionMatches(plan)) {
@@ -3052,6 +3081,7 @@ ApplicationWindow {
             if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
             root.pendingAiReader=null;root.pendingAiPlan=null;root.pendingAiToken="";
         }
+        function onAiPrereadingPolicyChanged(){++root.prereadingPolicyRevision;}
         function onAiOutputLanguageChanged() {
             const owner=root.pendingAiReader;
             if(!owner)return;

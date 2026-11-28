@@ -114,7 +114,7 @@ class ReadingPreferenceGuard final {
 public:
     ReadingPreferenceGuard() {
         QSettings settings;
-        for(const auto &key:{"appearance","paper","ai","aiOutputLanguage","aiReviewBeforeSending","reduceMotion","auxiliarySettingsGeometry","lyra.regionConversationStyle"}) {
+        for(const auto &key:{"appearance","paper","ai","aiOutputLanguage","aiReviewBeforeSending","aiPrereadingPolicy","reduceMotion","auxiliarySettingsGeometry","lyra.regionConversationStyle"}) {
             const auto full=QStringLiteral("reader/preferences/")+QLatin1String(key);
             m_values.insert(full,{settings.contains(full),settings.value(full)});
         }
@@ -379,6 +379,174 @@ private slots:
             QVERIFY(QGuiApplication::platformName() == "wayland" || QGuiApplication::platformName() == "xcb");
         }
         registerReaderTypes();
+        // Existing UI fixtures isolate their original task flow. Prereading
+        // cases below explicitly remove/replace this seed to exercise Ask's default.
+        QSettings saved;saved.setValue("reader/preferences/aiPrereadingPolicy","never");saved.sync();
+    }
+    void prereadingPoliciesConsumeTheExplicitTaskWithoutSendingItOnCompletion_data() {
+        QTest::addColumn<QVariant>("policy");QTest::addColumn<QString>("route");QTest::addColumn<bool>("review");
+        QTest::newRow("default-ask-skip")<<QVariant{}<<QString("skip")<<true;
+        QTest::newRow("ask-skip")<<QVariant("ask")<<QString("skip")<<false;
+        QTest::newRow("ask-start")<<QVariant("ask")<<QString("read")<<false;
+        QTest::newRow("always-direct")<<QVariant("always")<<QString("read")<<false;
+        QTest::newRow("always-review")<<QVariant("always")<<QString("read")<<true;
+        QTest::newRow("never")<<QVariant("never")<<QString("direct")<<false;
+        QTest::newRow("ask-close")<<QVariant("ask")<<QString("close")<<false;
+        QTest::newRow("ask-late-question")<<QVariant("ask")<<QString("question")<<false;
+        for(const auto &change:{"policy","language","tab","reopen","credential","replacement","window-close"})
+            QTest::newRow(qPrintable(QString("ask-")+change))<<QVariant("ask")<<QString(change)<<false;
+        QTest::newRow("ask-summary-needs-no-prior")<<QVariant("ask")<<QString("summary")<<false;
+        QTest::newRow("ask-translation-needs-no-prior")<<QVariant("ask")<<QString("translation")<<false;
+        QTest::newRow("future-summary-needs-no-prior")<<QVariant("future-policy")<<QString("summary")<<false;
+        QTest::newRow("future-object-translation-needs-no-prior")<<QVariant(QVariantMap{{"future",true}})<<QString("translation")<<false;
+        QTest::newRow("unknown-is-kept")<<QVariant("future-policy")<<QString("invalid")<<false;
+    }
+    void prereadingPoliciesConsumeTheExplicitTaskWithoutSendingItOnCompletion() {
+        QFETCH(QVariant,policy);QFETCH(QString,route);QFETCH(bool,review);
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property|Cannot assign).*"));
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings saved;
+        const QString key="reader/preferences/aiPrereadingPolicy";
+        if(policy.isValid())saved.setValue(key,policy);else saved.remove(key);
+        saved.setValue("reader/preferences/aiReviewBeforeSending",review);
+        saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");saved.sync();
+        QVERIFY(ChatGptAccounts::instance()->refreshConnection());
+        MockChatServer server;QVERIFY(server.listen());
+        if(route=="read")server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_PREREADING [p.1]"}}),QByteArray("data: [DONE]\n\n")},15,200});
+        server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_QUESTION_ANSWER [p.1]"}}),QByteArray("data: [DONE]\n\n")},15,200});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-prereading.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->loading() && !reader->pendingCommands());
+        QCOMPARE(view.workspace.aiPrereadingPolicy(),policy.isValid()?policy:QVariant("ask"));
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-prereading"}});
+        window->setProperty("reduceMotion",true);
+        if(policy.toString()=="always" && review)window->setProperty("appearance","dark");
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
+        const bool noPrior=route=="summary" || route=="translation";
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,noPrior?route:QString("chat"))));
+        if(route=="translation")window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",20}});
+        reader->setAiInput("question","What is the synthetic contribution?");
+        auto *panel=window->findChild<QObject *>("aiPanel");auto *choice=window->findChild<QObject *>("documentReadingPopup");
+        auto *taskReview=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(panel && choice && taskReview);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));
+        if(route=="invalid") {
+            QTRY_VERIFY(window->property("operationStatus").toString().contains("prereading preference"));
+            QVERIFY(!choice->property("visible").toBool());QCOMPARE(server.requests.size(),0);QCOMPARE(saved.value(key),policy);return;
+        }
+        const auto sendReview=[&] {
+            QTRY_VERIFY(taskReview->isVisible());QTRY_VERIFY(taskReview->property("canSend").toBool());
+            const auto evidence=qEnvironmentVariable("LYRA_READER_PREREADING_EVIDENCE");
+            if(!evidence.isEmpty()) {
+                QVERIFY(QDir().mkpath(evidence));taskReview->setProperty("bodyExpanded",true);
+                QSignalSpy frames(taskReview,&QQuickWindow::frameSwapped);taskReview->update();QTRY_VERIFY(!frames.isEmpty());
+                QVERIFY(taskReview->grabWindow().save(evidence+"/"+QString::fromLatin1(QTest::currentDataTag())+QString("-review-%1.png").arg(server.requests.size())));
+            }
+            QVERIFY(QMetaObject::invokeMethod(taskReview,"send"));
+        };
+        if(route!="direct" && !noPrior) {
+            if(policy.toString()!="always") {
+                QTRY_VERIFY(choice->property("opened").toBool());
+                QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));
+                QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),0);
+                const auto evidence=qEnvironmentVariable("LYRA_READER_PREREADING_EVIDENCE");
+                if(route=="skip" && !policy.isValid() && !evidence.isEmpty()) {
+                    QVERIFY(QDir().mkpath(evidence));QSignalSpy frames(window,&QQuickWindow::frameSwapped);window->update();QTRY_VERIFY(!frames.isEmpty());
+                    QVERIFY(window->grabWindow().save(evidence+"/ask-choice.png"));
+                }
+            }
+            if(route=="close" || route=="question" || route=="policy" || route=="language"
+                    || route=="tab" || route=="reopen" || route=="credential" || route=="replacement" || route=="window-close") {
+                if(route=="close")QVERIFY(QMetaObject::invokeMethod(choice,"close"));
+                else if(route=="question")reader->setAiInput("question","A different late synthetic question");
+                else if(route=="policy")QVERIFY(view.workspace.setAiPrereadingPolicy("never"));
+                else if(route=="language")QVERIFY(view.workspace.setAiOutputLanguage("French"));
+                else if(route=="tab")view.workspace.newTab();
+                else if(route=="window-close") {
+                    reader->flushAiChatDraft();QTRY_VERIFY(!reader->chatDraftPending());
+                    // The first close can wait for a local command. Verify the
+                    // completed closure instead of requiring synchronous approval.
+                    window->close();QTRY_VERIFY(!window->isVisible());
+                }
+                else if(route=="reopen") {
+                    reader->flushAiChatDraft();QTRY_VERIFY(!reader->chatDraftPending());
+                    const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));
+                    QTRY_VERIFY(reader->documentGeneration()!=generation);
+                }
+                else if(route=="replacement")reader->prepareDocumentReading({{"action","SummarizeDocument"},{"current_page",0},{"base_url",server.baseUrl()},{"model","synthetic-replacement"},{"document_knowledge",true},
+                    {"selection",QVariant{}},{"question",QVariant{}},{"language",QVariant{}},{"history",QVariantList{}},{"region",QVariant{}},
+                    {"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"},
+                    {"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}}});
+                else {
+                    const auto state=reader->documentReading();
+                    window->setProperty("credentialReadId",12345.);window->setProperty("pendingAiReader",QVariant::fromValue(reader));
+                    window->setProperty("pendingAiPlan",state.value("plan"));window->setProperty("pendingAiPurpose","document-reading");window->setProperty("pendingAiToken",state.value("token"));
+                    QVERIFY(QMetaObject::invokeMethod(choice,"close"));
+                    QCOMPARE(window->property("credentialReadId").toDouble(),-1.);
+                    emit view.workspace.credentials()->finished(12345,"read","synthetic-unused-secret",{});
+                }
+                QTRY_VERIFY(!choice->property("visible").toBool());QTRY_VERIFY(!reader->loading() && !reader->pendingCommands());
+                QVERIFY(!taskReview->isVisible());QCOMPARE(server.requests.size(),0);
+                QCOMPARE(reader->documentReading().value("phase").toString(),QString(route=="replacement"?"preview":"idle"));
+                if(route=="replacement")QCOMPARE(reader->documentReading().value("plan").toMap().value("model").toString(),QString("synthetic-replacement"));
+                return;
+            }
+            if(route=="skip") {
+                QVERIFY(QMetaObject::invokeMethod(choice,"continueWithout"));
+                QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("skipped"));
+            } else {
+                if(policy.toString()!="always")QVERIFY(QMetaObject::invokeMethod(choice,"startReading"));
+                if(review)sendReview();
+                QTRY_COMPARE(server.requests.size(),1);
+                QTRY_VERIFY(reader->documentReading().value("ready").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+                QVERIFY(!reader->aiState().value("running").toBool());
+                QTest::qWait(80);QCOMPARE(server.requests.size(),1);
+                QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));
+            }
+        }
+        if(review)sendReview();
+        QTRY_COMPARE(server.requests.size(),route=="read"?2:1);
+        QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto plan=reader->aiState().value("responsePlan").toMap();
+        const auto wire=server.requests.last().mid(server.requests.last().indexOf("\r\n\r\n")+4);
+        QCOMPARE(wire,plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8());
+        if(!noPrior)QVERIFY(wire.contains("What is the synthetic contribution?"));
+        // The shared chat builder uses a complete original for this small PDF
+        // once understanding exists, and deliberately omits a duplicate digest.
+        if(route=="read") {
+            QVERIFY(wire.contains("using the original sources above."));
+            QVERIFY(!wire.contains("SYNTHETIC_PREREADING"));
+        } else if(!noPrior)QVERIFY(wire.contains("using the retrieved passages below."));
+        QVERIFY(!choice->property("visible").toBool());QVERIFY(!taskReview->isVisible());
+    }
+    void failedPrereadingNeedsAnotherExplicitChoiceAndNeverReplaysTheQuestion_data() {
+        QTest::addColumn<bool>("retry");QTest::newRow("skip-failed")<<false;QTest::newRow("retry-failed")<<true;
+    }
+    void failedPrereadingNeedsAnotherExplicitChoiceAndNeverReplaysTheQuestion() {
+        QFETCH(bool,retry);ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;
+        stored.setValue("reader/preferences/aiPrereadingPolicy","always");stored.setValue("reader/preferences/aiReviewBeforeSending",false);
+        stored.setValue("chatGptPlan/connectionMode","apiKey");stored.remove("chatGptPlan/accounts");stored.sync();QVERIFY(ChatGptAccounts::instance()->refreshConnection());
+        MockChatServer server;QVERIFY(server.listen());server.responses.append({{QByteArray("{\"error\":{\"message\":\"synthetic prerequisite failure\"}}")},0,400});
+        if(retry)server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_RETRIED_UNDERSTANDING [p.1]"}}),QByteArray("data: [DONE]\n\n")},15,200});
+        server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_EXPLICIT_ANSWER [p.1]"}}),QByteArray("data: [DONE]\n\n")},15,200});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-prereading-failure.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));auto *reader=view.workspace.activeReader();
+        QTRY_VERIFY(reader->pageCount()==1 && !reader->pendingCommands());window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-failure"}});
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"chat")));
+        reader->setAiInput("question","An explicitly retained synthetic question");auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("failed"));
+        QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),1);QTest::qWait(60);QCOMPARE(server.requests.size(),1);
+        QVERIFY(reader->error().isEmpty());QCOMPARE(reader->aiState().value("input").toMap().value("question").toString(),QString("An explicitly retained synthetic question"));
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));auto *choice=window->findChild<QObject *>("documentReadingPopup");QVERIFY(choice);
+        QTRY_VERIFY(choice->property("opened").toBool());QCOMPARE(server.requests.size(),1);
+        if(retry) {
+            QVERIFY(QMetaObject::invokeMethod(choice,"prepare"));QTRY_VERIFY(reader->documentReading().value("ready").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            QTest::qWait(60);QCOMPARE(server.requests.size(),2);QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));
+        } else QVERIFY(QMetaObject::invokeMethod(choice,"continueWithout"));
+        QTRY_COMPARE(server.requests.size(),retry?3:2);QTRY_VERIFY(!reader->aiState().value("running").toBool() && !reader->pendingCommands());
+        const auto wire=server.requests.last().mid(server.requests.last().indexOf("\r\n\r\n")+4);
+        QVERIFY(wire.contains("An explicitly retained synthetic question"));QVERIFY(!wire.contains("synthetic prerequisite failure"));
+        const auto plan=reader->aiState().value("responsePlan").toMap();QCOMPARE(wire,plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8());
+        QVERIFY(!choice->property("visible").toBool());
     }
     void captureChatGptUrl(const QUrl &url) {
         capturedChatGptUrl = url;
@@ -2500,7 +2668,7 @@ private slots:
         QCOMPARE(previous.dirName(),QCoreApplication::organizationName());QVERIFY(previous.cdUp());
         QTemporaryDir scratch;QSettings::setPath(format,QSettings::UserScope,scratch.path());
         const auto restorePath=qScopeGuard([&]{QSettings::setPath(format,QSettings::UserScope,previous.absolutePath());});
-        WorkspaceController workspace;QVERIFY(workspace.setAiReadingWorkflow({{"outputLanguage","French"},{"reviewBeforeSending",true}}));
+        WorkspaceController workspace;QVERIFY(workspace.setAiReadingWorkflow({{"outputLanguage","French"},{"reviewBeforeSending",true},{"prereadingPolicy","ask"}}));
         QSettings fixture;const auto path=fixture.fileName(),directory=QFileInfo(path).absolutePath();const bool existed=fixture.contains("reader/preferences/aiReviewBeforeSending");
         QFile file(path);QVERIFY(file.open(QIODevice::ReadOnly));const auto original=file.readAll();file.close();
         const auto fp=QFile::permissions(path),dp=QFile::permissions(directory);
@@ -2508,16 +2676,87 @@ private slots:
         QVERIFY(QFile::setPermissions(path,QFileDevice::ReadOwner));QVERIFY(QFile::setPermissions(directory,QFileDevice::ReadOwner|QFileDevice::ExeOwner));
         QFile probe(directory+"/write-probe");if(probe.open(QIODevice::WriteOnly)){probe.close();QVERIFY(probe.remove());QSKIP("This runtime bypasses read-only fixture permissions");}
         QSignalSpy language(&workspace,&WorkspaceController::aiOutputLanguageChanged),review(&workspace,&WorkspaceController::aiReviewBeforeSendingChanged);
-        const QVariantMap patch{{"outputLanguage","German"},{"reviewBeforeSending",false}};
+        QSignalSpy prereading(&workspace,&WorkspaceController::aiPrereadingPolicyChanged);
+        const QVariantMap patch{{"outputLanguage","German"},{"reviewBeforeSending",false},{"prereadingPolicy","always"}};
         QVERIFY(!workspace.setAiReadingWorkflow(patch));QCOMPARE(language.size(),0);QCOMPARE(review.size(),0);
+        QCOMPARE(prereading.size(),0);QCOMPARE(workspace.aiPrereadingPolicy(),QVariant("ask"));
         QCOMPARE(workspace.aiOutputLanguage(),QVariant("French"));QCOMPARE(workspace.aiReviewBeforeSending(),QVariant(true));
         QCOMPARE(fixture.contains("reader/preferences/aiReviewBeforeSending"),existed);
         QVERIFY(file.open(QIODevice::ReadOnly));QCOMPARE(file.readAll(),original);file.close();
         QVERIFY(QFile::setPermissions(directory,dp));QVERIFY(QFile::setPermissions(path,fp));
         QVERIFY(workspace.setAiReadingWorkflow(patch));QCOMPARE(language.size(),1);QCOMPARE(review.size(),1);
+        QCOMPARE(prereading.size(),1);QCOMPARE(workspace.aiPrereadingPolicy(),QVariant("always"));
         QCOMPARE(workspace.aiOutputLanguage(),QVariant("German"));QCOMPARE(workspace.aiReviewBeforeSending(),QVariant(false));
         QCOMPARE(workspace.activeReader()->aiState().value("input").toMap().value("summaryLanguage").toString(),QString("German"));
 #endif
+    }
+    void prereadingSettingsKeepUnknownValuesCancelDraftsAndFollowOtherWindows() {
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;
+        const QString key="reader/preferences/aiPrereadingPolicy";stored.remove(key);stored.sync();
+        WorkspaceController plain;QCOMPARE(plain.aiPrereadingPolicy(),QVariant("ask"));
+        QVERIFY(!plain.setAiReadingWorkflow({{"outputLanguage","German"},{"prereadingPolicy",false}}));
+        QVERIFY(!plain.setAiPrereadingPolicy("future"));QVERIFY(!stored.contains(key));
+        stored.setValue(key,"future-prereading");stored.setValue("chatGptPlan/connectionMode","apiKey");stored.remove("chatGptPlan/accounts");stored.sync();
+        QVERIFY(ChatGptAccounts::instance()->refreshConnection());
+        NativeCorpus::Viewer first,second;QVERIFY(first.window && second.window);
+        auto *a=first.window->findChild<QQuickWindow *>("settingsWindow"),*b=second.window->findChild<QQuickWindow *>("settingsWindow");QVERIFY(a && b);
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));
+        QTRY_VERIFY(a->isVisible());
+        auto *ac=visualItem(a->contentItem(),"settingsAiPrereadingPolicy"),*bc=visualItem(b->contentItem(),"settingsAiPrereadingPolicy");QVERIFY(ac && bc);
+        QCOMPARE(ac->property("currentIndex").toInt(),-1);
+        auto *accessible=QAccessible::queryAccessibleInterface(ac);QVERIFY(accessible);
+        QVERIFY(accessible->text(QAccessible::Description).startsWith("Unrecognized saved preference."));
+        const auto evidence=qEnvironmentVariable("LYRA_READER_PREREADING_EVIDENCE");
+        if(!evidence.isEmpty()) {
+            QVERIFY(QDir().mkpath(evidence));a->requestActivate();QTRY_COMPARE(QGuiApplication::focusWindow(),a);
+            QSignalSpy frames(a,&QQuickWindow::frameSwapped);a->update();QTRY_VERIFY(!frames.isEmpty());
+            QVERIFY(a->grabWindow().save(evidence+"/settings-unknown-prereading.png"));
+        }
+        QVERIFY(QMetaObject::invokeMethod(second.window,"showSettings"));QTRY_VERIFY(b->isVisible());
+        QCOMPARE(bc->property("currentIndex").toInt(),-1);
+        ac->setProperty("currentIndex",2);QVERIFY(QMetaObject::invokeMethod(ac,"activated",Q_ARG(int,2)));
+        QVERIFY(QMetaObject::invokeMethod(a,"close"));QTRY_VERIFY(!a->isVisible());QCOMPARE(stored.value(key),QVariant("future-prereading"));
+        QVERIFY(QMetaObject::invokeMethod(first.window,"showSettings"));QTRY_VERIFY(a->isVisible());QCOMPARE(ac->property("currentIndex").toInt(),-1);
+        ac->setProperty("currentIndex",1);QVERIFY(QMetaObject::invokeMethod(ac,"activated",Q_ARG(int,1)));
+        QVERIFY(QMetaObject::invokeMethod(a,"save"));QTRY_VERIFY(!a->isVisible());
+        QCOMPARE(first.workspace.aiPrereadingPolicy(),QVariant("always"));QTRY_COMPARE(bc->property("currentIndex").toInt(),1);
+        bc->setProperty("currentIndex",2);QVERIFY(QMetaObject::invokeMethod(bc,"activated",Q_ARG(int,2)));
+        QVERIFY(first.workspace.setAiPrereadingPolicy("ask"));QCOMPARE(bc->property("currentIndex").toInt(),2);
+        QVERIFY(QMetaObject::invokeMethod(b,"close"));QTRY_VERIFY(!b->isVisible());QCOMPARE(stored.value(key),QVariant("ask"));
+        const QVariantMap opaque{{"future",true}};stored.setValue(key,opaque);
+        QVERIFY(first.workspace.setAiReviewBeforeSending(false));QCOMPARE(stored.value(key),QVariant(opaque));
+    }
+    void automaticPrereadingUsesTheWholeDocumentConnectionWithoutReadingAnyCredential_data() {
+        QTest::addColumn<bool>("legacy");QTest::addColumn<bool>("wholeDocument");
+        for(bool legacy:{true,false})for(bool wholeDocument:{true,false})
+            QTest::newRow(qPrintable(QString(legacy?"legacy":"unified")+(wholeDocument?"-granted":"-not-granted")))<<legacy<<wholeDocument;
+    }
+    void automaticPrereadingUsesTheWholeDocumentConnectionWithoutReadingAnyCredential() {
+        QFETCH(bool,legacy);QFETCH(bool,wholeDocument);
+        ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;
+        stored.setValue("reader/preferences/aiPrereadingPolicy","always");stored.setValue("reader/preferences/aiReviewBeforeSending",true);
+        if(legacy)stored.remove("chatGptPlan/connectionMode");else stored.setValue("chatGptPlan/connectionMode","chatGPT");
+        stored.setValue("chatGptPlan/accounts",QVariantList{QVariantMap{{"id","synthetic-prereading-account"},{"connected",true},{"model","synthetic-chatgpt"}}});
+        stored.setValue("chatGptPlan/selected","synthetic-prereading-account");stored.setValue("chatGptPlan/useForChat",true);stored.setValue("chatGptPlan/useForWholeDocument",wholeDocument);stored.sync();
+        QVERIFY(ChatGptAccounts::instance()->refreshConnection());
+        auto *vault=new FakeCredentialStore;WorkspaceController workspace(nullptr,vault);
+        QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);engine.rootContext()->setContextProperty("workspace",&workspace);engine.rootContext()->setContextProperty("reader",workspace.activeReader());
+        engine.load(QUrl("qrc:/qml/Main.qml"));QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        QVERIFY(window->property("requiresAiTaskReview").toBool());
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-prereading-connection.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QTRY_VERIFY(reader->pageCount()==1 && !reader->pendingCommands());
+        MockChatServer sentinel;QVERIFY(sentinel.listen());window->setProperty("aiSettings",QVariantMap{{"baseUrl",sentinel.baseUrl()},{"model","synthetic-api"}});
+        QVERIFY(workspace.chatGptAccounts()->refreshConnection());
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"chat")));reader->setAiInput("question","A synthetic question with an explicit reading preference");
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));
+        auto *review=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(review);QTRY_VERIFY(review->isVisible());QTRY_VERIFY(review->property("canSend").toBool());
+        const auto plan=reader->documentReading().value("plan").toMap();
+        const bool chatGpt=!legacy || wholeDocument;
+        QCOMPARE(plan.contains("chatgpt_account"),chatGpt);QCOMPARE(plan.value("model").toString(),QString(chatGpt?"synthetic-chatgpt":"synthetic-api"));
+        if(chatGpt)QCOMPARE(plan.value("endpoint").toString(),QString("https://api.openai.com/v1/responses"));
+        QCOMPARE(vault->requests.size(),0);QCOMPARE(sentinel.requests.size(),0);
+        auto *choice=window->findChild<QObject *>("documentReadingPopup");QVERIFY(choice);QVERIFY(QMetaObject::invokeMethod(choice,"close"));
+        QTRY_VERIFY(!review->isVisible());QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(vault->requests.size(),0);QCOMPARE(sentinel.requests.size(),0);
     }
     void visibleTaskReviewRejectsRetiredOwnersAndLateVaultReplies_data() {
         QTest::addColumn<QString>("change");
@@ -2561,19 +2800,22 @@ private slots:
         auto *credential=window->findChild<QObject *>("aiCredentialDialog");QVERIFY(credential);QVERIFY(!credential->property("visible").toBool());
     }
     void auxiliaryAiTasksUseTheSameOptionalReview_data() {
-        QTest::addColumn<QString>("route");QTest::addColumn<bool>("reviewEnabled");QTest::addColumn<bool>("cancelOwner");QTest::addColumn<bool>("chatGpt");
+        QTest::addColumn<QString>("route");QTest::addColumn<bool>("reviewEnabled");QTest::addColumn<bool>("cancelOwner");QTest::addColumn<bool>("chatGpt");QTest::addColumn<bool>("prereading");
         for(const auto &route:{QString("region"),QString("region-note"),QString("term"),QString("document-reading")})
-            for(bool enabled:{true,false})QTest::newRow(qPrintable(route+(enabled?"-review":"-direct")))<<route<<enabled<<false<<false;
+            for(bool enabled:{true,false})QTest::newRow(qPrintable(route+(enabled?"-review":"-direct")))<<route<<enabled<<false<<false<<false;
         for(const auto &route:{QString("region"),QString("term"),QString("document-reading")})
-            QTest::newRow(qPrintable(route+"-owner-close"))<<route<<true<<true<<false;
+            QTest::newRow(qPrintable(route+"-owner-close"))<<route<<true<<true<<false<<false;
         for(const auto &route:{QString("region"),QString("term"),QString("document-reading")})
-            QTest::newRow(qPrintable(route+"-chatgpt-cancel"))<<route<<true<<true<<true;
+            QTest::newRow(qPrintable(route+"-chatgpt-cancel"))<<route<<true<<true<<true<<false;
+        for(const auto &route:{QString("region"),QString("term")})for(bool enabled:{true,false})
+            QTest::newRow(qPrintable(route+(enabled?"-prereading-review":"-prereading-direct")))<<route<<enabled<<false<<false<<true;
     }
     void auxiliaryAiTasksUseTheSameOptionalReview() {
-        QFETCH(QString,route);QFETCH(bool,reviewEnabled);QFETCH(bool,cancelOwner);QFETCH(bool,chatGpt);
+        QFETCH(QString,route);QFETCH(bool,reviewEnabled);QFETCH(bool,cancelOwner);QFETCH(bool,chatGpt);QFETCH(bool,prereading);
         QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign|Required property).*"));
         ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;
         stored.setValue("reader/preferences/aiReviewBeforeSending",reviewEnabled);
+        stored.setValue("reader/preferences/aiPrereadingPolicy",prereading?"ask":"never");
         stored.setValue("chatGptPlan/connectionMode",chatGpt?"chatGPT":"apiKey");stored.remove("chatGptPlan/accounts");
         if(chatGpt) {stored.setValue("chatGptPlan/accounts",QVariantList{QVariantMap{{"id","synthetic-review-account"},{"connected",true},{"model","synthetic-responses-model"}}});stored.setValue("chatGptPlan/selected","synthetic-review-account");}stored.sync();
         MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;
@@ -2584,6 +2826,12 @@ private slots:
         window->setProperty("aiSettings",settings);window->setProperty("reduceMotion",true);QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
         QObject *origin=nullptr;QVariantMap prepared;QString token;int initialRequests=0;
         server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_AUXILIARY_REVIEW [p.1]"}}),QByteArray("data: [DONE]\n\n")},5,200});
+        const auto skipChoice=[&] {
+            auto *choice=window->findChild<QObject *>("documentReadingPopup");QVERIFY(choice);
+            QTRY_VERIFY(choice->property("opened").toBool());QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));
+            QCOMPARE(server.requests.size(),0);QVERIFY(QMetaObject::invokeMethod(choice,"continueWithout"));
+            QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("skipped"));
+        };
         if(route.startsWith("region")) {
             QVERIFY(reader->captureAiRegion(0,{{"x",60},{"y",55},{"width",420},{"height",180}},1));
             QTRY_VERIFY(!reader->aiRegion().value("image_png").toString().isEmpty());
@@ -2597,6 +2845,9 @@ private slots:
                 server.responses.append({{MockChatServer::delta({{"content","SYNTHETIC_NOTE_RESULT [p.1]"}}),QByteArray("data: [DONE]\n\n")},5,200});
             }
             QVERIFY(QMetaObject::invokeMethod(origin,"prepareFromUi",Q_ARG(QVariant,route=="region-note")));
+            if(prereading)skipChoice();
+            if(reviewEnabled)QTRY_VERIFY(!reader->aiState().value("plan").toMap().isEmpty());
+            else {QTRY_COMPARE(server.requests.size(),initialRequests+1);QTRY_VERIFY(!reader->aiState().value("running").toBool());}
             QTRY_COMPARE(reader->pendingCommands(),0);prepared=reader->aiState().value(reviewEnabled?"plan":"responsePlan").toMap();
         } else if(route=="document-reading") {
             QVERIFY(QMetaObject::invokeMethod(window,"openDocumentReading"));origin=window->findChild<QObject *>("documentReadingPopup");QVERIFY(origin);
@@ -2611,7 +2862,8 @@ private slots:
                 {"reasoning_mode","default"},{"reasoning_encoding","none"}};
             if(chatGpt){request.insert("chatgpt_account","synthetic-review-account");request.insert("model","synthetic-responses-model");}
             QVariant opened;QVERIFY(QMetaObject::invokeMethod(origin,"openFor",Q_RETURN_ARG(QVariant,opened),Q_ARG(QVariant,QVariant::fromValue(reader)),
-                Q_ARG(QVariant,reader->documentGeneration()),Q_ARG(QVariant,request),Q_ARG(QVariant,QVariant::fromValue(window->contentItem())),Q_ARG(QVariant,QVariant{})));QVERIFY(opened.toBool());
+                Q_ARG(QVariant,reader->documentGeneration()),Q_ARG(QVariant,request),Q_ARG(QVariant,QVariant::fromValue(window->contentItem())),Q_ARG(QVariant,QVariant{})));QCOMPARE(opened.toBool(),!prereading);
+            if(prereading)skipChoice();
             QTRY_VERIFY(reader->readingTerm()->property("state").toMap().value("phase").toString()==(reviewEnabled?"preview":"done"));
             prepared=reader->readingTerm()->property("state").toMap().value("plan").toMap();
         }
@@ -2681,12 +2933,20 @@ private slots:
         reader->setAiInput("action",5);window->setProperty("selection",QVariantMap{{"page",0},{"start",0},{"end",20}});
         QTRY_COMPARE(reader->pendingCommands(),0);
         const auto activate=[&](QQuickWindow *host,QQuickItem *button) {
-            host->requestActivate();if(!QTest::qWaitFor([&]{return QGuiApplication::focusWindow()==host;},3000))return false;
+            if(!QTest::qWaitForWindowExposed(host,3000)){qInfo()<<"Review activation: host not exposed"<<host;return false;}
+            host->requestActivate();
+            if(!QTest::qWaitFor([&]{return QGuiApplication::focusWindow()==host;},3000)) {
+                qInfo()<<"Review activation: compositor focus did not reach host"<<host<<QGuiApplication::focusWindow();return false;
+            }
             button->forceActiveFocus(Qt::TabFocusReason);
-            if(!QTest::qWaitFor([&]{return button->hasActiveFocus() && host->activeFocusItem()==button;},3000))return false;
+            if(!QTest::qWaitFor([&]{return button->hasActiveFocus() && host->activeFocusItem()==button;},3000)) {
+                qInfo()<<"Review activation: item focus did not settle"<<button<<host->activeFocusItem();return false;
+            }
             QSignalSpy clicked(button,SIGNAL(clicked()));
             QTest::keyClick(host,Qt::Key_Space);
-            return QTest::qWaitFor([&]{return !clicked.isEmpty();},3000);
+            const bool accepted=QTest::qWaitFor([&]{return !clicked.isEmpty();},3000);
+            if(!accepted)qInfo()<<"Review activation: Space did not click the focused control"<<button<<host->activeFocusItem()<<QGuiApplication::focusWindow();
+            return accepted;
         };
         QByteArray reviewedBody;
         for(int attempt=0;attempt<(requiresReview?2:1);++attempt) {
@@ -6340,18 +6600,22 @@ LyraMenu {
         window->setProperty("searchVisible",true);if(window->width()<1200)QTRY_VERIFY(!dock->isVisible());
         QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,true)));if(window->width()<1200)QVERIFY(!window->property("searchVisible").toBool());
     }
-    void optionalDocumentReadingDoesNotBlockQuestionsAndSkipOrStopSendsNoExtraWork() {
+    void documentPrereadingPausesAiWhilePdfTabsAndCancellationRemainUsable() {
         QTemporaryDir scratch;QVERIFY(scratch.isValid());const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});const auto cache=scratch.path()+"/cache";qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",cache.toUtf8());
         MockChatServer server;QVERIFY(server.listen());MockChatServer::Response held;held.holdLast=true;held.chunks={MockChatServer::delta({{"content","PARTIAL_READING_MUST_NOT_BE_CONTEXT"}}),QByteArray("data: [DONE]\n\n")};server.responses.append(held);server.responses.append({{MockChatServer::delta({{"content","Foreground answer while optional reading runs [p.1]"}}),QByteArray("data: [DONE]\n\n")},0,200});
         const auto path=scratch.path()+"/optional.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));NativeCorpus::Viewer view;QVERIFY(view.window);auto *reader=view.workspace.activeReader();view.workspace.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
         view.window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic"}});QVERIFY(QMetaObject::invokeMethod(view.window,"openDocumentReading"));auto *reading=view.window->findChild<QObject *>("documentReadingPopup");QVERIFY(reading);QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),0);
-        auto *skip=view.window->findChild<QObject *>("skipDocumentReading");QVERIFY(skip);QVERIFY(QMetaObject::invokeMethod(skip,"clicked"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("idle"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),0);
-        QVERIFY(QMetaObject::invokeMethod(view.window,"openDocumentReading"));QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);const auto state=reader->documentReading(),plan=state.value("plan").toMap();
+        auto *skip=view.window->findChild<QObject *>("skipDocumentReading");QVERIFY(skip);QVERIFY(QMetaObject::invokeMethod(skip,"clicked"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("skipped"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),0);
         reader->setAiInput("action",0);auto *panel=view.window->findChild<QObject *>("aiPanel");QVERIFY(panel);QVERIFY(QMetaObject::invokeMethod(panel,"prepare"));QTRY_VERIFY(reader->aiState().contains("plan"));QTRY_COMPARE(reader->pendingCommands(),0);const auto foreground=reader->aiState().value("plan").toMap();
-        QVERIFY(reader->startDocumentReading("local",plan,state.value("token").toString()));QTRY_COMPARE(server.requests.size(),1);QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("reading"));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->startAi("local",foreground));QTRY_VERIFY(!reader->aiState().value("running").toBool());QCOMPARE(server.requests.size(),2);QVERIFY(reader->aiState().value("output").toString().contains("Foreground answer"));QCOMPARE(reader->documentReading().value("phase").toString(),QString("reading"));QVERIFY(!reader->documentReading().value("ready").toBool());
-        const auto sent=server.requests[1].mid(server.requests[1].indexOf("\r\n\r\n")+4);QCOMPARE(sent,foreground.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8());QVERIFY(!sent.contains("PARTIAL_READING"));
+        QVERIFY(QMetaObject::invokeMethod(view.window,"openDocumentReading"));QVERIFY(QMetaObject::invokeMethod(reading,"prepare"));QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("preview"));QTRY_COMPARE(reader->pendingCommands(),0);const auto state=reader->documentReading(),plan=state.value("plan").toMap();
+        QVERIFY(reader->startDocumentReading("local",plan,state.value("token").toString()));QTRY_COMPARE(server.requests.size(),1);QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("reading"));QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(reader->startAi("local",foreground));QTRY_VERIFY(!reader->aiState().value("running").toBool() && !reader->pendingCommands());
+        QCOMPARE(server.requests.size(),1);QVERIFY(reader->aiState().value("status").toString().contains("Document prereading is in progress"));
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTest::qWait(60);QCOMPARE(server.requests.size(),1);
+        QCOMPARE(reader->documentReading().value("phase").toString(),QString("reading"));QVERIFY(!reader->documentReading().value("ready").toBool());
+        QVERIFY(view.window->property("operationStatus").toString().contains("Document prereading is in progress"));
+
         const auto other=scratch.path()+"/other-tab.pdf";QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",other));view.workspace.openFile(QUrl::fromLocalFile(other));QTRY_VERIFY(view.workspace.activeReader()!=reader);QTRY_COMPARE(view.workspace.activeReader()->pageCount(),1);QTRY_COMPARE(view.workspace.activeReader()->pendingCommands(),0);QCOMPARE(reader->documentReading().value("phase").toString(),QString("reading"));QVERIFY(!view.workspace.activeReader()->documentReading().value("ready").toBool());QVERIFY(!reading->property("visible").toBool());
-        reader->stopDocumentReading();QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("idle"));QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->startDocumentReading("local",plan,state.value("token").toString()));QCOMPARE(server.requests.size(),2);QVERIFY(reader->error().isEmpty());QVERIFY(!reader->hasUnsavedChanges());
+        reader->stopDocumentReading();QTRY_COMPARE(reader->documentReading().value("phase").toString(),QString("idle"));QTRY_COMPARE_WITH_TIMEOUT(server.activeConnections(),0,10000);QTRY_COMPARE(reader->pendingCommands(),0);QVERIFY(!reader->startDocumentReading("local",plan,state.value("token").toString()));QCOMPARE(server.requests.size(),1);QVERIFY(reader->error().isEmpty());QVERIFY(!reader->hasUnsavedChanges());
         QDirIterator files(cache,{"document-knowledge-v1.json"},QDir::Files,QDirIterator::Subdirectories);QVERIFY(!files.hasNext());
     }
     void documentReadingConsolidatesExactBodiesCachesAndEnrichesOnlyNewPreviews() {
@@ -11843,6 +12107,7 @@ QtObject {
         QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:|Unable to assign).*"));
         ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;QSettings stored;
         stored.setValue("reader/preferences/aiReviewBeforeSending",reviewEnabled);
+        stored.setValue("reader/preferences/aiPrereadingPolicy",QByteArray(QTest::currentDataTag())=="sidebar-review"?QVariant(QVariantMap{{"future",true}}):QVariant("ask"));
         stored.setValue("chatGptPlan/connectionMode","apiKey");stored.remove("chatGptPlan/accounts");stored.sync();QVERIFY(ChatGptAccounts::instance()->refreshConnection());
         MockChatServer server;QVERIFY(server.listen());QTemporaryDir scratch;
         const auto path=scratch.filePath("synthetic-note-workflow.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));

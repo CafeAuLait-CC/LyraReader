@@ -131,6 +131,9 @@ public:
     Q_INVOKABLE void prepareDocumentReading(const QVariantMap &request);
     Q_INVOKABLE bool startDocumentReading(const QString &key,const QVariantMap &plan,const QString &token);
     Q_INVOKABLE void stopDocumentReading();
+    Q_INVOKABLE void skipDocumentReading();
+    Q_PROPERTY(QString documentReadingRevision READ documentReadingRevision NOTIFY documentReadingChanged)
+    QString documentReadingRevision() const { return QString::number(m_readingRevision); }
     Q_INVOKABLE void invalidateDocumentReadingPreview();
     Q_INVOKABLE void dismissDocumentReadingChoice();
     QVariantMap aiRegion()const{return m_aiRegion;}
@@ -430,6 +433,7 @@ private:
     QString m_aiSummaryPreviewUnitId,m_aiSummaryPreviewLanguage;
     bool startAiWithCredential(const QString &key,const QVariantMap &expectedPlan);
     bool startDocumentReadingWithCredential(const QString &key,const QVariantMap &plan,const QString &token);
+    quint64 m_readingRevision=0;
     quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
     QString m_aiPreviewNoteId;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
