@@ -74,7 +74,8 @@ pub fn document_index_cache_path(document: &std::path::Path) -> std::path::PathB
 /// earlier libraries reject the new profile. Version 5 adds shared document analysis handles
 /// and cache-input usage to the matching UniFFI control plane. Version 6 adds saved task
 /// history queries and validated selection replay.
-pub const ABI_VERSION: u32 = 7;
+/// Version 8 adds the shared native citation-card heading rule.
+pub const ABI_VERSION: u32 = 8;
 
 /// Blend mode values in the `blend_modes` array of [`lyra_reader_surface_draw_pages`].
 ///

@@ -312,10 +312,15 @@ impl RenderSource {
             "page_targets" => Ok(
                 json!({"links":self.engine.links(page()?).map_err(|e|e.to_string())?,"citations":self.engine.citations(page()?).map_err(|e|e.to_string())?,"mentions":self.engine.caption_mentions(page()?).map_err(|e|e.to_string())?}),
             ),
-            "resolve_citations" => value(self.engine.resolve_citations_on(
-                page()?,
-                serde_json::from_value(request["labels"].clone()).map_err(|e| e.to_string())?,
-            )),
+            "resolve_citations" => crate::document::reference_preview_value(
+                self.engine
+                    .resolve_citations_on(
+                        page()?,
+                        serde_json::from_value(request["labels"].clone())
+                            .map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?,
+            ),
             "references" => value(self.engine.references()),
             "figures" => value(self.engine.figures()),
             _ => Err("Unknown render snapshot query".into()),

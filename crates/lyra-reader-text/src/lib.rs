@@ -27,6 +27,7 @@ mod note_markers;
 mod numbered;
 mod paren;
 mod passages;
+mod preview;
 mod selection;
 mod superscript;
 pub mod tables;
@@ -48,6 +49,7 @@ pub use paren::{ParenthesisedCandidate, inspect_parenthesised_citations};
 pub use passages::{
     AnnotationTextMap, MAX_PASSAGE_GLYPHS, PassageCluster, PassageRange, cluster_passages,
 };
+pub use preview::reference_preview_title;
 pub use selection::{
     MAX_REGION_TEXT_CHARS, SelectionLayout, SelectionLine, SelectionStop, SelectionTextPage,
     is_swift_whitespace, is_swift_whitespace_or_newline, normalize_copied_text, region_text,

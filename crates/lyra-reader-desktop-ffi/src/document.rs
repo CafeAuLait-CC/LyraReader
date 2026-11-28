@@ -276,6 +276,22 @@ fn value<T: Serialize>(result: Result<T, LyraReaderFfiError>) -> Result<Value, S
     serde_json::to_value(result.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+pub(super) fn reference_preview_value(resolved: Vec<ResolvedReference>) -> Result<Value, String> {
+    // Decorate only the disposable preview response, never the index/cache record format.
+    let mut rows = Vec::with_capacity(resolved.len());
+    for entry in resolved {
+        let heading = lyra_reader_text::reference_preview_title(&entry.reference.text);
+        let mut row = serde_json::to_value(&entry).map_err(|error| error.to_string())?;
+        let reference = row
+            .get_mut("reference")
+            .and_then(Value::as_object_mut)
+            .ok_or("The resolved reference did not serialize as a reference record")?;
+        reference.insert("heading".into(), json!(heading));
+        rows.push(row);
+    }
+    Ok(Value::Array(rows))
+}
+
 pub(super) fn render_reviewed_plan(
     result: Result<AiPlanRecord, LyraReaderFfiError>,
     account: Option<&str>,
@@ -971,7 +987,10 @@ impl DesktopDocument {
             "references" => value(d.references()),
             "figures" => value(d.figures()),
             "resolve_citations" => {
-                value(d.resolve_citations_on(arg(&r, "page")?, arg(&r, "labels")?))
+                let resolved = d
+                    .resolve_citations_on(arg(&r, "page")?, arg(&r, "labels")?)
+                    .map_err(|error| error.to_string())?;
+                reference_preview_value(resolved)
             }
             "rotations" => value(d.page_rotations()),
             "index_report" => {
@@ -1657,6 +1676,56 @@ impl DesktopDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn citation_heading_decorates_only_the_preview_response() {
+        let text = "[12] A. Author. A useful research title. Example Journal, 2024.";
+        let resolved = ResolvedReference {
+            reference: ReferenceRecord {
+                label: "12".into(),
+                text: text.into(),
+                page: 2,
+                x_pt: 10.0,
+                y_pt: 20.0,
+                width_pt: 200.0,
+                height_pt: 30.0,
+                fragments: Vec::new(),
+            },
+            list_index: 1,
+            list_count: 2,
+            list_heading: Some("References".into()),
+            list_first_page: Some(2),
+            list_last_page: Some(4),
+            document_wide: false,
+            reason: "Same section".into(),
+            ambiguous: false,
+        };
+        let original = serde_json::to_value(&resolved).unwrap();
+        let mut preview = reference_preview_value(vec![resolved.clone()]).unwrap();
+        assert_eq!(
+            preview[0]["reference"]["heading"],
+            "A useful research title."
+        );
+        assert_eq!(preview[0]["reference"]["text"], text);
+        preview[0]["reference"]
+            .as_object_mut()
+            .unwrap()
+            .remove("heading");
+        assert_eq!(preview[0], original);
+        assert!(
+            !serde_json::to_value(&resolved.reference)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("heading")
+        );
+        let mut unstructured = resolved;
+        unstructured.reference.text = "An unstructured citation".into();
+        assert!(
+            reference_preview_value(vec![unstructured]).unwrap()[0]["reference"]["heading"]
+                .is_null()
+        );
+    }
 
     #[test]
     fn inserted_paper_packet_keeps_source_pages_and_facing_partners_unchanged() {

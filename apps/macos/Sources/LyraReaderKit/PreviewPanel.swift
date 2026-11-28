@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import LyraReaderBindings
 
 // MARK: - Placement and limits
 
@@ -183,25 +184,7 @@ public enum ReferencePreviewLayout {
     /// Initials and common author suffixes do not split a sentence. Unstructured entries keep
     /// a neutral heading instead of inventing bibliographic metadata.
     public static func citationTitle(from raw: String) -> String? {
-        let text = raw.replacingOccurrences(of: #"^\s*\[?\d+\]?\.?\s+"#,
-                                           with: "", options: .regularExpression)
-        guard let regex = try? NSRegularExpression(pattern: #"[.!?](?=\s+\S|$)"#) else { return nil }
-        let ns = text as NSString
-        let boundaries = regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).filter { match in
-            let prefix = ns.substring(to: match.range.location)
-            let token = prefix.components(separatedBy: .whitespacesAndNewlines).last ?? ""
-            if ["Jr", "Sr", "Dr", "Prof", "vs", "e.g", "i.e"].contains(token) { return false }
-            if token.range(of: #"^(?:[A-Z]\.)*[A-Z]$"#, options: .regularExpression) != nil { return false }
-            return true
-        }
-        guard boundaries.count >= 2 else { return nil }
-        let start = boundaries[0].range.location + 1
-        let end = boundaries[1].range.location + 1
-        let title = ns.substring(with: NSRange(location: start, length: end - start))
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard title.split(whereSeparator: \.isWhitespace).count >= 3, title.count <= 400,
-              !title.lowercased().hasPrefix("in "), !title.lowercased().hasPrefix("proceedings ") else { return nil }
-        return title
+        referencePreviewTitle(raw: raw)
     }
 
     /// Height of `text` wrapped to `widthPt`, in points.

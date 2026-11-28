@@ -19,6 +19,12 @@
 //!
 //! The divergence is intentional and tested; see the module tests at the bottom.
 
+/// Conservative paper-title heading; the complete citation remains unchanged.
+#[uniffi::export]
+pub fn reference_preview_title(raw: String) -> Option<String> {
+    lyra_reader_text::reference_preview_title(&raw).map(str::to_owned)
+}
+
 /// `Page 3`, `Pages 1-3`, `Pages 1, 3, 5` for 1-based pages.
 ///
 /// This is the AI preview grammar. Pages are sorted and de-duplicated; a fully contiguous run

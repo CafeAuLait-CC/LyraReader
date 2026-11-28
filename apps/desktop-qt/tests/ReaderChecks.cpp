@@ -3605,6 +3605,77 @@ private slots:
         crop->setPaperAppearance("original");window.setColor(Qt::white);QTest::qWait(120);QVERIFY(std::abs(sample(8).red()-127)<=2);const auto saturated=sample(5);QVERIFY(std::abs(saturated.red()-255)<=1 && saturated.green()<=1 && saturated.blue()<=1);
         QVERIFY(window.close());
     }
+    void referencePreviewTypographyFollowsTheCitationCard_data() {
+        QTest::addColumn<QString>("appearance");QTest::addColumn<int>("panelWidth");
+        QTest::newRow("light")<<QString("light")<<520;
+        QTest::newRow("dark")<<QString("dark")<<520;
+        QTest::newRow("light-narrow")<<QString("light")<<320;
+        QTest::newRow("dark-narrow")<<QString("dark")<<320;
+    }
+    void referencePreviewTypographyFollowsTheCitationCard() {
+        QFETCH(QString,appearance);QFETCH(int,panelWidth);
+        NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
+        window->setProperty("appearance",appearance);
+        auto *panel=window->findChild<QObject *>("referencePreviewPanel");QVERIFY(panel);
+        QQmlComponent component(&view.engine);component.setData(R"(
+            import QtQuick
+            QtObject {
+                property var model: ({})
+                property bool visible: true
+                property bool pinned: false
+                property rect anchor: Qt.rect(20,20,10,10)
+                property int selectedEntry: -1
+                property int jumps: 0
+                signal changed()
+                function imageSegments(width,dpr,paper) { return []; }
+                function showEntry(index) { selectedEntry = index; }
+                function jump() { ++jumps; }
+                function close() { visible = false; changed(); }
+            })",QUrl());
+        auto *controller=component.create();QVERIFY2(controller,qPrintable(component.errorString()));controller->setParent(&view.engine);
+        QVERIFY(QQmlProperty::write(panel,"controller",QVariant::fromValue(controller)));
+        const QString title="A useful research title with <literal> text.";
+        const QString citation="[12] A. Author and B. Writer. "+title+" Journal, 2024.";
+        controller->setProperty("model",QVariantMap{{"kind","reference"},{"title","[12]"},{"page",2},{"from_page",0},{"entries",QVariantList{QVariantMap{{"label","12"},{"page",2},{"heading",title},{"text",citation}}}}});
+        QVERIFY(QMetaObject::invokeMethod(controller,"changed"));QTRY_VERIFY(panel->property("opened").toBool());panel->setProperty("preferredWidth",panelWidth);
+        auto *heading=visualItem(window->contentItem(),"referenceEntryHeading0");QVERIFY(heading);
+        QCOMPARE(heading->property("text").toString(),title);
+        QCOMPARE(heading->property("textFormat").toInt(),int(Qt::PlainText));
+        const QFont headingFont=qvariant_cast<QFont>(heading->property("font"));QCOMPARE(headingFont.pixelSize(),14);QCOMPARE(headingFont.weight(),QFont::DemiBold);
+        auto *colors=window->property("colors").value<QObject *>();QVERIFY(colors);QCOMPARE(heading->property("color").value<QColor>(),colors->property("accent").value<QColor>());
+        auto *body=visibleReadOnlyText(window->contentItem(),citation);QVERIFY(body);
+        QCOMPARE(qvariant_cast<QFont>(body->property("font")).pixelSize(),12);QCOMPARE(body->property("color").value<QColor>(),colors->property("textSecondary").value<QColor>());
+        QCOMPARE(body->property("leftPadding").toDouble(),0.0);
+        QTRY_VERIFY(qAbs(body->mapToScene(QPointF()).x()-heading->mapToScene(QPointF()).x())<.5);
+        QTRY_VERIFY(qAbs(body->width()-heading->width())<.5);
+        auto *copy=visualItem(window->contentItem(),"referenceEntryCopy0");QVERIFY(copy);QVERIFY(copy->mapToScene(QPointF()).x()>=heading->mapToScene(QPointF(heading->width(),0)).x());
+        auto *back=visualItem(window->contentItem(),"previewBack"),*close=visualItem(window->contentItem(),"previewClose"),*page=visualItem(window->contentItem(),"previewPageLink"),*bibtex=visualItem(window->contentItem(),"previewBibtex"),*jump=visualItem(window->contentItem(),"previewGoToPage");
+        QVERIFY(back && close && page && bibtex && jump);QVERIFY(bibtex->isVisible());
+        QVERIFY(back->mapToScene(QPointF()).y()<page->mapToScene(QPointF()).y());QVERIFY(bibtex->mapToScene(QPointF()).x()<jump->mapToScene(QPointF()).x());
+        const auto *popup=panel->property("contentItem").value<QQuickItem *>();QVERIFY(popup);
+        const auto contained=[&](QQuickItem *control) {
+            const auto popupBounds=popup->mapRectToScene(QRectF(0,0,popup->width(),popup->height()));
+            return popupBounds.adjusted(-.5,-.5,.5,.5).contains(control->mapRectToScene(QRectF(0,0,control->width(),control->height())));
+        };
+        for(auto *control:{back,close,page,bibtex,jump,copy}) {
+            QTRY_VERIFY2(contained(control),qPrintable(control->objectName()+" extends beyond the citation card"));
+        }
+        QVERIFY(QMetaObject::invokeMethod(heading->parentItem(),"clicked"));QCOMPARE(controller->property("selectedEntry").toInt(),0);
+        QVERIFY(QMetaObject::invokeMethod(page,"clicked"));QCOMPARE(controller->property("jumps").toInt(),1);
+        QVERIFY(QMetaObject::invokeMethod(copy,"clicked"));
+        auto *copyMenu=copy->findChild<QObject *>("referenceEntryCopyMenu0");QVERIFY(copyMenu);QTRY_VERIFY(copyMenu->property("opened").toBool());
+        auto *copyText=copy->findChild<QObject *>("referenceCopyText0"),*copyBibtex=copy->findChild<QObject *>("referenceCopyBibtex0");QVERIFY(copyText && copyBibtex);QVERIFY(!copyBibtex->property("enabled").toBool());
+        QVERIFY(QMetaObject::invokeMethod(copyText,"triggered"));QCOMPARE(QGuiApplication::clipboard()->text(),citation);QVERIFY(QMetaObject::invokeMethod(copyMenu,"close"));
+        auto *controls=visualItem(window->contentItem(),"previewControls");QVERIFY(controls);controls->forceActiveFocus(Qt::TabFocusReason);QTRY_VERIFY(controls->hasActiveFocus());
+        QTest::keyClick(window,Qt::Key_F10,Qt::ShiftModifier);
+        auto *additional=panel->findChild<QObject *>("previewAdditionalActions");QVERIFY(additional);QTRY_VERIFY(additional->property("opened").toBool());
+        QTest::keyClick(window,Qt::Key_Escape);QTRY_VERIFY(!additional->property("visible").toBool());QVERIFY(panel->property("visible").toBool());
+        const auto directory=qEnvironmentVariable("LYRA_READER_CHECK_SNAPSHOTS");if(!directory.isEmpty())QVERIFY(window->grabWindow().save(directory+"/preview-citation-"+appearance+"-"+QString::number(panelWidth)+".png"));
+        controller->setProperty("model",QVariantMap{{"kind","reference"},{"title","[13]"},{"page",2},{"entries",QVariantList{QVariantMap{{"label","13"},{"heading",QVariant()},{"text","Unstructured citation"}}}}});
+        QVERIFY(QMetaObject::invokeMethod(controller,"changed"));
+        QTRY_VERIFY(visualItem(window->contentItem(),"referenceEntryHeading0"));heading=visualItem(window->contentItem(),"referenceEntryHeading0");QCOMPARE(heading->property("text").toString(),QString("Reference"));QCOMPARE(heading->property("color").value<QColor>(),colors->property("textPrimary").value<QColor>());
+        QVERIFY(QMetaObject::invokeMethod(close,"clicked"));QTRY_VERIFY(!panel->property("visible").toBool());
+    }
     void referencePreviewAutoSizingUsesBodyAndHonoursManualSize() {
         NativeCorpus::Viewer view;QVERIFY(view.window);auto *window=view.window;
         auto *panel=window->findChild<QObject *>("referencePreviewPanel");QVERIFY(panel);
@@ -3622,9 +3693,9 @@ private slots:
         QVERIFY(QQmlProperty::write(panel,"controller",QVariant::fromValue(controller)));
         const auto entry=[](int index,const QString &text){return QVariantMap{{"label",QString::number(index)},{"page",0},{"text",text}};};
         const auto show=[&](const QVariantList &entries,const QString &title){controller->setProperty("model",QVariantMap{{"kind","reference"},{"title",title},{"page",0},{"entries",entries}});return QMetaObject::invokeMethod(controller,"changed");};
-        auto literal=entry(1,"A short citation.");literal.insert("label","<b>1</b>");
+        auto literal=entry(1,"A short citation.");literal.insert("label","<b>1</b>");literal.insert("heading","A literal <b>title</b>");
         QVERIFY(show({literal},"One"));QTRY_VERIFY(panel->property("opened").toBool());QTest::qWait(50);
-        auto *heading=visualItem(window->contentItem(),"referenceEntryHeading0");QVERIFY(heading);QCOMPARE(heading->property("textFormat").toInt(),int(Qt::PlainText));QVERIFY(heading->property("text").toString().contains("<b>1</b>"));
+        auto *heading=visualItem(window->contentItem(),"referenceEntryHeading0");QVERIFY(heading);QCOMPARE(heading->property("textFormat").toInt(),int(Qt::PlainText));QCOMPARE(heading->property("text").toString(),QString("A literal <b>title</b>"));
         const double shortHeight=panel->property("height").toDouble();QVERIFY2(shortHeight>=120 && shortHeight<200,qPrintable(QString("Short citation height %1").arg(shortHeight)));
         auto *reference=visibleReadOnlyText(window->contentItem(),"A short citation.");verifyReadOnlyKeyboard(window,reference);QVERIFY(!QTest::currentTestFailed());
         QVERIFY(show({entry(1,"First entry."),entry(2,"Second entry."),entry(3,"Third entry.")},"Three"));QTest::qWait(60);
@@ -3644,6 +3715,10 @@ private slots:
         preview->openAt(reader,0,125,y,320,200,1);QTRY_VERIFY_WITH_TIMEOUT(preview->visible(),10000);QCOMPARE(preview->model().value("kind").toString(),QString("figure"));
         auto *panel=window->findChild<QObject *>("referencePreviewPanel");QVERIFY(panel);QTRY_VERIFY_WITH_TIMEOUT(view.cropReady(),10000);
         auto *crop=visualItem(window->contentItem(),"referencePreviewImage");QVERIFY(crop);const auto before=crop->property("source").toUrl();
+        auto *popupBody=panel->property("contentItem").value<QQuickItem *>();QVERIFY(popupBody);
+        const auto imageBounds=crop->mapRectToScene(QRectF(0,0,crop->width(),crop->height()));
+        const auto panelBounds=popupBody->mapRectToScene(QRectF(0,0,popupBody->width(),popupBody->height()));
+        QVERIFY(imageBounds.left()>=panelBounds.left());QVERIFY(imageBounds.right()<=panelBounds.right());
         QVERIFY(preview->imageSegments(500,std::numeric_limits<double>::quiet_NaN(),"original").isEmpty());QVERIFY(preview->imageSegments(500,0,"original").isEmpty());
         const double width=panel->property("preferredWidth").toDouble(),rasterWidth=panel->property("rasterWidth").toDouble(),actualWidth=crop->width();
         panel->setProperty("preferredWidth",width+.5);QTest::qWait(120);
@@ -12895,6 +12970,7 @@ QtObject {
         QTRY_VERIFY_WITH_TIMEOUT(reader->pageCount()==2 && !reader->loading() && !reader->pendingCommands(),10000);QTRY_VERIFY(!window->property("positionRestoring").toBool());
         reader->submit("citations",{{"page",0}});QTRY_COMPARE(reader->pendingCommands(),0);const auto citations=reader->data().value("citations").toList();QCOMPARE(citations.size(),4);
         reader->submit("links",{{"page",0}});QTRY_COMPARE(reader->pendingCommands(),0);const auto links=reader->data().value("links").toList();QCOMPARE(links.size(),2);
+        const QStringList expectedTitles{"Prediction with a synthetic model.","An autonomous synthetic system.","Do synthetic models need observations.","An imitation baseline."};
         const QList<QStringList> expected{{"Hart 1951"},{"Reed 1988"},{"Quinn 2023","Lane 2024"},{"Vale 2010"}};auto *preview=view.workspace.preview();
         for(qsizetype i=0;i<citations.size();++i){
             const auto hit=citations[i].toMap();const auto x=hit.value("x_pt").toDouble()+hit.value("width_pt").toDouble()/2,y=hit.value("y_pt").toDouble()+hit.value("height_pt").toDouble()/2;
@@ -12902,7 +12978,7 @@ QtObject {
             // The real page-click route must prefer complete reference text to
             // an internal PDF destination on the first click, including cold links.
             QVERIFY(QMetaObject::invokeMethod(window,"pageClicked",Q_ARG(QVariant,0),Q_ARG(QVariant,x),Q_ARG(QVariant,y),Q_ARG(QVariant,320),Q_ARG(QVariant,200)));
-            QTRY_VERIFY_WITH_TIMEOUT(preview->visible() && !preview->loading(),10000);QCOMPARE(window->property("currentPage").toInt(),0);QCOMPARE(preview->model().value("kind").toString(),QString("reference"));
+            QTRY_VERIFY_WITH_TIMEOUT(preview->visible() && !preview->loading(),10000);QCOMPARE(window->property("currentPage").toInt(),0);QCOMPARE(preview->model().value("kind").toString(),QString("reference"));QCOMPARE(preview->model().value("entries").toList().first().toMap().value("heading").toString(),expectedTitles[int(i)]);
             const auto entries=preview->model().value("entries").toList();QCOMPARE(entries.size(),expected[i].size());
             for(qsizetype n=0;n<entries.size();++n){const auto entry=entries[n].toMap();QCOMPARE(entry.value("label").toString(),expected[i][n]);QCOMPARE(entry.value("page").toInt(),1);QVERIFY(entry.value("text").toString().contains("Example"));}
             preview->close();QVERIFY(!preview->visible());
