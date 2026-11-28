@@ -58,6 +58,7 @@ Pane {
         if (reviewTicket) Qt.callLater(finishUiReview);
     }
     onVisibleChanged: if (!visible) {
+        if(summaryIntentOwner){summaryIntentOwner.cancelDocumentSummaryReview();summaryIntentOwner=null;}
         reviewTicket=null;app.cancelAiTaskReview(owner,"assistant");
         if (summaryCatalog) summaryCatalog.close();
         if (selectionSource) selectionSource.close();
@@ -87,6 +88,18 @@ Pane {
     topPadding: workspace === "chat" || referenceSummary || referenceTranslation ? 0 : compact ? 6 : 10
     bottomPadding: workspace === "chat" || referenceSummary || referenceTranslation ? 0 : compact ? 6 : 10
     background: Rectangle { color: app.colors.panelBg }
+    property var summaryIntentOwner:null
+    function retireUnavailableSummary() {
+        if(summaryIntentOwner && !app.aiTaskUiAvailable()) {
+            summaryIntentOwner.cancelDocumentSummaryReview();summaryIntentOwner=null;
+        }
+    }
+    Connections {
+        target:aiPanel.app
+        function onCloseApprovedChanged(){aiPanel.retireUnavailableSummary();}
+        function onCloseOperationChanged(){aiPanel.retireUnavailableSummary();}
+        function onClosingTabChanged(){aiPanel.retireUnavailableSummary();}
+    }
     property var reviewTicket: null
     property var keepTicket: null
     property string lastKeptNoteId: ""
@@ -106,6 +119,7 @@ Pane {
     }
     function prepareFromUi() {
         if(running){owner.cancelAi();return;}
+        if(wholeSummary && previewReady && owner.ownsDocumentSummary(plan)){prepareTaskFromUi();return;}
         const reader=owner,generation=ownerGeneration,view=workspace,snapshot=JSON.stringify(input);
         const kind=view==="summary" ? "summary" : view==="translation" ? "translation" : "question";
         app.requestAiTaskFromUi(reader,kind,function(){
@@ -116,10 +130,10 @@ Pane {
         if (workspace !== "chat" && !referenceSummary && !referenceTranslation) { prepare(); return; }
         if (running) { owner.cancelAi(); return; }
         const selectedTask = selectedSummary || (referenceTranslation && !translateDocument);
-        if (previewReady && (!selectedTask || sameRange(preparedRange, liveRange))) { app.dispatchAiTaskFromUi(owner,plan); return; }
+        if (previewReady && (!wholeSummary || owner.ownsDocumentSummary(plan)) && (!selectedTask || sameRange(preparedRange, liveRange))) { app.dispatchAiTaskFromUi(owner,plan); return; }
         reviewTicket = {reader: owner, generation: ownerGeneration, view: workspace, question: input.question || "",
             selectionBound:selectedTask, range:liveRange, workflowRevision:app.aiReviewRevision};
-        prepare();
+        prepareTask(wholeSummary);
         Qt.callLater(finishUiReview);
     }
     function finishUiReview() {
@@ -197,6 +211,7 @@ Pane {
         owner.prepareAi(request, {}, {kind: "note", detail: "Standard", id: noteId});
     }
     onWorkspaceChanged: {
+        if(workspace!=="summary" && summaryIntentOwner){summaryIntentOwner.cancelDocumentSummaryReview();summaryIntentOwner=null;}
         app.cancelAiTaskReview(owner,"assistant");
         taskHistoryShown = false; reviewTicket = null;
         if (chatHistory && workspace !== "chat") chatHistory.close();
@@ -221,6 +236,7 @@ Pane {
         return !!a && !!b && a.page === b.page && a.start === b.start && a.end === b.end;
     }
     function resetSourceView() {
+        if(summaryIntentOwner){summaryIntentOwner.cancelDocumentSummaryReview();summaryIntentOwner=null;}
         if (locateContext) cancelLocate();
         taskHistoryShown = false; reviewTicket = null; keepTicket = null; lastKeptNoteId = "";
         dismissNotice();
@@ -310,7 +326,8 @@ Pane {
         if (accounts && !connectChatGpt(request, accounts, accounts.useForLayeredSummaries)) return;
         owner.prepareSummaryBatch(layer, offset, request, owner.documentGeneration, index === undefined ? -1 : index);
     }
-    function prepare() {
+    function prepare() {prepareTask(false);}
+    function prepareTask(ownedSummary) {
         if (batchMode) { prepareBatch(batchState.layer, batchState.offset); return; }
         if (unitMode) { prepareUnit(summaryUnit.id); return; }
         const modes = ["SummarizePage", "SummarizeDocument", "AskSelection", "TranslateSelection", "DocumentChat", "SummarizeSelection"];
@@ -330,8 +347,11 @@ Pane {
             if (wholeSummary) request.selection = null;
             if (accounts && !connectChatGpt(request, accounts, selectedSummary ? accounts.useForSelection : accounts.useForWholeDocument)) return;
             request.language = input.summaryLanguage || null;
-            owner.prepareAi(request, {}, {kind: "summary", detail: summaryDetail,
-                force: referenceSummary && !!summaryTaskLoader.item && summaryTaskLoader.item.hasResult});
+            const reading={kind:"summary",detail:summaryDetail,
+                force:referenceSummary && !!summaryTaskLoader.item && summaryTaskLoader.item.hasResult};
+            if(wholeSummary && ownedSummary===true) {
+                summaryIntentOwner=owner;owner.prepareDocumentSummary(request,reading);
+            } else owner.prepareAi(request,{},reading);
         }
         else {
             const request = baseRequest(modes[action]);

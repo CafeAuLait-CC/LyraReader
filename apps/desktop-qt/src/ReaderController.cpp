@@ -389,16 +389,19 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
     if(mutation)++m_mutationSequence;
     const auto mutationSequence=m_mutationSequence;
     const auto generation = m_generation;
+    const bool summaryOrderedPreview=operation==QStringLiteral("ai_preview") && m_aiSummaryCancelId;
+    const bool admittingSummary=operation==QStringLiteral("ai_summary_review_prepare");
     const bool admittingAi=operation==QStringLiteral("ai_start") && m_aiState.value(QStringLiteral("running")).toBool();
     const auto previewEpoch=m_aiPreviewEpoch;
-    const bool latestOnly=operation==QStringLiteral("translation_prepare") || operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
+    const bool latestOnly=operation==QStringLiteral("translation_prepare") || operation==QStringLiteral("ai_summary_cached") || operation==QStringLiteral("search") || operation==QStringLiteral("bibtex") || operation==QStringLiteral("layout") || operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_review_prepare") || operation==QStringLiteral("ai_summary_catalog") || operation==QStringLiteral("ai_summary_inspect") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_batch_prepare") || operation==QStringLiteral("split_plan") || operation==QStringLiteral("content_objects");
     if(latestOnly)m_latestRead.insert(operation,id);
     if(changesRevision)++m_revisionCommands;
     ++m_pendingCommands;
     QPointer<ReaderController> alive(this);emit commandsChanged();if(!alive)return 0;
     // A direct UI listener can retire the reviewed connection before work is queued.
-    if(admittingAi && (document!=m_document || generation!=m_generation || previewEpoch!=m_aiPreviewEpoch
-                      || m_aiState.value(QStringLiteral("cancelRequested")).toBool())) {
+    if((admittingAi || admittingSummary) && (document!=m_document || generation!=m_generation || previewEpoch!=m_aiPreviewEpoch
+                      || (admittingAi && m_aiState.value(QStringLiteral("cancelRequested")).toBool())
+                      || (admittingSummary && (m_aiSummaryOwner.isEmpty() || m_aiSummaryOwner!=arguments.value(QStringLiteral("owner")).toString())))) {
         --m_pendingCommands;
         emit commandsChanged();
         return 0;
@@ -529,7 +532,7 @@ quint64 ReaderController::submitWithId(quint64 id,const QString &operation,const
         return result;
     };
     const bool regionWrite=operation.startsWith(QStringLiteral("region_")) && operation!=QStringLiteral("region_get") && operation!=QStringLiteral("region_list") && operation!=QStringLiteral("region_thumbnail") && operation!=QStringLiteral("region_reopen");
-    if(mutation || regionWrite || eraseControl || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel") || operation==QStringLiteral("knowledge_skip")){
+    if(mutation || regionWrite || eraseControl || summaryOrderedPreview || operation.startsWith(QStringLiteral("ai_summary_review_")) || operation==QStringLiteral("ai_start") || operation==QStringLiteral("ai_cancel") || operation==QStringLiteral("knowledge_start") || operation==QStringLiteral("knowledge_cancel") || operation==QStringLiteral("knowledge_skip")){
         auto promise=std::make_shared<QPromise<CommandResult>>();promise->start();watcher->setFuture(promise->future());
         m_mutations->append([task,promise]{try{promise->addResult(task());}catch(...){promise->addResult(CommandResult{{},QStringLiteral("The command worker stopped unexpectedly.")});}promise->finish();});
     }else watcher->setFuture(QtConcurrent::run(std::move(task)));

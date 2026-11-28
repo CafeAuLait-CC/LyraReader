@@ -62,6 +62,7 @@
 #include <QJSValue>
 #include <QUrlQuery>
 #include <QInputMethodEvent>
+#include <QKeyEvent>
 #include <QDragEnterEvent>
 #include <QMimeData>
 #include <QQmlExpression>
@@ -539,7 +540,16 @@ private slots:
         QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));auto *choice=window->findChild<QObject *>("documentReadingPopup");QVERIFY(choice);
         QTRY_VERIFY(choice->property("opened").toBool());QCOMPARE(server.requests.size(),1);
         if(retry) {
-            QVERIFY(QMetaObject::invokeMethod(choice,"prepare"));QTRY_VERIFY(reader->documentReading().value("ready").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            auto *retryButton=window->findChild<QQuickItem *>("previewDocumentReading");QVERIFY(retryButton);
+            // The real Retry control stays disabled while deferred local work is
+            // pending. Do not bypass its admission by invoking prepare directly.
+            QTRY_VERIFY2(retryButton->isVisible() && retryButton->isEnabled(),qPrintable(QString("Retry admission: %1; pending=%2; %3")
+                .arg(reader->documentReading().value("phase").toString()).arg(reader->pendingCommands()).arg(window->property("operationStatus").toString())));
+            QVERIFY(QMetaObject::invokeMethod(retryButton,"clicked"));
+            QTRY_VERIFY2(reader->documentReading().value("ready").toBool(),qPrintable(QString("Retry result: %1; pending=%2; %3; %4")
+                .arg(reader->documentReading().value("phase").toString()).arg(reader->pendingCommands())
+                .arg(reader->documentReading().value("message").toString()).arg(window->property("operationStatus").toString())));
+            QTRY_COMPARE(reader->pendingCommands(),0);
             QTest::qWait(60);QCOMPARE(server.requests.size(),2);QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));
         } else QVERIFY(QMetaObject::invokeMethod(choice,"continueWithout"));
         QTRY_COMPARE(server.requests.size(),retry?3:2);QTRY_VERIFY(!reader->aiState().value("running").toBool() && !reader->pendingCommands());
@@ -2942,10 +2952,56 @@ private slots:
             if(!QTest::qWaitFor([&]{return button->hasActiveFocus() && host->activeFocusItem()==button;},3000)) {
                 qInfo()<<"Review activation: item focus did not settle"<<button<<host->activeFocusItem();return false;
             }
+            QSignalSpy rendered(host,&QQuickWindow::frameSwapped);host->update();
+            if(!QTest::qWaitFor([&]{return !rendered.isEmpty();},3000)) {
+                qInfo()<<"Review activation: focused host has no scene frame"<<host;return false;
+            }
+            if(!QTest::qWaitFor([&]{return button->isVisible() && button->isEnabled()
+                    && button->hasActiveFocus() && host->activeFocusItem()==button
+                    && QGuiApplication::focusWindow()==host;},3000)) {
+                qInfo()<<"Review activation: focused control is not ready for input"<<button
+                    <<button->isVisible()<<button->isEnabled()<<reader->pendingCommands();return false;
+            }
+            class KeyDelivery : public QObject {
+            public:
+                QStringList events;
+                bool eventFilter(QObject *target,QEvent *event) override {
+                    if(event->type()==QEvent::KeyPress || event->type()==QEvent::KeyRelease || event->type()==QEvent::ShortcutOverride) {
+                        const auto *key=static_cast<QKeyEvent *>(event);
+                        events.append(QStringLiteral("%1:%2:%3:%4").arg(target->objectName()).arg(int(event->type())).arg(key->key()).arg(key->isAutoRepeat()));
+                    }
+                    return false;
+                }
+            } delivery;
+            host->installEventFilter(&delivery);button->installEventFilter(&delivery);
+            connect(button,&QQuickItem::activeFocusChanged,&delivery,[&]{delivery.events.append(QStringLiteral("item-focus:%1").arg(button->hasActiveFocus()));});
+            connect(button,&QQuickItem::enabledChanged,&delivery,[&]{delivery.events.append(QStringLiteral("item-enabled:%1").arg(button->isEnabled()));});
+            connect(host,&QWindow::activeChanged,&delivery,[&]{delivery.events.append(QStringLiteral("window-active:%1").arg(host->isActive()));});
+            connect(host,&QQuickWindow::activeFocusItemChanged,&delivery,[&]{delivery.events.append(QStringLiteral("window-focus:%1").arg(host->activeFocusItem()?host->activeFocusItem()->objectName():QStringLiteral("none")));});
+            QSignalSpy pressed(button,SIGNAL(pressed()));
+            QSignalSpy released(button,SIGNAL(released()));
             QSignalSpy clicked(button,SIGNAL(clicked()));
-            QTest::keyClick(host,Qt::Key_Space);
+            const bool enabledBefore=button->isEnabled();const auto pendingBefore=reader->pendingCommands();
+            const auto pressedBefore=button->property("pressed"),downBefore=button->property("down");
+            if(button->objectName()==QStringLiteral("prepareAiRequest")) {
+                auto *task=visualItem(host->contentItem(),"aiSummaryTaskScroll");
+                if(!task)return false;
+                // A deferred history query must not cancel a held activation.
+                QTest::keyPress(host,Qt::Key_Space);
+                const bool refreshed=QMetaObject::invokeMethod(task,"refreshMetadata");
+                const bool held=button->isEnabled() && button->hasActiveFocus() && button->property("pressed").toBool();
+                QTest::keyRelease(host,Qt::Key_Space);
+                if(!refreshed || !held) {
+                    qInfo()<<"Review activation: history refresh cancelled held Generate"<<delivery.events;
+                    return false;
+                }
+            } else QTest::keyClick(host,Qt::Key_Space);
             const bool accepted=QTest::qWaitFor([&]{return !clicked.isEmpty();},3000);
-            if(!accepted)qInfo()<<"Review activation: Space did not click the focused control"<<button<<host->activeFocusItem()<<QGuiApplication::focusWindow();
+            if(!accepted)qInfo()<<"Review activation: Space did not click the focused control"<<button<<host->activeFocusItem()<<QGuiApplication::focusWindow()
+                <<"enabled before/after"<<enabledBefore<<button->isEnabled()<<"pending before/after"<<pendingBefore<<reader->pendingCommands()
+                <<"pressed/down before"<<pressedBefore<<downBefore<<"after"<<button->property("pressed")<<button->property("down")
+                <<"reader"<<reader->aiState().value("status")<<"operation"<<window->property("operationStatus")
+                <<"events"<<delivery.events<<"press/release signals"<<pressed.size()<<released.size();
             return accepted;
         };
         QByteArray reviewedBody;
@@ -8377,6 +8433,274 @@ QtObject { property var value: P.sections(Array(300).fill("## Heading\ntext").jo
         QVERIFY(second->reopenAiChat(id));
         QTRY_COMPARE(draft(second),QString("Newer unsent draft from the first window"));
         QCOMPARE(server.requests.size(),0);
+    }
+
+    void ownedSummaryPreparationAndCancellationAllowSynchronousControllerDestruction_data() {
+        QTest::addColumn<QString>("route");
+        for(const auto *route:{"prepare-signal","cancel-command","failure-poll"})QTest::newRow(route)<<QString::fromLatin1(route);
+    }
+    void ownedSummaryPreparationAndCancellationAllowSynchronousControllerDestruction() {
+        QFETCH(QString,route);const bool duringPreparation=route=="prepare-signal";QTemporaryDir scratch;
+        const auto path=scratch.filePath("synthetic-summary-lifetime.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        auto victim=std::make_unique<ReaderController>();QPointer<ReaderController> alive(victim.get());victim->openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE(victim->pageCount(),1);QTRY_COMPARE(victim->pendingCommands(),0);
+        QVariantMap request{{"action","SummarizeDocument"},{"base_url","http://localhost:11434/v1"},{"model","synthetic-lifetime"},
+            {"current_page",0},{"selection",QVariant{}},{"question",QVariant{}},{"language",QVariant{}},{"history",QVariantList{}},{"region",QVariant{}},
+            {"document_knowledge",false},{"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}},
+            {"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"}};
+        if(route=="failure-poll")request.insert("model",QString{});
+        QSignalSpy destroyed(victim.get(),&QObject::destroyed);
+        QMetaObject::Connection listener;
+        if(duringPreparation)listener=connect(victim.get(),&ReaderController::aiStateChanged,this,[&] {
+            if(victim && !victim->documentReading().value("summary_owner").toString().isEmpty())victim.reset();
+        });
+        int admissions=0;
+        if(route=="failure-poll")listener=connect(victim.get(),&ReaderController::commandsChanged,this,[&] {
+            if(victim && victim->pendingCommands() && ++admissions==2)victim.reset();
+        });
+        victim->prepareDocumentSummary(request,{{"kind","summary"},{"detail","Standard"},{"force",true}});
+        if(route=="cancel-command") {
+            QTRY_COMPARE(victim->pendingCommands(),0);QVERIFY(!victim->aiState().value("plan").toMap().isEmpty());
+            listener=connect(victim.get(),&ReaderController::commandsChanged,this,[&]{if(victim && victim->pendingCommands())victim.reset();});
+            victim->cancelDocumentSummaryReview();
+        }
+        QTRY_VERIFY(alive.isNull());QCOMPARE(destroyed.size(),1);disconnect(listener);
+    }
+
+    void ownedWholeSummaryReviewKeepsTheAnalysisAndExactBody_data() {
+        QTest::addColumn<QString>("route");
+        for(const auto *route:{"cancel","send","direct","input","policy","language","tab","hide","reopen","replacement","reentrant","window","provider-error","cache","credential","stop","hide-running"})
+            QTest::newRow(route)<<QString::fromLatin1(route);
+    }
+    void ownedWholeSummaryReviewKeepsTheAnalysisAndExactBody() {
+        QFETCH(QString,route);ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;
+        QTest::failOnWarning(QRegularExpression(".*(TypeError:|Binding loop|ReferenceError:).*"));
+        QSettings saved;saved.setValue("reader/preferences/aiPrereadingPolicy","ask");
+        saved.setValue("reader/preferences/aiReviewBeforeSending",route!="direct");saved.setValue("reader/preferences/reduceMotion",true);
+        saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");saved.sync();
+        MockChatServer server;QVERIFY(server.listen());
+        if(route=="stop" || route=="hide-running")server.responses.append({{MockChatServer::delta({{"content","PARTIAL_OWNED_SUMMARY"}}),QByteArray("data: [DONE]\n\n")},20,200,true});
+        else server.responses.append({{MockChatServer::delta({{"content","OWNED_SYNTHETIC_SUMMARY [p.1]"}}),QByteArray("data: [DONE]\n\n")},20,route=="provider-error"?500:200});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-owned-summary.pdf");
+        QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        auto *vault=new FakeCredentialStore;QSignalSpy vaultEvents(vault,&CredentialStore::finished);
+        WorkspaceController workspace(nullptr,vault);QQmlApplicationEngine engine;engine.addImageProvider("lyrapreview",new NativeImageProvider);
+        engine.rootContext()->setContextProperty("workspace",&workspace);engine.load(QUrl("qrc:/qml/Main.qml"));
+        QVERIFY(!engine.rootObjects().isEmpty());auto *window=qobject_cast<QQuickWindow *>(engine.rootObjects().first());QVERIFY(window);
+        workspace.openFile(QUrl::fromLocalFile(path));auto *reader=workspace.activeReader();QVERIFY(reader);
+        QTRY_COMPARE(reader->pageCount(),1);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",route=="credential"?QString("https://api.example.test/v1"):server.baseUrl()},{"model","synthetic-owned"}});
+        QVERIFY(workspace.chatGptAccounts()->refreshConnection());
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));reader->setAiInput("action",1);
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);
+        QTRY_VERIFY(window->isVisible() && panel->property("visible").toBool());
+        auto *review=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(review);
+        bool retired=false;QMetaObject::Connection reentrant;
+        if(route=="reentrant")reentrant=connect(reader,&ReaderController::commandsChanged,reader,[&]{
+            if(!retired && reader->pendingCommands()>0){retired=true;reader->invalidateAiPlan();}
+        });
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto assertNativeReleased=[&] {
+            QSignalSpy results(reader,&ReaderController::commandFinished);
+            const auto id=reader->submit("knowledge_poll");QVERIFY(id);QTRY_COMPARE(reader->pendingCommands(),0);
+            bool found=false;
+            for(const auto &entry:results)if(entry[0].toULongLong()==id) {
+                found=true;QVERIFY(entry[3].toString().isEmpty());
+                QVERIFY(entry[2].toMap().value("summary_owner").toString().isEmpty());
+            }
+            QVERIFY(found);
+        };
+        if(route=="reentrant") {
+            disconnect(reentrant);QVERIFY(retired);QTest::qWait(100);QCOMPARE(server.requests.size(),0);
+            QVERIFY(!review->isVisible());QVERIFY(reader->aiState().value("plan").toMap().isEmpty());
+            QVERIFY(reader->documentReading().value("summary_owner").toString().isEmpty());assertNativeReleased();return;
+        }
+        const auto plan=reader->aiState().value("plan").toMap();QVERIFY2(!plan.value("summary_review").toString().isEmpty(),qPrintable(QString("root=%1 reader=%2 phase=%3 visible=%4")
+            .arg(window->property("operationStatus").toString()).arg(reader->aiState().value("status").toString())
+            .arg(reader->documentReading().value("phase").toString()).arg(window->isVisible())));
+        if(route!="direct")QVERIFY(reader->ownsDocumentSummary(plan));
+        if(route!="direct") {
+            QTRY_VERIFY(review->isVisible());QCOMPARE(server.requests.size(),0);
+            QCOMPARE(reader->documentReading().value("phase").toString(),QString("preparing"));
+            QCOMPARE(reader->documentReading().value("summary_owner").toString(),plan.value("summary_review").toString());
+            QVariant eligible;QVERIFY(QMetaObject::invokeMethod(window,"foregroundAiIsReady",Q_RETURN_ARG(QVariant,eligible),Q_ARG(QVariant,QVariant::fromValue(static_cast<QObject *>(reader))),Q_ARG(QVariant,QVariant{})));
+            QVERIFY(!eligible.toBool());
+        }
+        if(route=="credential") {
+            QTRY_VERIFY(review->property("canSend").toBool());QVERIFY(QMetaObject::invokeMethod(review,"send"));
+            QTRY_COMPARE(vault->requests.size(),1);QCOMPARE(server.requests.size(),0);
+            reader->invalidateAiPlan();QTRY_COMPARE(reader->pendingCommands(),0);
+            QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(review->isVisible());
+            const auto replacement=reader->aiState().value("plan").toMap();QVERIFY(reader->ownsDocumentSummary(replacement));
+            window->setProperty("operationStatus","CURRENT_OWNED_SUMMARY");
+            vault->reply(0,{},"OBSOLETE_VAULT_FAILURE");QTRY_COMPARE(vaultEvents.size(),1);QTest::qWait(80);
+            QCOMPARE(window->property("operationStatus").toString(),QString("CURRENT_OWNED_SUMMARY"));
+            QVERIFY(reader->ownsDocumentSummary(replacement));QVERIFY(!reader->aiState().value("running").toBool());
+            QCOMPARE(server.requests.size(),0);QVERIFY(QMetaObject::invokeMethod(review,"cancel"));QTRY_COMPARE(reader->pendingCommands(),0);
+            assertNativeReleased();return;
+        }
+        if(route=="cancel") {QVERIFY(QMetaObject::invokeMethod(review,"cancel"));}
+        else if(route=="input")reader->setAiInput("summaryDetail","Brief");
+        else if(route=="policy")QVERIFY(workspace.setAiReviewBeforeSending(false));
+        else if(route=="language")QVERIFY(workspace.setAiOutputLanguage("German"));
+        else if(route=="tab")workspace.newTab();
+        else if(route=="hide")QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,false)));
+        else if(route=="reopen") {const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));QTRY_VERIFY(reader->documentGeneration()!=generation && !reader->loading());}
+        else if(route=="window") {QPointer<ReaderController> alive(reader);window->close();QTRY_VERIFY(!window->isVisible());if(!alive){QCOMPARE(server.requests.size(),0);return;}}
+        else if(route=="replacement") {
+            QVERIFY(QMetaObject::invokeMethod(review,"cancel"));QTRY_COMPARE(reader->pendingCommands(),0);
+            QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(review->isVisible());
+            const auto replacement=reader->aiState().value("plan").toMap();QVERIFY(replacement.value("summary_review")!=plan.value("summary_review"));
+            reader->cancelDocumentSummaryReview(plan);QTest::qWait(50);QVERIFY(reader->ownsDocumentSummary(replacement));
+            QVERIFY(QMetaObject::invokeMethod(review,"cancel"));
+        } else {
+            const auto expected=plan.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+            if(route!="direct") {QTRY_VERIFY(review->property("canSend").toBool());QVERIFY(QMetaObject::invokeMethod(review,"send"));}
+            QTRY_COMPARE(server.requests.size(),1);
+            if(route=="stop" || route=="hide-running") {
+                QTRY_VERIFY(reader->aiState().value("running").toBool());QTRY_VERIFY(reader->aiState().value("output").toString().contains("PARTIAL_OWNED_SUMMARY"));
+                QCOMPARE(reader->documentReading().value("summary_owner").toString(),plan.value("summary_review").toString());
+                QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),expected);
+                if(route=="hide-running")QVERIFY(QMetaObject::invokeMethod(window,"showAiPanel",Q_ARG(QVariant,false)));
+                else QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));
+                QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);QTRY_COMPARE(server.activeConnections(),0);
+                QVERIFY(!reader->documentReading().value("ready").toBool());QVERIFY(reader->aiState().value("output").toString().contains("PARTIAL_OWNED_SUMMARY"));
+                QCOMPARE(server.requests.size(),1);assertNativeReleased();QCOMPARE(vaultEvents.size(),0);return;
+            }
+            QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            QCOMPARE(server.requests.first().mid(server.requests.first().indexOf("\r\n\r\n")+4),expected);
+            QVERIFY(reader->documentReading().value("summary_owner").toString().isEmpty());
+            if(route=="provider-error")QVERIFY(!reader->documentReading().value("ready").toBool());
+            else {QVERIFY(reader->documentReading().value("ready").toBool());QVERIFY(reader->aiState().value("output").toString().contains("OWNED_SYNTHETIC_SUMMARY"));}
+            if(route=="cache") {
+                const auto generation=reader->documentGeneration();reader->openFile(QUrl::fromLocalFile(path));
+                QTRY_VERIFY(reader->documentGeneration()!=generation && !reader->loading());QTRY_COMPARE(reader->pendingCommands(),0);
+                QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));reader->setAiInput("action",1);
+                QTRY_VERIFY(panel->property("visible").toBool());
+                QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_COMPARE(reader->pendingCommands(),0);
+                QVERIFY(reader->aiState().value("cachedWholeSummary").toBool());QVERIFY(!review->isVisible());QCOMPARE(server.requests.size(),1);
+                QVERIFY(reader->documentReading().value("summary_owner").toString().isEmpty());
+            }
+            QCOMPARE(vaultEvents.size(),0);return;
+        }
+        QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(!review->isVisible());QCOMPARE(server.requests.size(),0);
+        QVERIFY(reader->documentReading().value("summary_owner").toString().isEmpty());QVERIFY(!reader->ownsDocumentSummary(plan));
+        QCOMPARE(vaultEvents.size(),0);assertNativeReleased();
+    }
+
+    void ownedSummaryKeepsOneAnalysisAcrossTheSeparateSynthesisReview_data() {
+        QTest::addColumn<bool>("cancelSynthesis");QTest::addColumn<bool>("retireDuringParts");
+        QTest::newRow("send")<<false<<false;QTest::newRow("cancel")<<true<<false;QTest::newRow("retired-in-flight")<<false<<true;
+    }
+    void ownedSummaryKeepsOneAnalysisAcrossTheSeparateSynthesisReview() {
+        QFETCH(bool,cancelSynthesis);QFETCH(bool,retireDuringParts);ReadingPreferenceGuard preferences;ChatGptPreferenceGuard profiles;
+        QSettings saved;saved.setValue("reader/preferences/aiReviewBeforeSending",true);
+        saved.setValue("reader/preferences/aiPrereadingPolicy","ask");saved.setValue("reader/preferences/reduceMotion",true);
+        saved.setValue("chatGptPlan/connectionMode","apiKey");saved.remove("chatGptPlan/accounts");saved.sync();
+        MockChatServer server;QVERIFY(server.listen());server.responder=[&](const QByteArray &body) {
+            const auto answer=body.contains("Consolidate the part summaries")?"FINAL_OWNED_SYNTHESIS [p.1]":"COMPLETE_OWNED_PART [p.1]";
+            return MockChatServer::Response{{MockChatServer::delta({{"content",answer}}),QByteArray("data: [DONE]\n\n")},retireDuringParts?200:10,200};
+        };
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-owned-multipart.pdf");
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        {
+            QPdfWriter pdf(path);pdf.setResolution(72);pdf.setPageSize(QPageSize(QPageSize::A4));QPainter painter(&pdf);QVERIFY(painter.isActive());painter.setFont(QFont("Sans Serif",9));
+            for(int page=0;page<16;++page){if(page)QVERIFY(pdf.newPage());for(int line=0;line<30;++line)
+                painter.drawText(QPointF(30,35+line*23),QString("Public source sentence page %1 line %2. Each synthetic example describes a reading task.").arg(page+1).arg(line+1));}
+            QVERIFY(painter.end());
+        }
+        NativeCorpus::Viewer view;auto *window=view.window;QVERIFY(window);view.workspace.openFile(QUrl::fromLocalFile(path));
+        auto *reader=view.workspace.activeReader();QTRY_COMPARE(reader->pageCount(),16);QTRY_COMPARE(reader->pendingCommands(),0);
+        window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-owned-multipart"}});
+        QVERIFY(view.workspace.chatGptAccounts()->refreshConnection());
+        QVERIFY(QMetaObject::invokeMethod(window,"openAiWorkspace",Q_ARG(QVariant,"summary")));reader->setAiInput("action",1);reader->setAiInput("summaryDetail","Detailed");
+        auto *panel=window->findChild<QObject *>("aiPanel");QVERIFY(panel);QTRY_VERIFY(window->isVisible() && panel->property("visible").toBool());
+        auto *review=window->findChild<QQuickWindow *>("aiTaskReviewWindow");QVERIFY(review);
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_COMPARE(reader->pendingCommands(),0);QTRY_VERIFY(review->isVisible());
+        const auto first=reader->aiState().value("plan").toMap();const auto parts=first.value("parts").toList();QVERIFY(parts.size()>1);
+        const auto owner=first.value("summary_review").toString();QVERIFY(!owner.isEmpty());
+        QTRY_VERIFY(review->property("canSend").toBool());QVERIFY(QMetaObject::invokeMethod(review,"send"));
+        if(retireDuringParts) {
+            QTRY_VERIFY(!server.requests.isEmpty());QVERIFY(reader->aiState().value("running").toBool());
+            window->setProperty("aiSettings",QVariantMap{{"baseUrl",server.baseUrl()},{"model","synthetic-next-configuration"}});
+            QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            QVERIFY(reader->documentReading().value("summary_owner").toString().isEmpty());QCOMPARE(server.requests.size(),parts.size());
+            QSignalSpy released(reader,&ReaderController::commandFinished);const auto query=reader->submit("knowledge_poll");QVERIFY(query);QTRY_COMPARE(reader->pendingCommands(),0);
+            bool found=false;for(const auto &entry:released)if(entry[0].toULongLong()==query){found=true;QVERIFY(entry[2].toMap().value("summary_owner").toString().isEmpty());}QVERIFY(found);return;
+        }
+        QTRY_COMPARE(reader->aiState().value("plan").toMap().value("kind").toString(),QString("summary_synthesis"));QTRY_COMPARE(reader->pendingCommands(),0);
+        const auto synthesis=reader->aiState().value("plan").toMap();QCOMPARE(synthesis.value("summary_review").toString(),owner);
+        QCOMPARE(reader->documentReading().value("phase").toString(),QString("preparing"));QVERIFY(reader->ownsDocumentSummary(synthesis));
+        QCOMPARE(server.requests.size(),parts.size());
+        for(qsizetype i=0;i<parts.size();++i)QCOMPARE(server.requests[i].mid(server.requests[i].indexOf("\r\n\r\n")+4),parts[i].toMap().value("wire_body").toString().toUtf8());
+        QVariant requestValue;QVERIFY(QMetaObject::invokeMethod(panel,"baseRequest",Q_RETURN_ARG(QVariant,requestValue),Q_ARG(QVariant,"SummarizeDocument")));
+        auto request=requestValue.metaType()==QMetaType::fromType<QJSValue>()?requestValue.value<QJSValue>().toVariant().toMap():requestValue.toMap();request.insert("selection",QVariant{});
+        ReaderController contender;contender.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(contender.pageCount(),16);QTRY_COMPARE(contender.pendingCommands(),0);
+        contender.prepareDocumentSummary(request,{{"kind","summary"},{"detail","Detailed"},{"force",true}});QTRY_COMPARE(contender.pendingCommands(),0);
+        QVERIFY(contender.aiState().value("plan").toMap().isEmpty());QVERIFY(contender.documentReading().value("summary_owner").toString().isEmpty());
+        QCOMPARE(server.requests.size(),parts.size());
+        QVERIFY(QMetaObject::invokeMethod(panel,"prepareFromUi"));QTRY_VERIFY(review->isVisible());
+        const auto body=synthesis.value("parts").toList().first().toMap().value("wire_body").toString().toUtf8();
+        if(cancelSynthesis) {
+            QVERIFY(QMetaObject::invokeMethod(review,"cancel"));QTRY_COMPARE(reader->pendingCommands(),0);QCOMPARE(server.requests.size(),parts.size());
+            QVERIFY(!reader->startAi("local",synthesis));
+        } else {
+            QTRY_VERIFY(review->property("canSend").toBool());QVERIFY(QMetaObject::invokeMethod(review,"send"));
+            QTRY_COMPARE(server.requests.size(),parts.size()+1);QTRY_VERIFY(!reader->aiState().value("running").toBool());QTRY_COMPARE(reader->pendingCommands(),0);
+            QCOMPARE(server.requests.last().mid(server.requests.last().indexOf("\r\n\r\n")+4),body);
+            QVERIFY(reader->aiState().value("output").toString().contains("FINAL_OWNED_SYNTHESIS"));QVERIFY(reader->documentReading().value("ready").toBool());
+        }
+        QVERIFY(reader->documentReading().value("summary_owner").toString().isEmpty());
+        contender.prepareDocumentSummary(request,{{"kind","summary"},{"detail","Detailed"},{"force",true}});QTRY_COMPARE(contender.pendingCommands(),0);
+        QVERIFY(!contender.aiState().value("plan").toMap().value("summary_review").toString().isEmpty());
+        contender.cancelDocumentSummaryReview();QTRY_COMPARE(contender.pendingCommands(),0);
+    }
+
+    void ownedSummaryControllerDestructionCancelsTransportAndReleasesTheAnalysis_data() {
+        QTest::addColumn<bool>("changeRevision");QTest::newRow("destroy")<<false;QTest::newRow("page-revision")<<true;
+    }
+    void ownedSummaryControllerDestructionCancelsTransportAndReleasesTheAnalysis() {
+        QFETCH(bool,changeRevision);
+        MockChatServer server;QVERIFY(server.listen());
+        server.responses.append({{MockChatServer::delta({{"content","PARTIAL_BEFORE_OWNER_CLOSE"}}),QByteArray("data: [DONE]\n\n")},10,200,true});
+        QTemporaryDir scratch;const auto path=scratch.filePath("synthetic-owner-lifetime.pdf");QVERIFY(QFile::copy(root+"/tests/fixtures/text-page.pdf",path));
+        const auto previous=qgetenv("LYRA_READER_DOCUMENT_CACHE_DIR");const auto restore=qScopeGuard([&]{qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",previous);});
+        qputenv("LYRA_READER_DOCUMENT_CACHE_DIR",scratch.filePath("cache").toUtf8());
+        const QVariantMap request{{"action","SummarizeDocument"},{"base_url",server.baseUrl()},{"model","synthetic-owner-lifetime"},
+            {"document_knowledge",false},{"document_knowledge_text",QVariant{}},{"document_knowledge_pages",QVariantList{}},
+            {"current_page",0},{"selection",QVariant{}},{"question",QVariant{}},{"language",QVariant{}},{"history",QVariantList{}},{"region",QVariant{}},
+            {"temperature",QVariant{}},{"max_tokens",QVariant{}},{"reasoning_mode","default"},{"reasoning_encoding","none"}};
+        const QVariantMap reading{{"kind","summary"},{"detail","Standard"},{"force",true}};
+        auto owner=std::make_unique<ReaderController>();owner->openFile(QUrl::fromLocalFile(path));
+        QTRY_COMPARE(owner->pageCount(),1);QTRY_COMPARE(owner->pendingCommands(),0);
+        owner->prepareDocumentSummary(request,reading);QTRY_COMPARE(owner->pendingCommands(),0);
+        const auto plan=owner->aiState().value("plan").toMap();QVERIFY(owner->ownsDocumentSummary(plan));
+        QVERIFY(owner->startAi("local",plan));QTRY_COMPARE(server.requests.size(),1);QTRY_COMPARE(server.activeConnections(),1);
+        QTRY_VERIFY(owner->aiState().value("output").toString().contains("PARTIAL_BEFORE_OWNER_CLOSE"));QTRY_COMPARE(owner->pendingCommands(),0);
+        if(changeRevision) {
+            const QVariantMap rotation{{"pages",QVariantList{0}},{"quarter_turns",1}};
+            const QVariantMap rotate{{"operation",QVariantMap{{"Rotate",rotation}}}};
+            QSignalSpy rejected(owner.get(),&ReaderController::commandFinished);const auto blocked=owner->submit("page_stage",rotate);QVERIFY(blocked);
+            QTRY_VERIFY(std::any_of(rejected.cbegin(),rejected.cend(),[&](const auto &entry){return entry[0].toULongLong()==blocked;}));bool observed=false;
+            for(const auto &entry:rejected)if(entry[0].toULongLong()==blocked){observed=true;QVERIFY(entry[3].toString().contains("Cancel the active AI request"));}QVERIFY(observed);
+            QCOMPARE(server.activeConnections(),1);owner->dismissError();owner->cancelAi();
+            QTRY_VERIFY(!owner->aiState().value("running").toBool());QTRY_COMPARE(owner->pendingCommands(),0);QTRY_COMPARE(server.activeConnections(),0);
+            owner->submit("page_stage",rotate);QTRY_COMPARE(owner->pendingCommands(),0);QVERIFY2(owner->error().isEmpty(),qPrintable(owner->error()));
+            owner->prepareDocumentSummary(request,reading);QTRY_COMPARE(owner->pendingCommands(),0);
+            QVERIFY(owner->ownsDocumentSummary(owner->aiState().value("plan").toMap()));
+            owner->cancelDocumentSummaryReview();QTRY_COMPARE(owner->pendingCommands(),0);
+            owner->submit("document_discard");QTRY_COMPARE(owner->pendingCommands(),0);QVERIFY(!owner->hasUnsavedChanges());
+        }
+        owner.reset();QTRY_COMPARE(server.activeConnections(),0);
+        ReaderController reopened;reopened.openFile(QUrl::fromLocalFile(path));QTRY_COMPARE(reopened.pageCount(),1);QTRY_COMPARE(reopened.pendingCommands(),0);
+        reopened.prepareDocumentSummary(request,reading);QTRY_COMPARE(reopened.pendingCommands(),0);
+        QVERIFY(reopened.ownsDocumentSummary(reopened.aiState().value("plan").toMap()));QCOMPARE(server.requests.size(),1);
+        reopened.cancelDocumentSummaryReview();QTRY_COMPARE(reopened.pendingCommands(),0);
     }
 
     void wholeSummaryRequiresSeparateReviewForSynthesis() {

@@ -36,6 +36,7 @@ mod session;
 mod settings;
 mod summary;
 mod summary_batch;
+mod summary_review;
 mod summary_store;
 mod term;
 mod tile_plan;

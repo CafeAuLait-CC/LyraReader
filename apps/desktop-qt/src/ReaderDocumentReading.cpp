@@ -70,6 +70,11 @@ bool ReaderController::startDocumentReadingWithCredential(const QString &key,con
     return id!=0;
 }
 void ReaderController::stopDocumentReading() {
+    if(!m_aiSummaryOwner.isEmpty()) {
+        if(m_aiState.value(QStringLiteral("running")).toBool())cancelAi();
+        else cancelDocumentSummaryReview();
+        return;
+    }
     ++m_readingRevision;
     m_readingChoiceShown=true;m_readingChoicePending=false;
     m_readingTimer.stop();m_readingPreviewId=0;m_readingStartId=0;m_readingPollId=0;

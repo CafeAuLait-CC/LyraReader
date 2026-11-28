@@ -164,7 +164,9 @@ trail, including retries. Settings and the AI panel open a metadata-only viewer,
 PDF. Clearing it requires confirmation of the displayed snapshot; concurrent changes require a refresh.
 Document prereading follows the Ask, Always or Never policy in Settings; Ask is the default.
 An eligible explicit question offers reading or Skip. Starting prereading pauses other AI tasks,
-while ordinary PDF reading remains available. Skip resumes only the unchanged explicit task;
+while ordinary PDF reading remains available. An explicit whole-document Summary owns its analysis
+from local preparation through request review and multipart synthesis; cancelling releases only that
+task. Skip resumes only the unchanged explicit task;
 completion does not send the original question. Summaries, translations and note updates do not
 request an additional prereading pass, but still wait for an active one. Document Reading
 (Ctrl+Shift+K) can inspect the extracted text, including the disclosed extra consolidation for

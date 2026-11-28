@@ -39,6 +39,7 @@ impl Drop for ReadingJob {
 }
 
 pub(super) struct Knowledge {
+    pub(super) summary_review: Option<crate::summary_review::SummaryReview>,
     token: String,
     phase: &'static str,
     plan: Option<AiPlanRecord>,
@@ -57,6 +58,7 @@ pub(super) struct Knowledge {
 impl Default for Knowledge {
     fn default() -> Self {
         Self {
+            summary_review: None,
             token: String::new(),
             phase: "idle",
             plan: None,
@@ -75,7 +77,39 @@ impl Default for Knowledge {
     }
 }
 impl Knowledge {
+    pub(super) fn begin_summary_review(&mut self, review: crate::summary_review::SummaryReview) {
+        self.summary_review = Some(review);
+        self.phase = "preparing";
+    }
+    pub(super) fn summary_reading(&mut self) {
+        self.phase = "reading";
+    }
+    pub(super) fn begin_summary_synthesis(&mut self) {
+        self.phase = "preparing";
+    }
+    pub(super) fn summary_status(&self) -> Result<Value, String> {
+        self.status(false)
+    }
+    pub(super) fn finish_summary_review(&mut self, owner: &str) {
+        if self
+            .summary_review
+            .as_ref()
+            .is_some_and(|review| review.owner == owner)
+        {
+            self.summary_review = None;
+            self.phase = if self.understanding.is_some() || self.record.is_some() {
+                "ready"
+            } else {
+                "idle"
+            };
+        }
+    }
     pub(super) fn ensure_foreground_ready(&self) -> Result<(), String> {
+        if self.summary_review.is_some() {
+            return Err(
+                "Document analysis is already in progress. Continue when Lyra AI is ready.".into(),
+            );
+        }
         let gate = crate::prereading::inspect("never", self.phase, false, "note")?;
         if gate.decision == "wait" {
             Err(crate::prereading::BUSY.into())
@@ -96,7 +130,7 @@ impl Knowledge {
         self.status(true)
     }
     fn status(&self, include_plan: bool) -> Result<Value, String> {
-        let mut result = json!({"phase":self.phase,"token":self.token,"ready":self.record.is_some() || self.understanding.is_some(),"message":self.message,"cache_warning":self.cache_error,"merge_payloads":self.merge_payloads});
+        let mut result = json!({"phase":self.phase,"token":self.token,"ready":self.record.is_some() || self.understanding.is_some(),"message":self.message,"summary_owner":self.summary_review.as_ref().map(|review| &review.owner),"cache_warning":self.cache_error,"merge_payloads":self.merge_payloads});
         if let Some(account) = &self.account {
             result["chatgpt_account"] = json!(account);
         }
@@ -116,6 +150,7 @@ impl Knowledge {
     }
     fn cancel(&mut self, invalidate: bool) -> Result<(), String> {
         self.token = crate::marks::uuid()?;
+        self.summary_review = None;
         self.job = None;
         self.plan = None;
         self.account = None;
@@ -152,6 +187,7 @@ impl DesktopDocument {
         }
     }
     pub(super) fn invalidate_reading(&self) -> Result<(), String> {
+        self.abandon_owned_summary_request()?;
         *self
             .pending_summary
             .lock()
@@ -199,7 +235,10 @@ impl DesktopDocument {
             .lock()
             .map_err(|_| "Document reading state is unavailable")?;
         state.understanding = Some(record);
-        if state.job.is_none() && !matches!(state.phase, "preparing" | "preview" | "starting") {
+        if state.job.is_none()
+            && state.summary_review.is_none()
+            && !matches!(state.phase, "preparing" | "preview" | "starting")
+        {
             state.phase = "ready";
             state.message =
                 Some("The completed document summary is ready for new questions.".into());
@@ -228,6 +267,9 @@ impl DesktopDocument {
                 .knowledge
                 .lock()
                 .map_err(|_| "Document reading state is unavailable")?;
+            if state.summary_review.is_some() {
+                return Err(crate::prereading::BUSY.into());
+            }
             if state.job.is_some() {
                 return Err("Stop the current document reading before preparing another.".into());
             }
@@ -634,6 +676,14 @@ impl DesktopDocument {
                     .knowledge
                     .lock()
                     .map_err(|_| "Document reading state is unavailable")?;
+                if s.summary_review
+                    .as_ref()
+                    .is_some_and(|review| review.started)
+                {
+                    return Err(
+                        "Stop the active summary before changing document prereading.".into(),
+                    );
+                }
                 s.cancel(false)?;
                 if op == "knowledge_skip" {
                     s.phase = "skipped";

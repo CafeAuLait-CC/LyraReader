@@ -99,8 +99,11 @@ ApplicationWindow {
     DocumentReading {id:documentReadingPopup;app:root}
     AiPrereadingWorkflow {id:prereadingWorkflow;app:root}
     signal aiTaskReviewCancelled(var ticket)
-    AiTaskReviewWindow {id:aiTaskReview;app:root;onCancelled:function(ticket){root.aiTaskReviewCancelled(ticket)}}
-    function openDocumentReading(){prereadingWorkflow.cancel();documentReadingPopup.gateMode=false;aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
+    AiTaskReviewWindow {id:aiTaskReview;app:root;onCancelled:function(ticket){
+        if(ticket.reader && ticket.plan && ticket.plan.summary_review)ticket.reader.cancelDocumentSummaryReview(ticket.plan);
+        root.aiTaskReviewCancelled(ticket);
+    }}
+    function openDocumentReading(){if(currentReader.documentReading.summary_owner){operationStatus=aiTaskBusyMessage(currentReader);return;}prereadingWorkflow.cancel();documentReadingPopup.gateMode=false;aiRegionCard.close();regionNotes.close();documentReadingPopup.open();}
     function requestAiTaskFromUi(owner,kind,valid,resume){return prereadingWorkflow.begin(owner,kind,valid,resume);}
     function aiTaskUiAvailable(){return visible && !closeApproved && !closeOperation && closingTab===-2 && !dialogs.closePromptVisible;}
     function showPrereadingChoice(owner,automatic){documentReadingPopup.openForGate(owner,automatic);}
@@ -109,8 +112,14 @@ ApplicationWindow {
     function skipPrereadingIntent(owner){return prereadingWorkflow.skip(owner);}
     function cancelPrereadingIntent(){prereadingWorkflow.cancel();}
     function prereadingMayStart(owner){return prereadingWorkflow.mayStart(owner);}
-    function foregroundAiIsReady(owner) {
+    function aiTaskBusyMessage(owner) {
+        return owner && owner.documentReading.summary_owner
+            ? qsTr("Document analysis is in progress. Continue when Lyra AI is ready.")
+            : qsTr("Document prereading is in progress. Continue when Lyra AI is ready.");
+    }
+    function foregroundAiIsReady(owner,plan) {
         if(!owner || !session)return false;
+        if(plan && owner.ownsDocumentSummary(plan))return true;
         const state=owner.documentReading;
         const gate=session.prereadingGate("never",state.phase || "idle",!!state.ready,"note");
         return !!gate.valid && gate.decision==="ready";
@@ -587,6 +596,7 @@ ApplicationWindow {
     onAppearanceChanged: if (session)
         session.setPreference("appearance", appearance)
     onCurrentReaderChanged: {
+        abandonStaleSummaryCredential();
         noteMarkerLayouts=({});
         selectedSidebarAnnotationID="";
         pendingLayoutPosition=null;
@@ -2178,7 +2188,7 @@ ApplicationWindow {
             return state.phase==="preview" && state.token===ticket.token && sameAiReviewPlan(state.plan,ticket.plan)
                 && (!documentReadingPopup.gateMode || prereadingWorkflow.mayStart(ticket.reader));
         }
-        if(!foregroundAiIsReady(ticket.reader))return false;
+        if(!foregroundAiIsReady(ticket.reader,ticket.plan))return false;
         if(ticket.purpose==="term") {
             const state=ticket.reader.readingTerm.state;
             return state.phase==="preview" && sameAiReviewPlan(state.plan,ticket.plan);
@@ -2207,7 +2217,7 @@ ApplicationWindow {
     function startPreparedAi(owner,key,plan,purpose,token) {
         if(!owner || !refreshAiConnection() || !owner || !aiConnectionMatches(plan))return false;
         if(purpose==="document-reading" && documentReadingPopup.gateMode && !prereadingWorkflow.mayStart(owner))return false;
-        if(purpose!=="document-reading" && !foregroundAiIsReady(owner))return false;
+        if(purpose!=="document-reading" && !foregroundAiIsReady(owner,plan))return false;
         if(purpose==="term")return owner.startAiTerm(key,plan);
         return purpose==="document-reading" ? owner.startDocumentReading(key,plan,token) : owner.startAi(key,plan);
     }
@@ -2230,14 +2240,30 @@ ApplicationWindow {
         credentialReadId=-1; pendingAiReader=null; pendingAiPlan=null; pendingAiToken="";
         if (dialogs.credentialDialog.visible) dialogs.credentialDialog.reject();
     }
+    function clearPendingSummaryCredential() {
+        if(!pendingAiPlan || !pendingAiPlan.summary_review)return;
+        credentialReadId=-1;pendingAiPlan=null;pendingAiReader=null;pendingAiToken="";
+        if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
+    }
+    function abandonStaleSummaryCredential() {
+        if(pendingAiPlan && pendingAiPlan.summary_review && (!pendingAiReader
+                || pendingAiReader!==currentReader || !pendingAiReader.ownsDocumentSummary(pendingAiPlan)))
+            clearPendingSummaryCredential();
+    }
+    onPendingAiReaderChanged:abandonStaleSummaryCredential()
+    Connections {
+        target:root.pendingAiReader
+        function onAiStateChanged(){root.abandonStaleSummaryCredential();}
+        function onDocumentChanged(){root.abandonStaleSummaryCredential();}
+    }
     function abandonPrereadingCredential(owner,token) {
         if(pendingAiPurpose!=="document-reading" || pendingAiReader!==owner || pendingAiToken!==token)return;
         credentialReadId=-1;pendingAiReader=null;pendingAiPlan=null;pendingAiToken="";
         if(dialogs.credentialDialog.visible)dialogs.credentialDialog.reject();
     }
     function sendAi(owner, plan, purpose, token) {
-        if(purpose!=="document-reading" && !foregroundAiIsReady(owner)) {
-            operationStatus=qsTr("Document prereading is in progress. Continue when Lyra AI is ready.");return;
+        if(purpose!=="document-reading" && !foregroundAiIsReady(owner,plan)) {
+            operationStatus=aiTaskBusyMessage(owner);return;
         }
         if (!owner || !plan || !refreshAiConnection() || !owner)
             return;

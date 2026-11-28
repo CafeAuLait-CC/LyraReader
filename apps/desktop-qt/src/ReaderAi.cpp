@@ -12,6 +12,7 @@
 #include <QtConcurrentRun>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace {
 QString aiView(const QString &action) {
@@ -100,6 +101,8 @@ void ReaderController::setDefaultAiOutputLanguage(const QString &language) {
     if(alive)emit aiStateChanged();
 }
 void ReaderController::resetAi(bool preserveTranslationViews) {
+    QPointer<ReaderController> summaryGuard(this);retireDocumentSummaryReview();if(!summaryGuard)return;
+    m_aiSummaryOwner.clear();m_aiSummaryCancelId=0;
     QPointer<ReaderController> termOwner(this);const auto termGeneration=m_generation;
     if(m_readingTerm)m_readingTerm->cancel();
     if(!termOwner || termGeneration!=m_generation)return;
@@ -426,6 +429,8 @@ void ReaderController::setAiInput(const QString &key,const QVariant &value) {
         else
             m_chatDraftTimer.stop();
     }
+    QPointer<ReaderController> summaryGuard(this);const auto summaryGeneration=m_generation;
+    retireDocumentSummaryReview();if(!summaryGuard || summaryGeneration!=m_generation)return;
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
     if(!m_aiState.value(QStringLiteral("running")).toBool()) {
         m_aiState.insert(QStringLiteral("statusView"),input.value(QStringLiteral("view"),QStringLiteral("summary")));
@@ -439,6 +444,8 @@ void ReaderController::invalidateAiPlan() {
     m_summaryCacheId=0;
     const bool hadPreview=m_aiPreviewId || m_aiState.contains(QStringLiteral("plan")) || m_regionContinuationPending;
     m_regionContinuationPending=false;m_regionContinuationSettings.clear();
+    QPointer<ReaderController> summaryGuard(this);const auto summaryGeneration=m_generation;
+    retireDocumentSummaryReview();if(!summaryGuard || summaryGeneration!=m_generation)return;
     ++m_aiPreviewEpoch;m_aiPreviewId=0;m_aiState.remove(QStringLiteral("plan"));
     m_aiState.remove(QStringLiteral("previewChatGptAccount"));
     m_aiState.remove(QStringLiteral("previewLayeredSummary"));
@@ -611,9 +618,35 @@ void ReaderController::finishChatDeferredCommand(const QString &draftError) {
     setError(error);
     if(alive)emit commandFinished(pending.id,pending.operation,{},error);
 }
+bool ReaderController::ownsDocumentSummary(const QVariantMap &plan)const {
+    return !m_aiSummaryOwner.isEmpty() && plan.value(QStringLiteral("summary_review")).toString()==m_aiSummaryOwner
+        && m_aiPlanGeneration==m_generation && m_aiState.value(QStringLiteral("plan")).toMap()==plan;
+}
+void ReaderController::retireDocumentSummaryReview() {
+    if(m_aiSummaryOwner.isEmpty() || m_aiState.value(QStringLiteral("running")).toBool())return;
+    const auto owner=std::exchange(m_aiSummaryOwner,QString{});
+    if(!m_document)return;
+    m_aiSummaryCancelId=m_commandSequence+1;
+    submit(QStringLiteral("ai_summary_review_cancel"),{{QStringLiteral("owner"),owner}});
+}
+void ReaderController::cancelDocumentSummaryReview(const QVariantMap &plan) {
+    if(m_aiSummaryOwner.isEmpty() || (!plan.isEmpty() && !ownsDocumentSummary(plan)))return;
+    if(m_aiState.value(QStringLiteral("running")).toBool())cancelAi();
+    else invalidateAiPlan();
+}
+void ReaderController::prepareDocumentSummary(const QVariantMap &request,const QVariantMap &reading) {
+    if(request.value(QStringLiteral("action"))!=QStringLiteral("SummarizeDocument")
+        || !request.value(QStringLiteral("selection")).isNull() || reading.value(QStringLiteral("kind"))!=QStringLiteral("summary"))return;
+    prepareAiImpl(request,{},reading,true);
+}
 void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &unit,const QVariantMap &reading) {
+    prepareAiImpl(request,unit,reading,false);
+}
+void ReaderController::prepareAiImpl(const QVariantMap &request,const QVariantMap &unit,const QVariantMap &reading,bool ownedSummary) {
     if(!m_document || m_aiState.value(QStringLiteral("running")).toBool())return;
     if(request.value(QStringLiteral("action"))==QStringLiteral("DocumentChat") && m_aiState.value(QStringLiteral("chatReadOnly")).toBool())return;
+    QPointer<ReaderController> initialOwner(this);const auto initialGeneration=m_generation;
+    retireDocumentSummaryReview();if(!initialOwner || initialGeneration!=m_generation)return;
     const auto readingKind=reading.value(QStringLiteral("kind")).toString();
     const auto previewView=(readingKind==QStringLiteral("translation") || readingKind==QStringLiteral("note") || readingKind==QStringLiteral("region_note"))
         ? readingKind : aiView(request.value(QStringLiteral("action")).toString());
@@ -657,12 +690,21 @@ void ReaderController::prepareAi(const QVariantMap &request,const QVariantMap &u
     if(previewView==QStringLiteral("note"))m_aiState.remove(QStringLiteral("noteSuggestion"));
     m_aiState.insert(QStringLiteral("statusView"),m_aiState.value(QStringLiteral("previewView")));
     m_aiState.remove(QStringLiteral("plan"));m_aiState.insert(QStringLiteral("status"),tr("Preparing request locally…"));
-    m_aiPlanGeneration=m_generation;emit aiStateChanged();if(!current())return;
+    m_aiPlanGeneration=m_generation;
+    const auto summaryOwner=ownedSummary?QUuid::createUuid().toString(QUuid::WithoutBraces):QString{};
+    if(ownedSummary) {
+        m_aiSummaryOwner=summaryOwner;
+        m_documentReading.insert(QStringLiteral("phase"),QStringLiteral("preparing"));
+        m_documentReading.insert(QStringLiteral("summary_owner"),m_aiSummaryOwner);
+    }
+    emit aiStateChanged();if(!current()){if(alive && ownedSummary && m_aiSummaryOwner==summaryOwner)retireDocumentSummaryReview();return;}
     QVariantMap preview{{QStringLiteral("request"),input}};
     if(!reading.isEmpty())preview.insert(QStringLiteral("reading"),reading);
     if(input.value(QStringLiteral("action")).toString()==QStringLiteral("RegionQuestion") && m_aiRegion.value(QStringLiteral("persisted")).toBool())preview.insert(QStringLiteral("region_history_id"),m_aiRegion.value(QStringLiteral("history_id")));
     if(!unit.isEmpty())preview.insert(QStringLiteral("unit"),unit);
-    const auto id=submit(unit.isEmpty()?QStringLiteral("ai_preview"):QStringLiteral("ai_summary_prepare"),preview);
+    if(ownedSummary)preview.insert(QStringLiteral("owner"),summaryOwner);
+    const auto id=submit(ownedSummary?QStringLiteral("ai_summary_review_prepare")
+        :unit.isEmpty()?QStringLiteral("ai_preview"):QStringLiteral("ai_summary_prepare"),preview);
     if(current())m_aiPreviewId=id;
 }
 
@@ -714,6 +756,7 @@ bool ReaderController::startAiWithCredential(const QString &key,const QVariantMa
             m_aiState.insert(QStringLiteral("running"),false);
             m_aiState.insert(QStringLiteral("activeChat"),false);
             m_aiState.insert(QStringLiteral("planSent"),false);
+            retireDocumentSummaryReview();if(!current())return false;
             m_aiState.remove(QStringLiteral("plan"));
             m_aiState.insert(QStringLiteral("status"),tr("The request changed before it was sent. Preview it again."));
             if(chatDraftPending())m_chatDraftTimer.start();
@@ -1028,8 +1071,29 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         m_aiState.insert(QStringLiteral("status"),readOnly?tr("Earlier PDF revision. Start a new chat for the current document."):tr("Conversation reopened."));
         emit aiStateChanged();return;
     }
-    if((operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_prepare")) && id==m_aiPreviewId) {
+    if(operation==QStringLiteral("ai_summary_review_cancel") && id==m_aiSummaryCancelId) {
+        m_aiSummaryCancelId=0;
+        if(m_aiSummaryOwner.isEmpty() && error.isEmpty()) {
+            m_documentReading=result.toMap();emit documentReadingChanged();
+        } else if(!error.isEmpty()) {
+            m_aiState.insert(QStringLiteral("status"),error);emit aiStateChanged();
+        }
+        return;
+    }
+    if((operation==QStringLiteral("ai_preview") || operation==QStringLiteral("ai_summary_prepare") || operation==QStringLiteral("ai_summary_review_prepare")) && id==m_aiPreviewId) {
         m_aiPreviewId=0;auto failure=error;
+        const bool owned=operation==QStringLiteral("ai_summary_review_prepare");
+        const auto prepared=owned?result.toMap().value(QStringLiteral("plan")):result;
+        if(owned) {
+            if(failure.isEmpty())m_documentReading=result.toMap().value(QStringLiteral("understanding")).toMap();
+            else {
+                QPointer<ReaderController> alive(this);const auto generation=m_generation;
+                m_aiSummaryOwner.clear();const auto poll=submit(QStringLiteral("knowledge_poll"));
+                if(!alive || generation!=m_generation)return;
+                m_readingPollId=poll;
+            }
+            if(failure.isEmpty() && m_documentReading.value(QStringLiteral("summary_owner")).toString()!=m_aiSummaryOwner)m_aiSummaryOwner.clear();
+        }
         if(failure.isEmpty() && operation==QStringLiteral("ai_summary_prepare")) {
             const auto preview=result.toMap();
             if(m_aiSummaryPreviewUnitId.isEmpty() || preview.value(QStringLiteral("id")).toString()!=m_aiSummaryPreviewUnitId
@@ -1042,7 +1106,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                 emit summaryCatalogChanged();if(!alive || epoch!=m_aiPreviewEpoch)return;
             }
         }else if(failure.isEmpty()) {
-            const auto plan=result.toMap();
+            const auto plan=prepared.toMap();
             const auto cached=plan.value(QStringLiteral("saved_summary")).toMap();
             if(!cached.isEmpty()) {
                 for(const auto *key:{"plan","reasoning","usage","unitTitle","unitLanguage","synthesisParts"})
@@ -1056,14 +1120,14 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                     {QStringLiteral("action"),QStringLiteral("SummarizeDocument")},
                     {QStringLiteral("source_pages"),cached.value(QStringLiteral("source_pages"))}});
                 m_aiState.insert(QStringLiteral("status"),tr("Opened a matching saved summary locally."));
-                retainAiResult(QStringLiteral("finished"));emit aiStateChanged();return;
+                retainAiResult(QStringLiteral("finished"));QPointer<ReaderController> alive(this);emit aiStateChanged();if(alive && owned)emit documentReadingChanged();return;
             }
-            m_aiState.insert(QStringLiteral("plan"),result);
+            m_aiState.insert(QStringLiteral("plan"),prepared);
             if(plan.contains(QStringLiteral("cache_warning")))m_aiState.insert(QStringLiteral("cacheWarning"),plan.value(QStringLiteral("cache_warning")));
             if(plan.value(QStringLiteral("kind"))==QStringLiteral("reading_translation"))
                 m_aiState.insert(QStringLiteral("previewSelection"),plan.value(QStringLiteral("reading_scope")).toMap().value(QStringLiteral("selection")));
         }
-        m_aiState.insert(QStringLiteral("status"),failure.isEmpty()?tr("Request ready. Nothing sent yet."):failure);emit aiStateChanged();return;
+        m_aiState.insert(QStringLiteral("status"),failure.isEmpty()?tr("Request ready. Nothing sent yet."):failure);QPointer<ReaderController> alive(this);emit aiStateChanged();if(alive && owned)emit documentReadingChanged();return;
     }
     if(operation==QStringLiteral("ai_start") && id==m_aiStartId) {
         m_aiStartId=0;
@@ -1076,10 +1140,12 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
                 && !m_aiState.value(QStringLiteral("cancelRequested")).toBool()
                 && chatDraft()==m_aiState.value(QStringLiteral("activeChatDraft")).toString())
                 setChatDraft({});
+            if(!m_aiSummaryOwner.isEmpty())m_documentReading.insert(QStringLiteral("phase"),QStringLiteral("reading"));
             m_aiState.insert(QStringLiteral("status"),tr("Receiving response…"));m_aiTimer.start();
         }
-        else {m_aiState.insert(QStringLiteral("running"),false);m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))markRegionDirty();}
-        emit aiStateChanged();return;
+        else {m_aiState.insert(QStringLiteral("running"),false);QPointer<ReaderController> alive(this);retireDocumentSummaryReview();if(!alive)return;m_aiState.insert(QStringLiteral("status"),error);finishAiChat(QStringLiteral("failed"));retainAiResult(QStringLiteral("failed"));if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region"))markRegionDirty();}
+        QPointer<ReaderController> alive(this);const bool owned=!m_aiSummaryOwner.isEmpty();
+        emit aiStateChanged();if(alive && owned)emit documentReadingChanged();return;
     }
     if(operation!=QStringLiteral("ai_poll") || id!=m_aiPollId)return;
     m_aiPollId=0;
@@ -1097,6 +1163,7 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         if(understanding.value(QStringLiteral("phase"))!=QStringLiteral("ready"))
             understanding.insert(QStringLiteral("plan"),m_documentReading.value(QStringLiteral("plan")));
         m_documentReading=understanding;
+        if(m_documentReading.value(QStringLiteral("summary_owner")).toString()!=m_aiSummaryOwner)m_aiSummaryOwner.clear();
         m_readingChoiceShown=true;m_readingChoicePending=false;
     }
     const auto chatCheckpoint=batch.value(QStringLiteral("chat_checkpoint")).toMap();
@@ -1146,7 +1213,11 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
     }
     m_aiState.insert(QStringLiteral("output"),output);m_aiState.insert(QStringLiteral("reasoning"),reasoning);
     if(batch.value(QStringLiteral("finished")).toBool()) {
-        if(m_aiState.value(QStringLiteral("running")).toBool()) {
+        if(batch.value(QStringLiteral("summary_cancelled")).toBool()) {
+            m_aiState.insert(QStringLiteral("chatOutcome"),QStringLiteral("cancelled"));
+            m_aiState.insert(QStringLiteral("status"),tr("Request cancelled. Partial output is kept in this tab."));
+        }
+        if(m_aiState.value(QStringLiteral("running")).toBool() && !batch.value(QStringLiteral("summary_cancelled")).toBool()) {
             const bool complete=m_aiState.value(QStringLiteral("terminalReceived")).toBool();
             m_aiState.insert(QStringLiteral("chatOutcome"),complete?QStringLiteral("finished"):QStringLiteral("failed"));
             m_aiState.insert(QStringLiteral("status"),complete?tr("Response complete."):tr("The response ended without a completion event."));
@@ -1200,6 +1271,13 @@ void ReaderController::handleAiCommand(quint64 id,const QString &operation,const
         const auto savedChatState=chatCheckpoint.value(QStringLiteral("state"),outcome).toString();
         finishAiChat(savedChatState,chatCheckpoint.value(QStringLiteral("note_source")).toString());
         retainAiResult(outcome);m_aiTimer.stop();
+        const auto waiting=batch.value(QStringLiteral("synthesis_plan")).toMap();
+        if(!m_aiSummaryOwner.isEmpty() && waiting.value(QStringLiteral("summary_review")).toString()==m_aiSummaryOwner
+            && m_aiState.value(QStringLiteral("plan")).toMap()!=waiting) {
+            // Retired UI intent cannot leave the native synthesis claim orphaned.
+            QPointer<ReaderController> owner(this);const auto currentGeneration=m_generation;
+            retireDocumentSummaryReview();if(!owner || currentGeneration!=m_generation)return;
+        }
     }
     if(m_aiState.value(QStringLiteral("responseView")).toString()==QStringLiteral("region") && (output!=priorOutput || !m_aiState.value(QStringLiteral("running")).toBool()))markRegionDirty();
     QPointer<ReaderController> alive(this);

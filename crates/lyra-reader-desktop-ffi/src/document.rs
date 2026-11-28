@@ -44,6 +44,7 @@ struct DesktopAiRequest {
     request: Arc<LyraReaderAiRequest>,
     reading: Option<ReadingReplies>,
     analysis: Option<AnalysisRun>,
+    summary_owner: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -673,21 +674,46 @@ impl DesktopDocument {
         Ok(bitmap)
     }
 
+    pub(super) fn abandon_owned_summary_request(&self) -> Result<(), String> {
+        let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
+        if let Some(job) = current.as_mut().filter(|job| job.summary_owner.is_some()) {
+            job.request.cancel();
+            // Publication only happens in poll. Retiring these captures before a
+            // revision change makes late network completion unable to write it.
+            job.reading = None;
+            job.analysis = None;
+            job.summary_owner = None;
+        }
+        Ok(())
+    }
     pub fn command(&self, r: Value) -> Result<Value, String> {
+        match r.get("op").and_then(Value::as_str) {
+            Some("ai_summary_review_prepare") => self.prepare_summary_review(r),
+            Some("ai_summary_review_cancel") => self.cancel_summary_review(&text(&r, "owner")?),
+            Some("ai_start") => {
+                let owned = self.owned_summary_start(&r["plan"])?;
+                self.command_inner(r, owned)
+            }
+            _ => self.command_inner(r, false),
+        }
+    }
+    pub(super) fn command_inner(&self, r: Value, owned_summary: bool) -> Result<Value, String> {
         let op = r
             .get("op")
             .and_then(Value::as_str)
             .ok_or("Missing operation")?;
-        if matches!(
-            op,
-            "ai_preview"
-                | "ai_start"
-                | "ai_summary_prepare"
-                | "ai_summary_batch_prepare"
-                | "ai_summary_batch_start"
-                | "translation_prepare"
-                | "translation_start"
-        ) {
+        if !owned_summary
+            && matches!(
+                op,
+                "ai_preview"
+                    | "ai_start"
+                    | "ai_summary_prepare"
+                    | "ai_summary_batch_prepare"
+                    | "ai_summary_batch_start"
+                    | "translation_prepare"
+                    | "translation_start"
+            )
+        {
             self.ensure_reading_idle()?;
         }
         if op.starts_with("translation_") {
@@ -1503,13 +1529,6 @@ impl DesktopDocument {
                     _ => None,
                 }
                 .map(|output| ReadingReplies::new(output, plan.parts.len()));
-                let analysis = match reading.as_ref().map(|reading| &reading.output) {
-                    Some(
-                        ReadingOutput::Summary { capture, .. }
-                        | ReadingOutput::Synthesis { capture, .. },
-                    ) => capture.claim(self, &d)?,
-                    _ => None,
-                };
                 let root = self
                     .marks
                     .lock()
@@ -1543,7 +1562,19 @@ impl DesktopDocument {
                     .ai_region_sources
                     .lock()
                     .map_err(|_| "Region request state is unavailable")? = provenance;
-                let request = {
+                let summary_owner = r["plan"]["summary_review"].as_str().map(str::to_owned);
+                let analysis = if owned_summary {
+                    Some(self.take_summary_run(&r["plan"])?)
+                } else {
+                    match reading.as_ref().map(|reading| &reading.output) {
+                        Some(
+                            ReadingOutput::Summary { capture, .. }
+                            | ReadingOutput::Synthesis { capture, .. },
+                        ) => capture.claim(self, &d)?,
+                        _ => None,
+                    }
+                };
+                let request = (|| {
                     self.summaries
                         .lock()
                         .map_err(|_| "Summary cache state is unavailable")?
@@ -1557,13 +1588,21 @@ impl DesktopDocument {
                     } else {
                         start_ai_request_audited(plan, text(&r, "api_key")?, false, Some(audit))
                     }
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())
+                })();
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.finish_summary_owner(summary_owner.as_deref())?;
+                        return Err(error);
+                    }
                 };
                 let mut current = self.ai.lock().map_err(|_| "AI state is unavailable")?;
                 if let Some(old) = current.replace(DesktopAiRequest {
                     request,
                     reading,
                     analysis,
+                    summary_owner,
                 }) {
                     old.request.cancel();
                 }
@@ -1586,8 +1625,19 @@ impl DesktopDocument {
                     if let Some(reading) = &mut job.reading {
                         reading.observe(&events);
                     }
+                    let summary_cancelled = finished
+                        && job.summary_owner.is_some()
+                        && job
+                            .reading
+                            .as_ref()
+                            .is_some_and(|reading| reading.cancelled);
                     let reading = if finished { job.reading.take() } else { None };
                     let analysis = if finished { job.analysis.take() } else { None };
+                    let summary_owner = if finished {
+                        job.summary_owner.take()
+                    } else {
+                        None
+                    };
                     let active = self
                         .summaries
                         .lock()
@@ -1610,8 +1660,7 @@ impl DesktopDocument {
                         None
                     };
                     drop(current);
-                    let mut result =
-                        json!({"events":events,"finished":finished,"cache_warning":warning});
+                    let mut result = json!({"events":events,"finished":finished,"cache_warning":warning,"summary_cancelled":summary_cancelled});
                     match reading.and_then(|reading| reading.publish(&mut result)) {
                         Some(ReadingArchive::Translation(archive)) => {
                             if let Err(error) =
@@ -1639,6 +1688,24 @@ impl DesktopDocument {
                                 .map_err(|_| "Note review state is unavailable.")? = Some(*capture);
                         }
                         Some(ReadingArchive::PendingSummary(snapshot)) => {
+                            if let Some(owner) = summary_owner.as_deref() {
+                                let mut state = self
+                                    .knowledge
+                                    .lock()
+                                    .map_err(|_| "Document reading state is unavailable")?;
+                                let review = state
+                                    .summary_review
+                                    .as_mut()
+                                    .filter(|review| review.owner == owner)
+                                    .ok_or(
+                                        "The summary analysis was cancelled before synthesis.",
+                                    )?;
+                                review.update_plan(&mut result["synthesis_plan"])?;
+                                review.run = analysis;
+                                review.started = false;
+                                state.begin_summary_synthesis();
+                                result["understanding"] = state.summary_status()?;
+                            }
                             *self
                                 .pending_summary
                                 .lock()
@@ -1657,12 +1724,21 @@ impl DesktopDocument {
                                     self.archive_summary_task(&d, record)
                                 }
                             });
+                            if summary_owner.is_some() {
+                                result["understanding"] =
+                                    self.finish_summary_owner(summary_owner.as_deref())?;
+                            }
                             match published {
                                 Ok(id) => result["summary_note_source"] = json!(id),
                                 Err(error) => result["cache_warning"] = json!(error),
                             }
                         }
-                        None => {}
+                        None => {
+                            if summary_owner.is_some() {
+                                result["understanding"] =
+                                    self.finish_summary_owner(summary_owner.as_deref())?;
+                            }
+                        }
                     }
                     Ok(result)
                 } else {
@@ -1674,9 +1750,17 @@ impl DesktopDocument {
                     .ai
                     .lock()
                     .map_err(|_| "AI state is unavailable")?
-                    .as_ref()
+                    .as_mut()
                 {
                     job.request.cancel();
+                    if job.summary_owner.is_some()
+                        && let Some(reading) = job.reading.as_mut()
+                    {
+                        // Cancellation wins even when Done was queued before the
+                        // UI's final poll; no completed understanding is published.
+                        reading.cancelled = true;
+                        reading.incomplete = true;
+                    }
                 }
                 Ok(Value::Bool(true))
             }
@@ -6145,6 +6229,298 @@ mod tests {
             "base_url":"http://localhost:11434/v1","model":"synthetic-summary",
             "temperature":null,"max_tokens":null,"reasoning_mode":"default","reasoning_encoding":"none",
             "document_knowledge_text":"UNVERIFIED_PARTIAL_CONTEXT","document_knowledge_pages":[1]})
+    }
+
+    #[test]
+    fn owned_summary_review_claims_before_send_and_retires_only_its_scope() {
+        let fixture = Fixture::new("text-page.pdf");
+        let before = fs::read(&fixture.path).unwrap();
+        let doc = fixture.open();
+        let source = doc.active().unwrap();
+        let request = summary_settings();
+        let reading = json!({"kind":"summary","detail":"Standard","force":true});
+        let pure = doc
+            .command(json!({"op":"ai_preview","request":request,"reading":reading}))
+            .unwrap();
+        assert!(pure.get("summary_review").is_none());
+        assert!(doc.ensure_reading_idle().is_ok());
+        let owned=doc.command(json!({"op":"ai_summary_review_prepare","owner":"first-review","request":request,"reading":reading})).unwrap();
+        let plan = &owned["plan"];
+        assert_eq!(owned["understanding"]["phase"], "preparing");
+        assert_eq!(owned["understanding"]["summary_owner"], "first-review");
+        assert_eq!(plan["summary_review"], "first-review");
+        assert_eq!(plan["parts"], pure["parts"]);
+        assert!(doc.ai.lock().unwrap().is_none());
+        assert!(
+            doc.command(json!({"op":"ai_preview","request":request,"reading":reading}))
+                .unwrap_err()
+                .contains("analysis")
+        );
+        assert!(
+            doc.with_reading_cache(&source, true, |cache, hash| AnalysisRun::begin(
+                cache,
+                hash,
+                "".into(),
+                "Standard".into()
+            ))
+            .is_err()
+        );
+        let mut changed = plan.clone();
+        changed["parts"][0]["wire_body"] = json!("tampered body");
+        assert!(
+            doc.command(json!({"op":"ai_start","plan":changed}))
+                .unwrap_err()
+                .contains("review changed")
+        );
+        assert!(doc.owned_summary_start(plan).unwrap());
+        let mut stripped = plan.clone();
+        stripped.as_object_mut().unwrap().remove("summary_review");
+        assert!(
+            doc.command(json!({"op":"ai_start","plan":stripped,"api_key":"unused"}))
+                .unwrap_err()
+                .contains("analysis")
+        );
+        assert!(doc.ai.lock().unwrap().is_none());
+        let wrong = doc
+            .command(json!({"op":"ai_summary_review_cancel","owner":"later-review"}))
+            .unwrap();
+        assert_eq!(wrong["summary_owner"], "first-review");
+        let cancelled = doc
+            .command(json!({"op":"ai_summary_review_cancel","owner":"first-review"}))
+            .unwrap();
+        assert_eq!(cancelled["phase"], "idle");
+        assert!(doc.ensure_reading_idle().is_ok());
+        let second=doc.command(json!({"op":"ai_summary_review_prepare","owner":"second-review","request":request,"reading":reading})).unwrap();
+        assert_eq!(second["plan"]["summary_review"], "second-review");
+        assert_eq!(
+            doc.command(json!({"op":"ai_summary_review_cancel","owner":"first-review"}))
+                .unwrap()["summary_owner"],
+            "second-review"
+        );
+        assert!(doc.command(json!({"op":"ai_start","plan":plan})).is_err());
+        doc.invalidate_reading().unwrap();
+        assert!(doc.ensure_reading_idle().is_ok());
+        let run = doc
+            .with_reading_cache(&source, true, |cache, hash| {
+                AnalysisRun::begin(cache, hash, "".into(), "Standard".into())
+            })
+            .unwrap();
+        drop(run);
+        assert_eq!(fs::read(&fixture.path).unwrap(), before);
+    }
+
+    #[test]
+    fn owned_summary_chatgpt_preview_keeps_the_account_and_never_reads_credentials() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let mut request = summary_settings();
+        request["chatgpt_account"] = json!("synthetic-owned-account");
+        let owned = doc
+            .command(
+                json!({"op":"ai_summary_review_prepare","owner":"account-review","request":request,
+            "reading":{"kind":"summary","detail":"Standard","force":true}}),
+            )
+            .unwrap();
+        let plan = &owned["plan"];
+        assert_eq!(plan["chatgpt_account"], "synthetic-owned-account");
+        assert_eq!(
+            plan["endpoint"],
+            lyra_reader_ai::openai::CHATGPT_RESPONSES_ENDPOINT
+        );
+        assert!(doc.owned_summary_start(plan).unwrap());
+        let mut changed = plan.clone();
+        changed["chatgpt_account"] = json!("another-account");
+        assert!(
+            doc.command(
+                json!({"op":"ai_start","plan":changed,"chatgpt_account":"another-account"})
+            )
+            .unwrap_err()
+            .contains("review changed")
+        );
+        assert!(doc.ai.lock().unwrap().is_none());
+        doc.command(json!({"op":"ai_summary_review_cancel","owner":"account-review"}))
+            .unwrap();
+    }
+
+    #[test]
+    fn owned_summary_cancel_before_terminal_poll_does_not_publish_a_completed_reply() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            time::{Duration, Instant},
+        };
+        for revision_change in [false, true] {
+            let fixture = Fixture::new("text-page.pdf");
+            let doc = fixture.open();
+            let source = doc.active().unwrap();
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut request = summary_settings();
+            request["base_url"] = json!(format!("http://{address}/v1"));
+            let owned=doc.command(json!({"op":"ai_summary_review_prepare","owner":"finished-but-unpublished","request":request,
+            "reading":{"kind":"summary","detail":"Standard","force":true}})).unwrap();
+            let expected = owned["plan"]["parts"][0]["wire_body"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+            std::thread::scope(|scope| {
+                let server=scope.spawn(move|| {
+                let deadline=Instant::now()+Duration::from_secs(3);
+                let mut stream=loop {match listener.accept(){Ok((stream,_))=>break stream,Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{
+                    assert!(Instant::now()<deadline,"No synthetic request arrived");std::thread::sleep(Duration::from_millis(1));
+                },Err(error)=>panic!("{error}")}};
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut bytes=Vec::new();let mut chunk=[0u8;4096];
+                let body=loop {
+                    let size=stream.read(&mut chunk).unwrap();assert!(size>0);bytes.extend_from_slice(&chunk[..size]);assert!(bytes.len()<1024*1024);
+                    if let Some(end)=bytes.windows(4).position(|w|w==b"\r\n\r\n") {
+                        let headers=String::from_utf8_lossy(&bytes[..end]);
+                        let length=headers.lines().find_map(|line|line.split_once(':').filter(|(key,_)|key.eq_ignore_ascii_case("content-length"))
+                            .map(|(_,value)|value.trim().parse::<usize>().unwrap())).unwrap();
+                        if bytes.len()>=end+4+length {break bytes[end+4..end+4+length].to_vec();}
+                    }
+                };
+                let response="data: {\"choices\":[{\"delta\":{\"content\":\"Complete but not published [p.1]\"}}]}\n\ndata: [DONE]\n\n";
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                stream.flush().unwrap();body
+            });
+                doc.command(json!({"op":"ai_start","plan":owned["plan"],"api_key":"unused"}))
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if doc
+                        .ai
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .request
+                        .is_finished()
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "The synthetic response did not finish"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(server.join().unwrap(), expected);
+            });
+            if revision_change {
+                doc.command(json!({"op":"page_stage","operation":{"Rotate":{"pages":[0],"quarter_turns":1}}})).unwrap();
+                let next=doc.command(json!({"op":"ai_summary_review_prepare","owner":"new-revision","request":request,
+                "reading":{"kind":"summary","detail":"Standard","force":true}})).unwrap();
+                assert!(doc.owned_summary_start(&next["plan"]).unwrap());
+                let polled = doc.command(json!({"op":"ai_poll"})).unwrap();
+                assert!(polled["summary_note_source"].is_null());
+                assert!(doc.owned_summary_start(&next["plan"]).unwrap());
+                doc.command(json!({"op":"ai_summary_review_cancel","owner":"new-revision"}))
+                    .unwrap();
+                doc.command(json!({"op":"document_discard"})).unwrap();
+            } else {
+                doc.command(json!({"op":"ai_cancel"})).unwrap();
+                let polled = doc.command(json!({"op":"ai_poll"})).unwrap();
+                assert_eq!(polled["finished"], true);
+                assert_eq!(polled["summary_cancelled"], true);
+                assert!(polled["summary_note_source"].is_null());
+                assert_eq!(polled["understanding"]["ready"], false);
+                assert!(doc.ensure_reading_idle().is_ok());
+                assert!(
+                    !doc.with_reading_cache(&source, true, |cache, _| Ok(cache
+                        .directory
+                        .join(crate::analysis_cache::FILE)))
+                        .unwrap()
+                        .exists()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_summary_send_revalidates_external_pdf_changes_before_any_request() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let owned=doc.command(json!({"op":"ai_summary_review_prepare","owner":"source-review","request":summary_settings(),
+            "reading":{"kind":"summary","detail":"Standard","force":true}})).unwrap();
+        let mut changed = fs::read(&fixture.path).unwrap();
+        changed.extend_from_slice(b"\n% external revision\n");
+        fs::write(&fixture.path, &changed).unwrap();
+        let error = doc
+            .command(json!({"op":"ai_start","plan":owned["plan"],"api_key":"unused"}))
+            .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert!(doc.ai.lock().unwrap().is_none());
+        doc.command(json!({"op":"ai_summary_review_cancel","owner":"source-review"}))
+            .unwrap();
+        assert_eq!(fs::read(&fixture.path).unwrap(), changed);
+    }
+
+    #[test]
+    fn owned_summary_matching_cache_needs_no_second_analysis_claim() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = doc.active().unwrap();
+        let begin = || {
+            doc.with_reading_cache(&source, true, |cache, hash| {
+                AnalysisRun::begin(cache, hash, "".into(), "Standard".into())
+            })
+        };
+        let record = ReadingRecord {
+            id: "owned-cache-result".into(),
+            kind: "summary".into(),
+            source_id: reading_scope_key(None),
+            source_hash: source.document_identity().sha256,
+            content: "A complete synthetic result [p.1].".into(),
+            pages: vec![1],
+            model: "synthetic".into(),
+            detail: "Standard".into(),
+            status: "finished".into(),
+            modified: 1,
+            originals: vec!["Synthetic source passage.".into()],
+            original_pages: vec![1],
+            ..ReadingRecord::default()
+        };
+        let (context, _, _) = doc
+            .publish_summary(&source, record, begin().unwrap())
+            .unwrap();
+        doc.adopt_understanding(context).unwrap();
+        let another = begin().unwrap();
+        let cached=doc.command(json!({"op":"ai_summary_review_prepare","owner":"cached-review","request":summary_settings(),
+            "reading":{"kind":"summary","detail":"Standard"}})).unwrap();
+        assert_eq!(cached["plan"]["saved_summary"]["id"], "owned-cache-result");
+        assert!(cached["understanding"]["summary_owner"].is_null());
+        assert!(doc.ensure_reading_idle().is_ok());
+        assert!(doc.ai.lock().unwrap().is_none());
+        drop(another);
+    }
+
+    #[test]
+    fn owned_summary_prepare_error_releases_the_analysis_and_keeps_pure_preview_pure() {
+        let fixture = Fixture::new("text-page.pdf");
+        let doc = fixture.open();
+        let source = doc.active().unwrap();
+        let mut bad = summary_settings();
+        bad["model"] = json!("");
+        assert!(
+            doc.command(
+                json!({"op":"ai_summary_review_prepare","owner":"failed-review","request":bad,
+            "reading":{"kind":"summary","detail":"Standard","force":true}})
+            )
+            .is_err()
+        );
+        assert!(doc.ensure_reading_idle().is_ok());
+        let run = doc
+            .with_reading_cache(&source, true, |cache, hash| {
+                AnalysisRun::begin(cache, hash, "".into(), "Standard".into())
+            })
+            .unwrap();
+        drop(run);
+        assert!(doc.ai.lock().unwrap().is_none());
+        assert!(doc.command(json!({"op":"ai_preview","request":summary_settings(),"reading":{"kind":"summary","detail":"Standard"}})).is_ok());
+        assert!(doc.ensure_reading_idle().is_ok());
     }
 
     #[test]

@@ -54,6 +54,9 @@ AiReadingScrollView {
         // History is covered by the review dialog. Its deferred read must not
         // change command admission while the reader activates Send.
         if (!visible || panel.reviewTicket || panel.payloadOpen || panel.running) return;
+        // A history read changes pendingCommands and disables these controls.
+        // Let an in-progress pointer/key activation finish before starting it.
+        if (generateSummary.pressed || sendSummary.pressed) { scopeRefresh.restart(); return; }
         if (panel.selectedSummary && !range) { store.reset(); return; }
         store.reload("summary", range);
     }
@@ -244,6 +247,7 @@ AiReadingScrollView {
         Label { visible: !!text; text: [task.result.summaryHistoryWarning, task.panel.viewState.cacheWarning, task.store.failure].filter(value => !!value).join("\n"); textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.warningFg; font.pixelSize: 11 }
         Label { visible: !task.configured; text: qsTr("Connect an AI provider in Settings to continue."); textFormat: Text.PlainText; wrapMode: Text.Wrap; Layout.fillWidth: true; color: app.colors.textSecondary; font.pixelSize: 12 }
         ReadingPrimaryButton {
+            id: generateSummary
             app: task.app
             objectName: "prepareAiRequest"
             Layout.fillWidth: true
@@ -256,7 +260,7 @@ AiReadingScrollView {
             visible: task.panel.previewReady && !task.panel.running
             Layout.fillWidth: true
             Button { text: qsTr("Inspect Payload"); Layout.fillWidth: true; onClicked: task.panel.inspectPayload() }
-            Button { objectName: "sendAiRequest"; text: task.panel.synthesisPreview ? qsTr("Send synthesis") : qsTr("Send"); Layout.fillWidth: true; enabled: !task.panel.owner.pendingCommands; onClicked: app.sendAi(task.panel.owner, task.panel.plan) }
+            Button { id: sendSummary; objectName: "sendAiRequest"; text: task.panel.synthesisPreview ? qsTr("Send synthesis") : qsTr("Send"); Layout.fillWidth: true; enabled: !task.panel.owner.pendingCommands; onClicked: app.sendAi(task.panel.owner, task.panel.plan) }
         }
         RowLayout {
             visible: !!task.panel.owner.documentReading.choice_pending

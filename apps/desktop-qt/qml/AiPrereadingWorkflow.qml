@@ -25,7 +25,7 @@ Item {
         if(!gate.valid) {app.operationStatus=gate.message;return false;}
         if(gate.decision==="ready") {cancel();return resume()!==false;}
         if(gate.decision==="wait") {
-            app.operationStatus=qsTr("Document prereading is in progress. Continue when Lyra AI is ready.");return false;
+            app.operationStatus=app.aiTaskBusyMessage(reader);return false;
         }
         cancel();
         pending={reader:reader,generation:reader.documentGeneration,valid:valid,resume:resume,

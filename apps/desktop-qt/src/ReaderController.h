@@ -179,6 +179,9 @@ public:
     Q_INVOKABLE bool saveGeneratedRegionNote();
     Q_INVOKABLE void dismissGeneratedRegionNote();
     Q_INVOKABLE void prepareAi(const QVariantMap &request,const QVariantMap &unit={},const QVariantMap &reading={});
+    Q_INVOKABLE void prepareDocumentSummary(const QVariantMap &request,const QVariantMap &reading);
+    Q_INVOKABLE bool ownsDocumentSummary(const QVariantMap &plan)const;
+    Q_INVOKABLE void cancelDocumentSummaryReview(const QVariantMap &plan={});
     Q_INVOKABLE bool startAi(const QString &key,const QVariantMap &expectedPlan);
     bool startChatGptRequest(const QString &account,const QString &token,const QVariantMap &plan,const QString &readingToken);
     Q_INVOKABLE void cancelAi();
@@ -386,6 +389,8 @@ private:
     bool m_regionFlushRequested=false,m_regionCancelRequested=false,m_regionClearPending=false;
     QVariantMap m_pendingRegionCapture;
     void resetAi(bool preserveTranslationViews=false);
+    void prepareAiImpl(const QVariantMap &request,const QVariantMap &unit,const QVariantMap &reading,bool ownedSummary);
+    void retireDocumentSummaryReview();
     void initDocumentReading();
     void resetDocumentReading();
     void handleDocumentReadingCommand(quint64 id,const QString &operation,const QVariant &result,const QString &error);
@@ -437,6 +442,8 @@ private:
     quint64 m_aiPreviewEpoch=0,m_aiActivePreviewEpoch=0;
     QString m_aiPreviewNoteId;
     quint64 m_aiPreviewId=0,m_aiStartId=0,m_aiPollId=0,m_aiPlanGeneration=0;
+    QString m_aiSummaryOwner;
+    quint64 m_aiSummaryCancelId=0;
     quint64 m_aiChatLoadId=0,m_aiChatLoadEpoch=0;
     quint64 m_chatDraftSaveId=0;
     QTimer m_chatDraftTimer;
